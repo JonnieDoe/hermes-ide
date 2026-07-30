@@ -123,11 +123,12 @@ fn cleanup_stale_worktrees(app: &tauri::AppHandle, database: &db::Database) {
         // Only remove linked worktrees from disk, not main worktrees
         if !wt.is_main_worktree {
             if let Ok(Some(project_entry)) = database.get_project(&wt.project_id) {
+                let wt_base = git::resolve_worktree_base(database, Some(&wt.session_id), Some(&wt.project_id));
                 if let Err(e) = git::worktree::remove_worktree(
                     &project_entry.path,
                     &wt.session_id,
                     &wt.worktree_path,
-                    custom_base.as_deref(),
+                    wt_base.as_deref(),
                 ) {
                     log::warn!(
                         "Startup worktree cleanup: failed to remove worktree '{}': {}",
@@ -214,10 +215,16 @@ fn cleanup_stale_worktrees(app: &tauri::AppHandle, database: &db::Database) {
             .collect();
 
         for proj in &projects {
-            let mut bases = vec![None]; // None represents default base
-            if custom_base.is_some() {
-                bases.push(custom_base.as_deref());
+            let mut bases: Vec<Option<&Path>> = vec![None]; // None represents default base
+            if let Some(ref gb) = custom_base {
+                bases.push(Some(gb.as_path()));
             }
+            if let Some(ref pb) = proj.worktree_base_path {
+                if !pb.trim().is_empty() {
+                    bases.push(Some(Path::new(pb)));
+                }
+            }
+            bases.dedup();
 
             for base in bases {
                 let wt_dir = git::worktree::worktree_dir(&app_data_dir, &proj.path, base);
@@ -530,15 +537,25 @@ pub fn run() {
 
             // Start worktree file watcher (notification only — never
             // deletes projects or closes sessions)
-            let custom_base = database
-                .get_setting("worktree_base_path")
-                .ok()
-                .flatten()
-                .filter(|s| !s.is_empty())
-                .map(std::path::PathBuf::from);
+            let mut custom_bases: Vec<std::path::PathBuf> = Vec::new();
+            if let Ok(Some(gb)) = database.get_setting("worktree_base_path") {
+                if !gb.trim().is_empty() {
+                    custom_bases.push(std::path::PathBuf::from(gb));
+                }
+            }
+            if let Ok(projects) = database.get_all_projects() {
+                for proj in projects {
+                    if let Some(pb) = proj.worktree_base_path {
+                        if !pb.trim().is_empty() {
+                            custom_bases.push(std::path::PathBuf::from(pb));
+                        }
+                    }
+                }
+            }
+            custom_bases.dedup();
 
             let watcher =
-                git::watcher::start_watching(app.handle().clone(), app_dir.clone(), custom_base);
+                git::watcher::start_watching(app.handle().clone(), app_dir.clone(), custom_bases);
 
             let state = AppState {
                 db: Mutex::new(database),

@@ -23,12 +23,46 @@ use crate::AppState;
 const VCS_STATUS_FILE_CAP: usize = 10_000;
 
 /// Returns the custom worktree base path if configured in settings.
-fn get_custom_worktree_base(db: &Database) -> Option<std::path::PathBuf> {
+pub fn get_custom_worktree_base(db: &Database) -> Option<std::path::PathBuf> {
     db.get_setting("worktree_base_path")
         .ok()
         .flatten()
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
         .map(std::path::PathBuf::from)
+}
+
+/// Resolves the worktree base directory path using the complete hierarchy:
+/// 1. Session-level setting (`session_id` -> `worktree_base_path`)
+/// 2. Project-level setting (`project_id` -> `worktree_base_path`)
+/// 3. Global custom base setting (`settings` -> `worktree_base_path`)
+/// 4. Default (`None`)
+pub fn resolve_worktree_base(
+    db: &Database,
+    session_id: Option<&str>,
+    project_id: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    // 1. Session tier
+    if let Some(sid) = session_id {
+        if let Ok(Some(path)) = db.get_session_worktree_base_path(sid) {
+            if !path.trim().is_empty() {
+                return Some(std::path::PathBuf::from(path));
+            }
+        }
+    }
+
+    // 2. Project tier
+    if let Some(pid) = project_id {
+        if let Ok(Some(project)) = db.get_project(pid) {
+            if let Some(ref path) = project.worktree_base_path {
+                if !path.trim().is_empty() {
+                    return Some(std::path::PathBuf::from(path));
+                }
+            }
+        }
+    }
+
+    // 3. Global custom base tier
+    get_custom_worktree_base(db)
 }
 
 /// Validates that a path is inside the Hermes worktrees directory
@@ -2888,19 +2922,23 @@ pub fn git_create_worktree(
         .ok_or_else(|| format!("Project '{}' not found", project_id))?;
     let root_path = project.path.clone();
 
-    // Hierarchy of base paths:
-    // 1. Session override (passed to this command)
-    // 2. Project-specific base (from DB)
-    // 3. Global custom base (from settings)
-    // 4. Default (None)
     let custom_base = if let Some(ref path) = worktree_base_path {
-        Some(std::path::PathBuf::from(path))
-    } else if let Some(ref path) = project.worktree_base_path {
-        Some(std::path::PathBuf::from(path))
+        if !path.trim().is_empty() {
+            Some(std::path::PathBuf::from(path))
+        } else {
+            resolve_worktree_base(&db, Some(&session_id), Some(&project_id))
+        }
     } else {
-        get_custom_worktree_base(&db)
+        resolve_worktree_base(&db, Some(&session_id), Some(&project_id))
     };
     drop(db);
+
+    if let Some(ref base) = custom_base {
+        worktree::validate_custom_worktree_base(
+            base.to_str().unwrap_or_default(),
+            Some(&root_path),
+        )?;
+    }
 
     // Journal: log the CREATE operation before performing it
     let intended_path = worktree::worktree_path_for_session(
@@ -3008,14 +3046,7 @@ pub fn git_remove_worktree(
     let root_path = project.path.clone();
     let is_main = wt.is_main_worktree;
 
-    // Hierarchy of bases for validation:
-    // If project has a specific base, we MUST check against it.
-    // Otherwise check against global custom base or default.
-    let custom_base = if let Some(ref path) = project.worktree_base_path {
-        Some(std::path::PathBuf::from(path))
-    } else {
-        get_custom_worktree_base(&db)
-    };
+    let custom_base = resolve_worktree_base(&db, Some(&session_id), Some(&project_id));
     drop(db);
 
     // SAFETY: never remove the main worktree (it IS the project root)
@@ -3686,12 +3717,18 @@ pub fn git_detect_orphan_worktrees(
     }
 
     // 3. Check for "directory_only" — directory exists but no DB record
-    //    Scan each project's worktree hash directory in both default and custom base
+    //    Scan each project's worktree hash directory across all candidate bases (default, global, project)
     for project in &projects {
-        let mut bases = vec![None]; // None represents default base
-        if custom_base.is_some() {
-            bases.push(custom_base.as_deref());
+        let mut bases: Vec<Option<&std::path::Path>> = vec![None]; // None represents default base
+        if let Some(ref gb) = custom_base {
+            bases.push(Some(gb.as_path()));
         }
+        if let Some(ref pb) = project.worktree_base_path {
+            if !pb.trim().is_empty() {
+                bases.push(Some(std::path::Path::new(pb)));
+            }
+        }
+        bases.dedup();
 
         for base in bases {
             let wt_dir = worktree::worktree_dir(&app_data_dir, &project.path, base);

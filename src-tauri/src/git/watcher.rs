@@ -50,20 +50,22 @@ impl WorktreeWatcher {
 pub fn start_watching(
     app: AppHandle,
     base_dir: PathBuf,
-    custom_base: Option<PathBuf>,
+    custom_bases: Vec<PathBuf>,
 ) -> Option<WorktreeWatcher> {
-    let worktrees_dir = base_dir.join(super::worktree::HERMES_WORKTREE_MARKER);
+    let default_dir = super::worktree::worktrees_base_dir(&base_dir, None);
 
     // Collect directories that exist and should be watched
     let mut dirs_to_watch = Vec::new();
-    if worktrees_dir.is_dir() {
-        dirs_to_watch.push(worktrees_dir);
+    if default_dir.is_dir() {
+        dirs_to_watch.push(default_dir);
     }
-    if let Some(ref cb) = custom_base {
-        if cb.is_dir() {
-            dirs_to_watch.push(cb.clone());
+    for cb in &custom_bases {
+        let wt_dir = super::worktree::worktrees_base_dir(&base_dir, Some(cb));
+        if wt_dir.is_dir() {
+            dirs_to_watch.push(wt_dir);
         }
     }
+    dirs_to_watch.dedup();
 
     if dirs_to_watch.is_empty() {
         log::info!("[worktree-watcher] no worktree directories exist yet — skipping watcher");

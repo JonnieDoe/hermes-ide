@@ -683,6 +683,19 @@ impl Database {
         Ok(parsed)
     }
 
+    /// Read the persisted `worktree_base_path` for a session (if configured).
+    pub fn get_session_worktree_base_path(&self, session_id: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT worktree_base_path FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|opt| opt.flatten())
+            .map_err(|e| format!("Failed to query session worktree_base_path: {}", e))
+    }
+
     /// Persist `workspace_paths` for a session.  Used by `add_workspace_path`
     /// and `remove_workspace_path` when the session is agent-mode (no PTY
     /// entry to mutate in-memory) so the next agent respawn picks up the
@@ -2457,6 +2470,9 @@ const VALID_SETTING_KEYS: &[&str] = &[
 pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Result<(), String> {
     if !VALID_SETTING_KEYS.contains(&key.as_str()) {
         return Err(format!("Unknown setting key: {}", key));
+    }
+    if key == "worktree_base_path" && !value.trim().is_empty() {
+        crate::git::worktree::validate_custom_worktree_base(&value, None)?;
     }
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.set_setting(&key, &value)

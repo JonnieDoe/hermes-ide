@@ -80,10 +80,16 @@ pub fn repo_path_hash(repo_path: &str) -> String {
 // ─── Public API ─────────────────────────────────────────────────────
 
 /// Returns the top-level directory for all Hermes worktrees.
-/// Defaults to `{app_data_dir}/hermes-worktrees/` unless `custom_base` is provided.
+/// Defaults to `{app_data_dir}/hermes-worktrees/` or `{custom_base}/hermes-worktrees/`.
 pub fn worktrees_base_dir(app_data_dir: &Path, custom_base: Option<&Path>) -> PathBuf {
     match custom_base {
-        Some(base) => base.to_path_buf(),
+        Some(base) => {
+            if base.ends_with(HERMES_WORKTREE_MARKER) {
+                base.to_path_buf()
+            } else {
+                base.join(HERMES_WORKTREE_MARKER)
+            }
+        }
         None => app_data_dir.join(HERMES_WORKTREE_MARKER),
     }
 }
@@ -688,15 +694,14 @@ pub fn cleanup_stale_worktrees(repo_path: &str) -> Result<u32, String> {
 pub fn is_hermes_worktree_path(path: &str, custom_base: Option<&Path>) -> bool {
     let normalized = path.replace('\\', "/");
 
-    // 1. Check against default marker
-    if normalized.contains("hermes-worktrees/") {
-        return true;
+    // 1. Must contain "hermes-worktrees" substring
+    if !normalized.contains(HERMES_WORKTREE_MARKER) {
+        return false;
     }
 
     // 2. Check against custom base if provided
     if let Some(base) = custom_base {
         let base_str = base.to_string_lossy().replace('\\', "/");
-        // Ensure base_str ends with / for prefix check
         let prefix = if base_str.ends_with('/') {
             base_str
         } else {
@@ -707,7 +712,75 @@ pub fn is_hermes_worktree_path(path: &str, custom_base: Option<&Path>) -> bool {
         }
     }
 
-    false
+    true
+}
+
+/// Validate a candidate custom worktree base path.
+/// Verifies that:
+/// 1. The path is non-empty.
+/// 2. The path exists and is a directory.
+/// 3. The directory is writable.
+/// 4. The path is not the repository root itself, inside the repository, or an ancestor of the repository.
+pub fn validate_custom_worktree_base(
+    path_str: &str,
+    repo_path: Option<&str>,
+) -> Result<PathBuf, String> {
+    let trimmed = path_str.trim();
+    if trimmed.is_empty() {
+        return Err("Worktree base path cannot be empty".to_string());
+    }
+
+    let path = PathBuf::from(trimmed);
+    if !path.exists() {
+        return Err(format!("Worktree base path does not exist: '{}'", trimmed));
+    }
+
+    if !path.is_dir() {
+        return Err(format!("Worktree base path is not a directory: '{}'", trimmed));
+    }
+
+    // Check writability by attempting to write and remove a temporary file
+    let test_file = path.join(format!(".hermes_write_test_{}", uuid::Uuid::new_v4()));
+    match fs::write(&test_file, "test") {
+        Ok(_) => {
+            let _ = fs::remove_file(&test_file);
+        }
+        Err(e) => {
+            return Err(format!(
+                "Worktree base path is not writable: '{}' ({})",
+                trimmed, e
+            ));
+        }
+    }
+
+    // Check that custom base is not inside or equal to the repository itself
+    if let Some(repo) = repo_path {
+        let repo_canon = fs::canonicalize(repo).ok();
+        let path_canon = fs::canonicalize(&path).ok();
+
+        if let (Some(rc), Some(pc)) = (repo_canon, path_canon) {
+            if pc == rc {
+                return Err(format!(
+                    "Worktree base path cannot be the repository root directory: '{}'",
+                    trimmed
+                ));
+            }
+            if pc.starts_with(&rc) {
+                return Err(format!(
+                    "Worktree base path cannot be inside the repository directory: '{}'",
+                    trimmed
+                ));
+            }
+            if rc.starts_with(&pc) {
+                return Err(format!(
+                    "Worktree base path cannot be an ancestor of the repository directory: '{}'",
+                    trimmed
+                ));
+            }
+        }
+    }
+
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -1659,5 +1732,82 @@ mod tests {
             err
         );
     }
+
+    #[test]
+    fn test_create_and_remove_worktree_custom_base() {
+        let app_data = create_test_app_data_dir();
+        let repo_dir = create_test_repo();
+        let repo_path = repo_dir.path().to_str().unwrap();
+        let custom_base_dir = TempDir::new().unwrap();
+        let custom_base = custom_base_dir.path();
+
+        // Create worktree under custom base
+        let wt = create_worktree(
+            app_data.path(),
+            repo_path,
+            "session1",
+            "project-base-branch",
+            true,
+            None,
+            Some(custom_base),
+        )
+        .unwrap();
+
+        assert!(wt.worktree_path.contains("hermes-worktrees"));
+        assert!(wt.worktree_path.starts_with(custom_base.to_str().unwrap()));
+        assert!(Path::new(&wt.worktree_path).exists());
+
+        // Remove worktree under custom base
+        let remove_res = remove_worktree(
+            repo_path,
+            "session1",
+            &wt.worktree_path,
+            Some(custom_base),
+        );
+        assert!(
+            remove_res.is_ok(),
+            "remove_worktree failed with custom base: {:?}",
+            remove_res.err()
+        );
+        assert!(
+            !Path::new(&wt.worktree_path).exists(),
+            "Worktree directory should no longer exist"
+        );
+    }
+
+    #[test]
+    fn test_validate_custom_worktree_base() {
+        let repo_dir = create_test_repo();
+        let repo_path = repo_dir.path().to_str().unwrap();
+        let valid_dir = TempDir::new().unwrap();
+
+        // Valid custom base outside repo
+        let res = validate_custom_worktree_base(
+            valid_dir.path().to_str().unwrap(),
+            Some(repo_path),
+        );
+        assert!(res.is_ok());
+
+        // Non-existent path
+        let res_nonexistent = validate_custom_worktree_base(
+            "/nonexistent/directory/path/here",
+            Some(repo_path),
+        );
+        assert!(res_nonexistent.is_err());
+
+        // Inside repo path
+        let inside_repo = repo_dir.path().join("subfolder");
+        std::fs::create_dir_all(&inside_repo).unwrap();
+        let res_inside = validate_custom_worktree_base(
+            inside_repo.to_str().unwrap(),
+            Some(repo_path),
+        );
+        assert!(res_inside.is_err());
+        assert!(res_inside.unwrap_err().contains("inside the repository"));
+
+        // Repo root path itself
+        let res_root = validate_custom_worktree_base(repo_path, Some(repo_path));
+        assert!(res_root.is_err());
+        assert!(res_root.unwrap_err().contains("repository root directory"));
     }
 }

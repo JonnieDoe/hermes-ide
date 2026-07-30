@@ -211,10 +211,20 @@ pub fn set_project_worktree_path(
     path: Option<String>,
 ) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
+    let project = db
+        .get_project(&id)?
+        .ok_or_else(|| format!("Project '{}' not found", id))?;
+
+    if let Some(ref p) = path {
+        if !p.trim().is_empty() {
+            crate::git::worktree::validate_custom_worktree_base(p, Some(&project.path))?;
+        }
+    }
+
     db.set_project_worktree_path(&id, path.as_deref())?;
 
-    if let Ok(Some(project)) = db.get_project(&id) {
-        let _ = app.emit("project-updated", &project);
+    if let Ok(Some(updated)) = db.get_project(&id) {
+        let _ = app.emit("project-updated", &updated);
     }
     Ok(())
 }

@@ -617,6 +617,11 @@ pub fn create_session(
 ) -> Result<SessionUpdate, String> {
     let session_mode = mode.unwrap_or(SessionMode::Terminal);
     let session_id = session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    if let Some(ref base) = worktree_base_path {
+        if !base.trim().is_empty() {
+            crate::git::worktree::validate_custom_worktree_base(base, None)?;
+        }
+    }
     let shell = state
         .db
         .lock()
@@ -2101,13 +2106,6 @@ fn remove_owned_worktrees_from_disk(
 ) {
     let mut repos_to_prune: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    let custom_base = db
-        .get_setting("worktree_base_path")
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from);
-
     for wt in worktrees {
         let Ok(Some(proj)) = db.get_project(&wt.project_id) else {
             // Project gone — we can't locate the parent repo to run
@@ -2120,6 +2118,8 @@ fn remove_owned_worktrees_from_disk(
         };
 
         repos_to_prune.insert(proj.path.clone());
+
+        let custom_base = crate::git::resolve_worktree_base(db, Some(session_id), Some(&wt.project_id));
 
         match crate::git::worktree::remove_worktree(
             &proj.path,
