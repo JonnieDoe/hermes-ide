@@ -58,3 +58,13 @@ features:
       N06-3:
         text: "Opening a database from a newer version shows a clear message and changes nothing"
         scenarios: [N06-db-migrations.mjs]
+  N07:
+    name: "Feature flags"
+    status: partial
+    criteria:
+      N07-1:
+        text: "A flagged feature is invisible on stable and visible on beta"
+        scenarios: [N07-feature-flags.mjs]
+      N07-2:
+        text: "Turning a flag off hides the feature on next launch"
+        scenarios: [N07-feature-flags.mjs]

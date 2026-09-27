@@ -407,11 +407,24 @@ export function inheritedEnv() {
  *       the machine's real temp folder, like a second build a developer
  *       starts next to an installed Hermes.
  * env:  extra environment variables (e.g. HERMES_DATA_DIR).
+ * homeDir: only with home: "private" — use this exact folder as the private
+ *          home instead of a fresh mkdtemp'd one, and never delete it here.
+ *          Lets a scenario relaunch the app against the SAME throwaway data
+ *          (settings, onboarding state) to prove something that only takes
+ *          effect "on next launch", while still never touching the real
+ *          home. The caller owns cleanup of this folder.
+ * resetData: only with home: "real" — false keeps the test app's data folder
+ *            from the previous launch instead of wiping it, for the same
+ *            "relaunch against the same data" scenarios on Windows (where
+ *            the app's data lives under %APPDATA%, not HOME, so a private
+ *            home does not isolate it). Default true.
  */
 export async function launchApp({
   runDir,
   log = () => {},
   home = platform() === "win32" ? "real" : "private",
+  homeDir,
+  resetData = true,
   startupTimeoutMs = 60_000,
   tmp = "private",
   env: extraEnv = {},
@@ -436,7 +449,7 @@ export async function launchApp({
   const homeEnv = {};
   let dataDir;
   if (home === "private") {
-    const privateHome = join(privateTmp, "home");
+    const privateHome = homeDir || join(privateTmp, "home");
     mkdirSync(privateHome, { recursive: true });
     homeEnv.HOME = privateHome;
     homeEnv.CFFIXED_USER_HOME = privateHome; // macOS system frameworks
@@ -448,7 +461,7 @@ export async function launchApp({
         ? join(privateHome, "Library", "Application Support", E2E_IDENTIFIER)
         : join(homeEnv.XDG_DATA_HOME, E2E_IDENTIFIER);
   } else {
-    resetE2eDataDir();
+    if (resetData) resetE2eDataDir();
     dataDir = e2eDataDir();
   }
   if (extraEnv.HERMES_DATA_DIR) dataDir = extraEnv.HERMES_DATA_DIR;

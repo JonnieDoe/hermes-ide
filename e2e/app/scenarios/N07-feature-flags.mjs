@@ -1,0 +1,279 @@
+#!/usr/bin/env node
+// Scenario: N07 — feature flags.
+//
+// Proves, on the REAL app, that the feature-flag mechanism actually gates a
+// visible surface (the "FLAG" badge in the top bar, gated on the
+// "dummyProofSurface" flag — see src/featureFlags/ and
+// src/components/FeatureFlagDummyBanner.tsx):
+//
+//   run 1  fresh install, stable channel, no override  -> badge OFF
+//          force the flag on in the hidden Settings > Flags section
+//   run 2  relaunch                                    -> badge ON
+//          put the flag back to "Default for channel"; quit; switch this
+//          install to the beta update channel (update_channel = beta)
+//   run 3  relaunch, beta channel, no override          -> badge ON
+//          force the flag off
+//   run 4  relaunch, beta channel, forced off           -> badge OFF
+//
+// Flags are read once at startup, so every change is checked after a
+// relaunch against the same data, and also checked NOT to apply in the
+// session where it was made.
+//
+// The beta channel is the `update_channel` setting the updater reads. Until
+// the Settings control for it ships, this scenario writes that setting into
+// the app's database while the app is closed, exactly as the control would
+// store it.
+//
+//   node e2e/app/build.mjs
+//   node e2e/app/scenarios/N07-feature-flags.mjs
+//
+// Evidence (log + screenshots) goes to HERMES_E2E_EVIDENCE, or
+// <out dir>/evidence/N07-feature-flags.
+
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { platform, tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { createLogger, finishScenario, launchApp, outDir, sleep } from "../harness.mjs";
+
+const SCENARIO = "N07-feature-flags";
+const startedAt = Date.now();
+const evidenceDir = process.env.HERMES_E2E_EVIDENCE || join(outDir(), "evidence", SCENARIO);
+const logFile = join(evidenceDir, "scenario.log");
+rmSync(logFile, { force: true });
+const log = createLogger(logFile);
+
+function assert(condition, message) {
+  if (!condition) throw new Error(`ASSERTION FAILED: ${message}`);
+  log(`  ok — ${message}`);
+}
+
+const BADGE = ".topbar-flag-badge";
+const DB_FILE = "hermes_idea_v3.db";
+
+// Windows keeps app data under %APPDATA%, which a private HOME does not
+// move, so there the harness uses the real home and the test app's own data
+// folder; relaunches then keep that folder instead of wiping it.
+const onWindows = platform() === "win32";
+const homeDir = onWindows ? undefined : mkdtempSync(join(tmpdir(), "hermes-e2e-n07-home-"));
+
+function launch(run, { first = false } = {}) {
+  const runDir = join(evidenceDir, `run-${run}`);
+  return onWindows
+    ? launchApp({ runDir, log, home: "real", resetData: first })
+    : launchApp({ runDir, log, home: "private", homeDir });
+}
+
+/** First-launch welcome flow, same steps as the terminal-echo scenario. */
+async function completeOnboarding(bridge) {
+  await bridge.waitFor("the welcome dialog", `return !!e2e.first(".onboarding-dialog");`);
+  for (const _screen of ["welcome", "theme", "AI tools"]) {
+    await bridge.click(".onboarding-actions .onboarding-btn-primary");
+    await sleep(150);
+  }
+  await bridge.waitFor("the privacy screen", `return e2e.all(".onboarding-privacy-checkbox input").length === 2;`);
+  await bridge.clickWhenReady(`
+    const [analytics, policy] = e2e.all(".onboarding-privacy-checkbox input");
+    if (analytics.checked) e2e.click(analytics);
+    if (!policy.checked) e2e.click(policy);
+    return { analytics: analytics.checked, policy: policy.checked };
+  `);
+  await bridge.waitFor("the Finish button to become enabled", `
+    const b = e2e.first(".onboarding-actions .onboarding-btn-primary");
+    return !!b && !b.disabled;
+  `);
+  await bridge.click(".onboarding-actions .onboarding-btn-primary");
+  await bridge.waitFor("the welcome dialog to close", `return !e2e.first(".onboarding-backdrop");`);
+  await sleep(300);
+  await dismissWhatsNew(bridge);
+}
+
+async function dismissWhatsNew(bridge) {
+  if (await bridge.exists(".whatsnew-backdrop")) {
+    await bridge.click(".whatsnew-footer .whatsnew-btn-primary");
+    await bridge.waitFor("the what's-new dialog to close", `return !e2e.first(".whatsnew-backdrop");`);
+  }
+}
+
+/** A relaunch with existing data: no onboarding, main UI up. */
+async function waitForReturningLaunch(bridge) {
+  await bridge.waitFor("the app UI to be ready (no onboarding this time)", `
+    return !!e2e.first(".topbar-title, .topbar") && !e2e.first(".onboarding-backdrop");
+  `);
+  await dismissWhatsNew(bridge);
+  assert(!(await bridge.exists(".onboarding-backdrop")), "onboarding is not shown again (same persisted data)");
+}
+
+/** The badge must stay in its state for a while, not just at one instant. */
+async function assertBadgeStays(bridge, shown, message) {
+  for (let i = 0; i < 5; i++) {
+    if ((await bridge.exists(BADGE)) !== shown) throw new Error(`ASSERTION FAILED: ${message} (changed after ${i * 200}ms)`);
+    await sleep(200);
+  }
+  const seen = await bridge.eval(`
+    const b = e2e.first(${JSON.stringify(BADGE)});
+    const r = b?.getBoundingClientRect();
+    return { topbar: e2e.norm(e2e.first(".topbar")?.innerText), badge: b ? { text: e2e.norm(b.innerText), x: r.x, y: r.y, w: r.width, h: r.height } : null };
+  `);
+  log(`  ok — ${message}   (top bar: ${JSON.stringify(seen)})`);
+}
+
+/**
+ * Opens Settings, unlocks the hidden "Flags" tab (7 clicks on the panel
+ * title, the real gesture — see Settings.tsx handleTitleClick), sets the
+ * dummyProofSurface override ("default" | "on" | "off"), waits for it to
+ * land in the app's settings, then closes Settings.
+ */
+async function setFlagOverride(bridge, value) {
+  await bridge.clickByName("Settings");
+  await bridge.waitFor("the Settings dialog", `return !!e2e.first('[role="dialog"] .settings-title');`);
+
+  await bridge.eval(`
+    const title = e2e.must(e2e.first(".settings-title"), "settings title");
+    for (let i = 0; i < 7; i++) e2e.click(title);
+    return { clicked: 7 };
+  `);
+  await bridge.waitFor("the hidden Flags tab to appear", `
+    return e2e.all(".settings-tab").some((el) => e2e.norm(el.innerText) === "Flags");
+  `);
+  await bridge.eval(`
+    const tab = e2e.all(".settings-tab").find((el) => e2e.norm(el.innerText) === "Flags");
+    return e2e.click(e2e.must(tab, "Flags tab"));
+  `);
+  await bridge.waitFor("the flag override select", `return !!e2e.first("select.settings-select");`);
+
+  const result = await bridge.eval(`
+    const sel = e2e.must(e2e.first("select.settings-select"), "flag override select");
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value").set;
+    setter.call(sel, ${JSON.stringify(value)});
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    return { value: sel.value };
+  `);
+  assert(result.value === value, `flag override select now shows "${value}"`);
+
+  const expected = value === "default" ? "undefined" : value === "on" ? "true" : "false";
+  // updateSetting fires the write without awaiting it: wait until it lands.
+  await bridge.waitFor("the override to be saved", `
+    const raw = await window.__TAURI_INTERNALS__.invoke("get_settings");
+    const overrides = raw.feature_flag_overrides ? JSON.parse(raw.feature_flag_overrides) : {};
+    return overrides.dummyProofSurface === ${expected};
+  `);
+
+  await bridge.click(".settings-close");
+  await bridge.waitFor("the Settings dialog to close", `return !e2e.first(".settings-title");`);
+}
+
+/** Quit and require a clean exit (so the database is closed and flushed). */
+async function quit(current) {
+  const exit = await current.stop();
+  log(`  app exited: ${JSON.stringify(exit)}`);
+  assert(!exit.forced && exit.code === 0, "the app quit cleanly");
+}
+
+/** Store update_channel in the closed app's database, as the Settings control would. */
+function setUpdateChannel(dataDir, channel) {
+  const file = join(dataDir, DB_FILE);
+  assert(existsSync(file), `the app database exists (${DB_FILE})`);
+  const db = new DatabaseSync(file);
+  try {
+    db.prepare(
+      `INSERT INTO settings (key, value, updated_at) VALUES ('update_channel', ?, datetime('now'))
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+    ).run(channel);
+    const row = db.prepare(`SELECT value FROM settings WHERE key = 'update_channel'`).get();
+    assert(row?.value === channel, `update_channel = ${channel} is stored`);
+  } finally {
+    db.close();
+  }
+}
+
+let app;
+let failed = false;
+
+try {
+  log(`scenario: ${SCENARIO}   platform: ${platform()}`);
+
+  // ── run 1: fresh install, stable, no override -> OFF ─────────────
+  log("step 1: fresh launch — stable channel, no override: the badge is OFF");
+  app = await launch(1, { first: true });
+  await completeOnboarding(app.bridge);
+  assert((await app.bridge.eval(`return e2e.all(".session-item").length;`)) === 0, "a fresh install (no sessions)");
+  await assertBadgeStays(app.bridge, false, "the flag badge is NOT shown on a fresh stable install");
+  await app.bridge.screenshot(join(evidenceDir, "01-stable-default.png"));
+
+  log("step 2: force the flag ON in the hidden Settings > Flags section");
+  await setFlagOverride(app.bridge, "on");
+  await assertBadgeStays(app.bridge, false, "still OFF in this session (flags are read once, at startup)");
+  await quit(app);
+
+  // ── run 2: stable, forced on -> ON ───────────────────────────────
+  log("step 3: relaunch — the forced-on override takes effect");
+  app = await launch(2);
+  await waitForReturningLaunch(app.bridge);
+  await app.bridge.waitFor("the flag badge to appear", `return !!e2e.first(${JSON.stringify(BADGE)});`);
+  await assertBadgeStays(app.bridge, true, "the flag badge IS shown with the override forced on");
+  await app.bridge.screenshot(join(evidenceDir, "02-stable-forced-on.png"));
+
+  log("step 4: clear the override (Default for channel), quit, switch this install to the beta channel");
+  await setFlagOverride(app.bridge, "default");
+  await quit(app);
+  setUpdateChannel(app.dataDir, "beta");
+
+  // ── run 3: beta, no override -> ON ───────────────────────────────
+  log("step 5: relaunch on the beta channel with no override — the badge is ON");
+  app = await launch(3);
+  await waitForReturningLaunch(app.bridge);
+  const stored = await app.bridge.eval(`
+    const raw = await window.__TAURI_INTERNALS__.invoke("get_settings");
+    return { channel: raw.update_channel ?? null, overrides: raw.feature_flag_overrides ?? null };
+  `);
+  log(`  settings seen by the app: ${JSON.stringify(stored)}`);
+  assert(stored.channel === "beta", "the app sees update_channel = beta");
+  assert(!stored.overrides || !("dummyProofSurface" in JSON.parse(stored.overrides)), "no override is set");
+  await app.bridge.waitFor("the flag badge to appear", `return !!e2e.first(${JSON.stringify(BADGE)});`);
+  await assertBadgeStays(app.bridge, true, "the flag badge IS shown on beta with no override");
+  await app.bridge.screenshot(join(evidenceDir, "03-beta-default.png"));
+
+  log("step 6: force the flag OFF");
+  await setFlagOverride(app.bridge, "off");
+  await assertBadgeStays(app.bridge, true, "still ON in this session (flags are read once, at startup)");
+  await quit(app);
+
+  // ── run 4: beta, forced off -> OFF ───────────────────────────────
+  log("step 7: relaunch — turning the flag off hides it on next launch");
+  app = await launch(4);
+  await waitForReturningLaunch(app.bridge);
+  await sleep(500);
+  await assertBadgeStays(app.bridge, false, "the flag badge is hidden on beta after forcing it off and relaunching");
+  await app.bridge.screenshot(join(evidenceDir, "04-beta-forced-off.png"));
+} catch (e) {
+  failed = true;
+  log(`FAILED: ${e?.stack ?? e}`);
+  try {
+    if (app?.isRunning()) {
+      await app.bridge.screenshot(join(evidenceDir, "99-failure.png"));
+      const dump = await app.bridge.eval(`
+        return {
+          buttons: e2e.all("button").map(e2e.nameOf).slice(0, 40),
+          dialogs: [...document.querySelectorAll('[class*="backdrop"],[class*="overlay"]')].map((e) => e.className),
+        };
+      `);
+      log(`  what the app showed: ${JSON.stringify(dump)}`);
+    }
+  } catch (inner) {
+    log(`  (could not capture failure evidence: ${inner.message})`);
+  }
+} finally {
+  if (app?.isRunning()) {
+    log("step 8: quit the app");
+    const exit = await app.stop();
+    log(`  app exited: ${JSON.stringify(exit)}`);
+    if (!failed && (exit.forced || exit.code !== 0)) {
+      failed = true;
+      log("FAILED: the app did not quit cleanly");
+    }
+  }
+  if (homeDir) rmSync(homeDir, { recursive: true, force: true });
+}
+
+finishScenario({ scenario: SCENARIO, evidenceDir, failed, startedAt, log });

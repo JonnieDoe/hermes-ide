@@ -4,6 +4,7 @@ import { exit } from "@tauri-apps/plugin-process";
 import App from "./App";
 import { getStartupProblem } from "./api/startupProblem";
 import { StartupProblemScreen } from "./components/StartupProblemScreen";
+import { initFeatureFlags } from "./featureFlags";
 import "./styles/tokens.css";
 import "./styles/base.css";
 
@@ -34,9 +35,23 @@ const root = ReactDOM.createRoot(document.getElementById("root") as HTMLElement)
 // If Hermes could not open its data (for example, it was saved by a newer
 // version), explain that instead of starting the workspace.
 void getStartupProblem().then((problem) => {
-  root.render(
-    <React.StrictMode>
-      {problem ? <StartupProblemScreen problem={problem} onQuit={() => void exit(0)} /> : <App />}
-    </React.StrictMode>,
-  );
+  if (problem) {
+    root.render(
+      <React.StrictMode>
+        <StartupProblemScreen problem={problem} onQuit={() => void exit(0)} />
+      </React.StrictMode>,
+    );
+    return;
+  }
+  // Feature flags are read once, here, before the workspace renders — see
+  // src/featureFlags/index.ts. It never rejects, and gives up after a short
+  // timeout (flags then stay at their stable default for this launch), so a
+  // slow backend can never leave a blank window.
+  void initFeatureFlags().finally(() => {
+    root.render(
+      <React.StrictMode>
+        <App />
+      </React.StrictMode>,
+    );
+  });
 });
