@@ -1989,6 +1989,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "base64 0.22.1",
+ "block2",
  "chrono",
  "criterion",
  "dirs 6.0.0",
@@ -1996,12 +1997,17 @@ dependencies = [
  "env_logger",
  "flate2",
  "git2",
+ "gtk",
  "ignore",
  "image",
  "lazy_static",
  "libc",
  "log",
  "notify",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "objc2-web-kit",
  "portable-pty",
  "regex",
  "reqwest 0.12.28",
@@ -2023,6 +2029,7 @@ dependencies = [
  "tokio",
  "uuid",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
