@@ -59,8 +59,9 @@ import {
   loadNotesMap,
   serializeNotesMap,
 } from "../utils/workbenchLayout";
-import { spawnAgentSession, closeAgentSession, sendAgentInput, updateHermesState, setAgentPermissionMode } from "../api/agent";
+import { spawnAgentSession, restartAgentSession, closeAgentSession, sendAgentInput, updateHermesState, setAgentPermissionMode } from "../api/agent";
 import { reportAgentSpawnFailure } from "../utils/agentSpawnFailure";
+import { createRespawnQueue, respawnJoinDisabledForTest } from "../utils/respawnQueue";
 import { destroyAgentSessionStore } from "../agent/agentSessionStore";
 import { cleanupSessionRefs } from "../utils/sessionRefCleanup";
 import { cacheAgentInit, clearAgentInitCache, peekAgentInitCache } from "../agent/useAgentInit";
@@ -1164,6 +1165,9 @@ export function SessionProvider({ children }: { children: ReactNode }) {
    *  detects the diff and triggers a respawn so Read/Edit tools can
    *  actually access files in newly-attached paths. */
   const claudeAddDirs = useRef<Map<string, string[]>>(new Map());
+  /** Per-session respawn lock: overlapping plain restarts join one restart
+   *  (see utils/respawnQueue.ts). */
+  const respawnQueue = useRef(createRespawnQueue());
   /** sessionId → "already auto-named, don't try again". Prevents racing
    *  duplicate label writes if the user submits two messages in quick
    *  succession before the first persist round-trip completes. */
@@ -2261,7 +2265,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
    *  The `claudeUuids` map is updated to whichever id Claude returned
    *  (same id on plain resume, new id on fork) so subsequent respawns
    *  continue from the latest active session. */
-  const respawnAgent = useCallback(async (
+  const respawnAgentNow = useCallback(async (
     sessionId: string,
     overrides: {
       model?: string | null;
@@ -2318,11 +2322,10 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     try {
       void attachInitListener(sessionId);
 
-      await closeAgentSession(sessionId).catch((err) => {
-        console.warn("[SessionContext] closeAgentSession during respawn:", err);
-      });
-
-      const newUuid = await spawnAgentSession({
+      // One backend call stops the old process and starts the new one under
+      // the session's spawn lock: restarts that overlap (a double-clicked
+      // Retry, a submit racing a card's reply) start a single process.
+      const newUuid = await restartAgentSession({
         sessionId,
         workingDir: session.working_directory,
         priorUuid,
@@ -2351,6 +2354,26 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       return false;
     }
   }, [attachInitListener]);
+
+  /** `respawnAgentNow` behind the per-session respawn lock. */
+  const respawnAgent = useCallback((
+    sessionId: string,
+    overrides: {
+      model?: string | null;
+      permissionMode?: string | null;
+      effort?: string | null;
+    },
+  ): Promise<boolean> => {
+    const carriesSettings =
+      overrides.model !== undefined ||
+      overrides.permissionMode !== undefined ||
+      overrides.effort !== undefined;
+    return respawnQueue.current.run(
+      sessionId,
+      { joinable: !carriesSettings && !respawnJoinDisabledForTest() },
+      () => respawnAgentNow(sessionId, overrides),
+    );
+  }, [respawnAgentNow]);
 
   // Switch the active model on a live agent-mode session.  Claude's
   // stream-json subprocess takes the model as a spawn-time flag, and the
