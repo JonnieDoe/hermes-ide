@@ -3,12 +3,12 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::thread;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
-use crate::db::{Database, ExecutionNode, SessionWorktreeRow};
+use crate::db::{Database, SessionWorktreeRow};
 use crate::pty::adapters::now;
-use crate::pty::analyzer::{CommandPredictionEvent, OutputAnalyzer};
+use crate::pty::analyzer::OutputAnalyzer;
 use crate::pty::models::*;
 use crate::pty::{
     ai_launch_command, channels_suffix, detect_shell, get_working_directory, PtySession,
@@ -1064,16 +1064,11 @@ pub fn create_session(
     // crashes in multi-threaded processes ("multi-threaded process forked").
     // Use posix_spawn() instead which atomically creates the child process.
     // See issue #31 and issue-31-investigation.md.
-    // Save the slave TTY path before spawning — needed later for direct
-    // SIGINT delivery via tcgetpgrp()/kill() when the line discipline
-    // fails to convert \x03 into a signal.
-    #[cfg(target_os = "macos")]
-    let saved_tty_path = pair.master.tty_name();
-
     #[cfg(target_os = "macos")]
     let child = {
-        let tty_path = saved_tty_path
-            .clone()
+        let tty_path = pair
+            .master
+            .tty_name()
             .ok_or_else(|| "Failed to get PTY device path for posix_spawn".to_string())?;
         // Drop the slave end — the child opens the TTY by path via posix_spawn
         // file actions.  CTT assignment is handled by the --pty-setup trampoline.
@@ -1160,12 +1155,6 @@ pub fn create_session(
                         }
                         let data = &buf[..n];
 
-                        // Declare outside analyzer lock scope so DB work can
-                        // access them after the lock is released.
-                        let mut completed = Vec::new();
-                        let mut recent_cmds_snapshot: Option<std::collections::VecDeque<String>> =
-                            None;
-
                         if let Ok(mut a) = analyzer_clone.lock() {
                             a.process(data);
 
@@ -1177,16 +1166,6 @@ pub fn create_session(
                                 let _ = app_clone
                                     .emit(&format!("cwd-changed-{}", event_session_id), &new_cwd);
                             }
-
-                            // Drain completed nodes — processed OUTSIDE the analyzer
-                            // lock to prevent AB-BA deadlock with do_save_workspace
-                            // (which acquires db → analyzer; here we'd be analyzer → db).
-                            completed = a.drain_completed_nodes();
-                            recent_cmds_snapshot = if !completed.is_empty() {
-                                Some(a.recent_commands.clone())
-                            } else {
-                                None
-                            };
 
                             if let Some(new_phase) = a.take_pending_phase() {
                                 if let Ok(mut s) = session_clone.lock() {
@@ -1351,153 +1330,6 @@ pub fn create_session(
                                     // Phase-change paths already set it on real activity.
                                     let update = SessionUpdate::from(&*s);
                                     let _ = app_clone.emit("session-updated", &update);
-                                }
-                            }
-                        }
-
-                        // ─── DB work: analyzer lock is NOT held ──────────
-                        // Process completed execution nodes with the DB lock.
-                        // This runs after releasing the analyzer lock to maintain
-                        // consistent lock ordering (db before analyzer) and prevent
-                        // deadlocks with save_workspace_state / save_all_snapshots.
-                        if !completed.is_empty() {
-                            if let Some(mut recent_cmds) = recent_cmds_snapshot {
-                                if let Ok(db) = app_clone.state::<AppState>().db.lock() {
-                                    for node in &completed {
-                                        let node_id = db
-                                            .insert_execution_node(
-                                                &event_session_id,
-                                                node.timestamp,
-                                                &node.kind,
-                                                node.input.as_deref(),
-                                                node.output_summary.as_deref(),
-                                                node.exit_code,
-                                                &node.working_dir,
-                                                node.duration_ms,
-                                                None,
-                                            )
-                                            .ok();
-
-                                        // Emit execution-node event
-                                        if let Some(id) = node_id {
-                                            let exec_node = ExecutionNode {
-                                                id,
-                                                session_id: event_session_id.clone(),
-                                                timestamp: node.timestamp,
-                                                kind: node.kind.clone(),
-                                                input: node.input.clone(),
-                                                output_summary: node.output_summary.clone(),
-                                                exit_code: node.exit_code,
-                                                working_dir: node.working_dir.clone(),
-                                                duration_ms: node.duration_ms,
-                                                metadata: None,
-                                            };
-                                            let _ = app_clone.emit(
-                                                &format!("execution-node-{}", event_session_id),
-                                                &exec_node,
-                                            );
-                                        }
-
-                                        let project_id: Option<String> =
-                                            Some(node.working_dir.clone());
-
-                                        // Command sequence tracking — push FIRST then record
-                                        if node.kind == "command" {
-                                            if let Some(ref input) = node.input {
-                                                let normalized = input
-                                                    .trim()
-                                                    .trim_start_matches('$')
-                                                    .trim()
-                                                    .to_string();
-                                                if !normalized.is_empty() {
-                                                    recent_cmds.push_back(normalized.clone());
-                                                    if recent_cmds.len() > 5 {
-                                                        recent_cmds.pop_front();
-                                                    }
-
-                                                    let cmds: Vec<String> =
-                                                        recent_cmds.iter().cloned().collect();
-                                                    if cmds.len() >= 2 {
-                                                        let prev: Vec<&str> = cmds
-                                                            [..cmds.len() - 1]
-                                                            .iter()
-                                                            .rev()
-                                                            .take(2)
-                                                            .map(|s| s.as_str())
-                                                            .collect::<Vec<_>>()
-                                                            .into_iter()
-                                                            .rev()
-                                                            .collect();
-                                                        let seq_json = serde_json::to_string(&prev)
-                                                            .unwrap_or_default();
-                                                        db.record_command_sequence(
-                                                            project_id.as_deref(),
-                                                            &seq_json,
-                                                            &normalized,
-                                                        )
-                                                        .ok();
-                                                    }
-                                                    if cmds.len() >= 3 {
-                                                        let prev: Vec<&str> = cmds
-                                                            [..cmds.len() - 1]
-                                                            .iter()
-                                                            .rev()
-                                                            .take(3)
-                                                            .map(|s| s.as_str())
-                                                            .collect::<Vec<_>>()
-                                                            .into_iter()
-                                                            .rev()
-                                                            .collect();
-                                                        let seq_json = serde_json::to_string(&prev)
-                                                            .unwrap_or_default();
-                                                        db.record_command_sequence(
-                                                            project_id.as_deref(),
-                                                            &seq_json,
-                                                            &normalized,
-                                                        )
-                                                        .ok();
-                                                    }
-
-                                                    // Query predictions and emit
-                                                    let seq: Vec<&str> = cmds
-                                                        .iter()
-                                                        .rev()
-                                                        .take(2)
-                                                        .collect::<Vec<_>>()
-                                                        .into_iter()
-                                                        .rev()
-                                                        .map(|s| s.as_str())
-                                                        .collect();
-                                                    let seq_json = serde_json::to_string(&seq)
-                                                        .unwrap_or_default();
-                                                    if let Ok(predictions) = db
-                                                        .predict_next_command(
-                                                            project_id.as_deref(),
-                                                            &seq_json,
-                                                            3,
-                                                        )
-                                                    {
-                                                        if !predictions.is_empty() {
-                                                            let evt = CommandPredictionEvent {
-                                                                predictions,
-                                                            };
-                                                            let _ = app_clone.emit(
-                                                                &format!(
-                                                                    "command-prediction-{}",
-                                                                    event_session_id
-                                                                ),
-                                                                &evt,
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                // Write back updated recent_commands to analyzer
-                                if let Ok(mut a) = analyzer_clone.lock() {
-                                    a.recent_commands = recent_cmds;
                                 }
                             }
                         }
@@ -1700,8 +1532,6 @@ pub fn create_session(
         session: session_arc,
         analyzer,
         child,
-        #[cfg(target_os = "macos")]
-        tty_path: saved_tty_path,
         shell_integration,
         hermes_suggestions: disable_native_suggestions,
     };
@@ -1816,49 +1646,6 @@ pub fn write_to_session(
 
     if let Ok(mut a) = session.analyzer.lock() {
         a.mark_input_sent();
-
-        // While a TUI owns the screen (vim, less, htop, claude, etc.) the
-        // line buffer must stay quiescent. Keystrokes typed at a TUI are
-        // application input, not shell commands, and recording them would
-        // pollute the execution-node stream and feed garbage into the
-        // command-prediction system (issue #172).
-        if !a.in_alternate_screen {
-            let text = String::from_utf8_lossy(&bytes);
-            let is_enter = text.contains('\r') || text.contains('\n');
-
-            // Accumulate printable chars into the line buffer
-            for ch in text.chars() {
-                if ch == '\r' || ch == '\n' {
-                    // Enter pressed — commit the accumulated line
-                    continue;
-                } else if ch == '\x7f' || ch == '\x08' {
-                    // Backspace — pop last char
-                    a.input_line_buffer.pop();
-                } else if ch == '\x03' {
-                    // Ctrl+C — clear buffer
-                    a.input_line_buffer.clear();
-                } else if !ch.is_control() {
-                    a.input_line_buffer.push(ch);
-                }
-            }
-
-            if is_enter && !a.input_line_buffer.is_empty() {
-                let line = std::mem::take(&mut a.input_line_buffer);
-                a.mark_input_line(&line);
-                let cwd = a.current_cwd.clone().unwrap_or_default();
-                a.start_node(&cwd);
-            } else if is_enter {
-                // Enter with empty buffer — still mark activity
-                a.input_line_buffer.clear();
-            }
-        } else {
-            // Defensive: a TUI may launch mid-line. Any half-typed shell
-            // command in the buffer at that point isn't a real command —
-            // drop it so we don't commit it on the next post-TUI Enter.
-            if !a.input_line_buffer.is_empty() {
-                a.input_line_buffer.clear();
-            }
-        }
     }
 
     {
@@ -1919,42 +1706,49 @@ pub fn write_to_session(
 /// vim, htop, etc.) is running in the foreground.
 ///
 /// Strategy:
-///   1. macOS — open the TTY slave device and call `tcgetpgrp()` to get the
-///      foreground PGID, then compare with the shell's own PGID.
-///   2. Linux — read `/proc/{pid}/stat` to obtain `pgrp` and `tpgid`.
-///   3. Fallback — enumerate the shell's direct children; if none exist the
-///      shell is assumed to be at its prompt.
+///   1. macOS and Linux — `tcgetpgrp()` on the PTY master gives the
+///      terminal's foreground process group; compare it with the shell's.
+///      (The slave side cannot be used: on macOS `tcgetpgrp()` on a terminal
+///      that is not this process's controlling terminal fails with ENOTTY.)
+///   2. Linux fallback — read `/proc/{pid}/stat` to obtain `pgrp` and `tpgid`.
+///   3. Windows (no process groups on a pseudo console) and the last Unix
+///      fallback — the shell is at its prompt when it has no child process.
+///      A program the shell started, such as an agent CLI, is its child.
+///      Without process groups a background job (`npm run dev &`) cannot be
+///      told apart from a foreground one, so on Windows suggestions also stay
+///      off while the shell has one running. Erring that way never draws over
+///      an agent.
 #[tauri::command]
-pub fn is_shell_foreground(state: State<'_, AppState>, session_id: String) -> Result<bool, String> {
-    let mgr = state.pty_manager.lock().unwrap_or_else(|e| e.into_inner());
-    let session = mgr
-        .sessions
-        .get(&session_id)
-        .ok_or_else(|| format!("Session {} not found", session_id))?;
+pub async fn is_shell_foreground(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<bool, String> {
+    // Hold the PTY manager lock only for what needs the session: its shell
+    // pid and, on Unix, one tcgetpgrp() on the master. Keystrokes are written
+    // under the same lock, so the slower fallbacks below (the Windows one
+    // scans the whole process table) run after it is released.
+    let (shell_pid, from_master) = {
+        let mgr = state.pty_manager.lock().unwrap_or_else(|e| e.into_inner());
+        let session = mgr
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| format!("Session {} not found", session_id))?;
+        let shell_pid = session
+            .child
+            .process_id()
+            .ok_or_else(|| "Shell process ID not available".to_string())?;
 
-    let shell_pid = session
-        .child
-        .process_id()
-        .ok_or_else(|| "Shell process ID not available".to_string())?;
+        // ── macOS and Linux: the foreground process group, from the master ──
+        #[cfg(unix)]
+        let from_master = shell_group_is_foreground(session.master.as_ref(), shell_pid);
+        #[cfg(not(unix))]
+        let from_master: Option<bool> = None;
 
-    // ── macOS: tcgetpgrp on the TTY slave ──
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(ref tty_path) = session.tty_path {
-            if let Ok(tty_cstr) = std::ffi::CString::new(tty_path.to_string_lossy().into_owned()) {
-                let fd = unsafe { libc::open(tty_cstr.as_ptr(), libc::O_RDONLY | libc::O_NOCTTY) };
-                if fd >= 0 {
-                    let fg_pgid = unsafe { libc::tcgetpgrp(fd) };
-                    unsafe { libc::close(fd) };
-                    if fg_pgid > 0 {
-                        let shell_pgid = unsafe { libc::getpgid(shell_pid as i32) };
-                        if shell_pgid > 0 {
-                            return Ok(fg_pgid == shell_pgid);
-                        }
-                    }
-                }
-            }
-        }
+        (shell_pid, from_master)
+    };
+
+    if let Some(owns) = from_master {
+        return Ok(owns);
     }
 
     // ── Linux: read tpgid from /proc/{pid}/stat ──
@@ -1984,8 +1778,49 @@ pub fn is_shell_foreground(state: State<'_, AppState>, session_id: String) -> Re
         Ok(children.is_empty())
     }
 
+    // Windows: the process-table scan blocks, so keep it off the async
+    // runtime's worker threads.
     #[cfg(not(unix))]
-    Ok(true)
+    {
+        tokio::task::spawn_blocking(move || !has_child_process(shell_pid))
+            .await
+            .map_err(|e| format!("Foreground check failed: {}", e))
+    }
+}
+
+/// Whether the shell's process group is the terminal's foreground process
+/// group, or `None` when either cannot be read.
+#[cfg(unix)]
+fn shell_group_is_foreground(
+    master: &(dyn portable_pty::MasterPty + Send),
+    shell_pid: u32,
+) -> Option<bool> {
+    let foreground = master.process_group_leader()?;
+    let shell_pgid = unsafe { libc::getpgid(shell_pid as i32) };
+    if shell_pgid <= 0 {
+        return None;
+    }
+    Some(foreground == shell_pgid)
+}
+
+/// Whether any running process has `parent_pid` as its parent. The console
+/// host Windows may start for a console program is not a program the user
+/// ran, so it does not count. Windows reuses process ids and keeps an
+/// orphan's old parent id, so a process that started before the shell was
+/// the child of an earlier process with the same id, and does not count.
+#[cfg(any(not(unix), test))]
+fn has_child_process(parent_pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let parent = Pid::from_u32(parent_pid);
+    let parent_started = sys.process(parent).map_or(0, |p| p.start_time());
+    sys.processes().values().any(|p| {
+        p.parent() == Some(parent) && p.start_time() >= parent_started && {
+            let name = p.name().to_string_lossy().to_ascii_lowercase();
+            name != "conhost.exe" && name != "openconsole.exe"
+        }
+    })
 }
 
 #[tauri::command]
@@ -4147,5 +3982,130 @@ mod ssh_command_tests {
         let pty = pty_args(&i);
         let dest = pty.iter().position(|a| a == "-oProxyCommand=x").unwrap();
         assert_eq!(pty[dest - 1], "--");
+    }
+}
+
+#[cfg(test)]
+mod foreground_tests {
+    use super::has_child_process;
+    #[cfg(unix)]
+    use std::io::Write;
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
+    /// A process that starts a child of its own and waits for it.
+    fn parent_with_child() -> Child {
+        #[cfg(windows)]
+        let child = Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+            .spawn();
+        #[cfg(not(windows))]
+        let child = Command::new("sh").args(["-c", "sleep 30; true"]).spawn();
+        child.unwrap()
+    }
+
+    /// A process that starts nothing.
+    fn lone_process() -> Child {
+        #[cfg(windows)]
+        let child = Command::new("ping").args(["-n", "30", "127.0.0.1"]).spawn();
+        #[cfg(not(windows))]
+        let child = Command::new("sleep").arg("30").spawn();
+        child.unwrap()
+    }
+
+    fn eventually(mut check: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if check() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    #[test]
+    fn a_program_the_shell_started_is_seen_as_its_child() {
+        let mut shell = parent_with_child();
+        let seen = eventually(|| has_child_process(shell.id()));
+        let _ = shell.kill();
+        let _ = shell.wait();
+        assert!(seen, "the running child was not found");
+    }
+
+    /// An interactive shell in a PTY, started the way sessions start it.
+    #[cfg(unix)]
+    fn interactive_shell() -> (
+        portable_pty::PtyPair,
+        Box<dyn portable_pty::Child + Send + Sync>,
+        Box<dyn std::io::Write + Send>,
+    ) {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-i");
+        cmd.env("PS1", "$ ");
+        cmd.cwd(std::env::temp_dir());
+        #[cfg(target_os = "macos")]
+        let child = {
+            let tty = pair.master.tty_name().unwrap();
+            crate::pty::spawn::posix_spawn_in_pty(&cmd, &tty).unwrap()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let child = pair.slave.spawn_command(cmd).unwrap();
+        // Keep the PTY drained so the shell never blocks on output.
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = std::io::Read::read(&mut reader, &mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        let writer = pair.master.take_writer().unwrap();
+        (pair, child, writer)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_started_at_the_prompt_owns_the_terminal_until_it_exits() {
+        use super::shell_group_is_foreground;
+        let (pair, mut shell, mut input) = interactive_shell();
+        let pid = shell.process_id().unwrap();
+        let owns = || shell_group_is_foreground(pair.master.as_ref(), pid);
+
+        let at_prompt = eventually(|| owns() == Some(true));
+        input.write_all(b"sleep 3\n").unwrap();
+        input.flush().unwrap();
+        let while_running = eventually(|| owns() == Some(false));
+        let after_exit = eventually(|| owns() == Some(true));
+
+        let _ = shell.kill();
+        let _ = shell.wait();
+        assert!(at_prompt, "the shell owns the terminal at its prompt");
+        assert!(while_running, "the program owns the terminal while it runs");
+        assert!(
+            after_exit,
+            "the shell owns the terminal again after it exits"
+        );
+    }
+
+    #[test]
+    fn a_process_with_nothing_running_has_no_child() {
+        let mut lone = lone_process();
+        // Give it time to start; it never gains a child.
+        std::thread::sleep(Duration::from_millis(300));
+        let found = has_child_process(lone.id());
+        let _ = lone.kill();
+        let _ = lone.wait();
+        assert!(!found, "found a child that does not exist");
     }
 }
