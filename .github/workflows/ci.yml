@@ -87,6 +87,20 @@ jobs:
               - 'scripts/stage-bridge-deps.mjs'
               - 'e2e/**'
 
+  # ── Dev and test builds never run as the installed app ───────────────
+  instance-identifiers:
+    name: Instance Identifiers
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 22
+      - name: Dev and e2e configs never use the production identifier
+        run: node scripts/check-instance-identifiers.mjs
+
   # ── Frontend: TypeScript + Tests (merged into one job) ───────────────
   frontend:
     name: Frontend
@@ -301,6 +315,7 @@ jobs:
             set -e
             node e2e/app/run.mjs --repeat "$REPEAT" terminal-echo.mjs
             node e2e/app/run.mjs --keep-going N01-bridge-safety.mjs N01-acceptance-gate.mjs N01-release-refuses-e2e.mjs
+            node e2e/app/run.mjs --keep-going N02-instance-isolation.mjs
           '
 
       - name: Run scenarios
@@ -312,6 +327,7 @@ jobs:
           export CARGO_TERM_COLOR=never
           node e2e/app/run.mjs --repeat "$REPEAT" terminal-echo.mjs
           node e2e/app/run.mjs --keep-going N01-bridge-safety.mjs N01-acceptance-gate.mjs
+          node e2e/app/run.mjs --keep-going N02-instance-isolation.mjs
 
       - name: Upload evidence
         if: always()
@@ -414,7 +430,7 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [changes, frontend, rust-fmt, rust-clippy, rust-test, e2e-app, acceptance, privacy]
+    needs: [changes, frontend, rust-fmt, rust-clippy, rust-test, e2e-app, acceptance, privacy, instance-identifiers]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
