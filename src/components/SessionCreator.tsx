@@ -32,6 +32,8 @@ import type { PermissionMode, SessionMode, TmuxSessionEntry } from "../types/ses
 import { isGitRepo as checkIsGitRepo } from "../api/git";
 import { LANG_COLORS } from "../utils/langColors";
 import { SessionBranchSelector } from "./SessionBranchSelector";
+import { isFeatureFlagEnabled } from "../featureFlags";
+import { randomTaskSlug } from "../state/isolation";
 import { SESSION_COLORS } from "./SessionList";
 import {
   SessionCreatorModeStep,
@@ -197,8 +199,15 @@ export function SessionCreator({ onClose, onCreate, defaultGroup, initialMode, o
   type BranchSelection = { branch: string; createNew: boolean; fromRemote?: string };
   const [gitProjectIds, setGitProjectIds] = useState<string[]>([]);
   const [checkingGit, setCheckingGit] = useState(false);
+  // The selection the git check last answered for (see gitCheckPending).
+  const [gitCheckedFor, setGitCheckedFor] = useState<readonly string[] | null>(null);
   const [branchSelections, setBranchSelections] = useState<Record<string, BranchSelection>>({});
   const [expandedProjectId, setExpandedProjectId] = useState<string | null>(null);
+  // Honest isolation: one slug per task, so every project of this task
+  // defaults to the same hermes/<slug> branch.
+  const [defaultTaskSlug] = useState<string | undefined>(() =>
+    isFeatureFlagEnabled("honestIsolation") ? randomTaskSlug() : undefined,
+  );
 
   // Resolve session-mode that gets persisted to the session.  Agent mode is
   // Claude-only; ssh always = terminal (per v1.0.0 — see playbook §8).
@@ -488,6 +497,7 @@ export function SessionCreator({ onClose, onCreate, defaultGroup, initialMode, o
         if (cancelled) return;
         const gitIds = results.filter((r) => r.isGit).map((r) => r.projectId);
         setGitProjectIds(gitIds);
+        setGitCheckedFor(selectedProjectIds);
         setBranchSelections((prev) => {
           const next: Record<string, BranchSelection> = {};
           for (const [id, sel] of Object.entries(prev)) {
@@ -503,6 +513,13 @@ export function SessionCreator({ onClose, onCreate, defaultGroup, initialMode, o
       });
     return () => { cancelled = true; };
   }, [selectedProjectIds]);
+
+  // Next waits until the git check has answered for THIS selection. Right
+  // after a folder is picked there is a render before the check starts;
+  // moving on then would skip the branch step (and with it the task's own
+  // worktree).
+  const gitCheckPending =
+    checkingGit || (selectedProjectIds.length > 0 && gitCheckedFor !== selectedProjectIds);
 
   const filtered = useMemo(() => {
     if (!query) return allProjects;
@@ -733,7 +750,7 @@ export function SessionCreator({ onClose, onCreate, defaultGroup, initialMode, o
         toggleProject(filtered[highlightedIndex].id);
       } else if (e.key === "Enter" && highlightedIndex >= 0) {
         e.preventDefault();
-        goNext();
+        if (!gitCheckPending) goNext();
       }
     } else if (step === "ai") {
       if (e.key === "ArrowDown" || e.key === "ArrowRight") {
@@ -1075,9 +1092,9 @@ export function SessionCreator({ onClose, onCreate, defaultGroup, initialMode, o
               <button
                 className="session-creator-btn-primary"
                 onClick={goNext}
-                disabled={checkingGit}
+                disabled={gitCheckPending}
               >
-                {checkingGit ? t("common.checking") : isShellOnly
+                {gitCheckPending ? t("common.checking") : isShellOnly
                   ? t("common.next")
                   : t("common.selectedCount", { count: selectedProjectIds.length })}
               </button>
@@ -1135,6 +1152,7 @@ export function SessionCreator({ onClose, onCreate, defaultGroup, initialMode, o
                           // re-expand, retrigger the auto-advance effect
                           // below, and snap the panel shut).
                           existingBranchName={branchSelections[projectId]?.branch}
+                          defaultTaskSlug={defaultTaskSlug}
                           onBranchSelected={(name, isNew, fromRemote) => {
                             setBranchSelections((prev) => ({
                               ...prev,
