@@ -567,9 +567,24 @@ pub(crate) fn save_workspace_state(app: &tauri::AppHandle) {
     }
     do_save_workspace(app);
 
-    // Remove the startup marker to signal a clean shutdown
+    fold_database_log(app);
     if let Some(state) = app.try_state::<AppState>() {
+        // Remove the startup marker to signal a clean shutdown
         let _ = std::fs::remove_file(&state.startup_marker_path);
+    }
+}
+
+/// Everything saved goes into the database file itself (CHAOS-14). Runs on
+/// the first save at quit and again at the very end: a quit answered in the
+/// keep-or-stop dialog saves first, and the frontend's own save and the
+/// stopped sessions write after that.
+fn fold_database_log(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(db) = state.db.lock() {
+            if let Err(e) = db.checkpoint_wal() {
+                log::warn!("[hermes] could not fold the database log on quit: {e}");
+            }
+        }
     }
 }
 
@@ -816,6 +831,8 @@ pub fn run() {
             agent_caps::commands::relaunch_agent,
             task_launcher::task_repo_probe,
             task_launcher::task_write_feature_file,
+            task_launcher::task_track_prompt,
+            task_launcher::task_write_done_when,
             // Session management
             pty::create_session,
             pty::ssh_list_directory,
@@ -982,6 +999,10 @@ pub fn run() {
             git::git_attach_worktree,
             git::git_detach_worktree,
             git::git_commit_worktree,
+            git::git_commit_kept_worktree,
+            git::git_save_kept_detached_head,
+            git::git_keep_worktree,
+            git::git_remove_leftover_worktree,
             // Worktree overview & cleanup
             git::git_list_all_worktrees,
             git::git_detect_orphan_worktrees,
@@ -1017,6 +1038,7 @@ pub fn run() {
             plugin_identity::revoke_plugin_token,
             // Clipboard
             clipboard::copy_image_to_clipboard,
+            platform::read_clipboard_text,
             // Transcript watching
             transcript::start_transcript_watcher,
             transcript::stop_transcript_watcher,
@@ -1025,6 +1047,7 @@ pub fn run() {
             agent::restart_agent_session,
             agent::send_agent_input,
             agent::interrupt_agent,
+            agent::force_stop_agent,
             agent::close_agent_session,
             agent::check_claude_cli,
             agent::read_image_for_attachment,
@@ -1048,6 +1071,8 @@ pub fn run() {
             turn_ledger::turn_ledger_turn_ended,
             turn_ledger::preview_restore_turn,
             turn_ledger::restore_turn,
+            turn_ledger::undo_restore_turn,
+            turn_ledger::turn_ledger_between,
             // Review Desk (F21): merge-base diff, revert a turn, review file.
             review::review_diff,
             review::review_revert_preview,
@@ -1071,6 +1096,8 @@ pub fn run() {
             track::track_skip,
             track::track_revert_gate,
             track::track_promote,
+            track::track_promote_plan,
+            track::track_undo_promote,
             track::track_read_file,
             track::track_file_path,
             track::track_write_review,
@@ -1079,6 +1106,7 @@ pub fn run() {
             // the answer to "keep running or stop?" on quit.
             session_host::session_host_status,
             session_host::session_host_quit,
+            session_host::session_host_set_queued,
             session_host::session_host_stop_all,
             // Fleet controls (2.0: spend caps, task queue) — see fleet.rs.
             fleet::fleet_agent_load,
@@ -1139,6 +1167,7 @@ pub fn run() {
             tauri::RunEvent::Exit => {
                 log::info!("[hermes] Exit — saving workspace");
                 save_workspace_state(app);
+                fold_database_log(app);
                 // Let the machine sleep again (F12 keep-awake).
                 attention::shutdown();
             }

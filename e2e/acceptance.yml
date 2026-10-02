@@ -457,6 +457,72 @@ features:
       FIX-branch-case-5:
         text: "The Branch In Use choice and the Git panel's New Branch check a new name against every local branch, letter case included, say which branch it is in words, and the choice offers that branch on purpose"
         scenarios: [FIX-branch-case.mjs, F09-honest-isolation.mjs, F09-isolation-edge-cases.mjs]
+  QA-git:
+    # Fixes from the git QA sweep (data safety first, then wording), not new
+    # 2.0 work and not behind a feature flag. Negative control (run by hand):
+    # a build of main before the fixes ends each scenario in RESULT: FAIL.
+    # Scenarios that need a POSIX shell (hooks, loops) or the session host
+    # run on macOS and Linux.
+    name: "Git operations, task worktrees and closing never lose work, and say what they do in plain words"
+    status: shipped
+    criteria:
+      QA-git-1:
+        text: "Pull keeps uncommitted edits the incoming commits do not touch, and stops (naming the file, never suggesting stash) when they would overwrite one"
+        scenarios: [QA-git-pull-keeps-uncommitted.mjs]
+      QA-git-2:
+        text: "A commit made inside a submodule of a task's worktree survives closing the task; edits inside a submodule are named and the worktree can be kept"
+        scenarios: ["QA-git-submodule-work-kept.mjs@darwin,linux"]
+      QA-git-3:
+        text: "Abort Merge asks first and keeps uncommitted edits the merge never touched"
+        scenarios: [QA-git-abort-merge-keeps-edits.mjs]
+      QA-git-4:
+        text: "Discard restores exactly the file it names, also when its name has [ ] * ?"
+        scenarios: [QA-git-discard-literal-path.mjs]
+      QA-git-5:
+        text: "The branch switcher never deletes a branch with commits no other branch has without asking, asks before moving a task's worktree, and closing commits to the branch the dialog names"
+        scenarios: [QA-git-branch-switcher.mjs]
+      QA-git-6:
+        text: "Land lands into the branch the task was started from, and warns when another base would bring that branch's commits"
+        scenarios: [QA-git-land-into-base.mjs]
+      QA-git-7:
+        text: "Commits on a detached HEAD are never deleted on close without asking, and can be saved on a hermes-archive branch"
+        scenarios: [QA-git-detached-commits-kept.mjs]
+      QA-git-8:
+        text: "A post-checkout hook that fails after git made the worktree starts the task with a warning that quotes it, and leaves nothing behind"
+        scenarios: ["QA-git-hook-failure-no-leftovers.mjs@darwin,linux"]
+      QA-git-9:
+        text: "When the terminal service dies, its sessions stay listed, ended, with their output and worktrees, one notice says so, and Restart brings them back"
+        scenarios: ["QA-git-host-crash-keeps-sessions.mjs@darwin,linux"]
+      QA-git-10:
+        text: "Close session? is a modal alert dialog: Enter on Cancel closes nothing, Escape cancels, Tab stays inside, focus returns to the ×"
+        scenarios: [QA-git-close-dialog-keyboard.mjs]
+      QA-git-11:
+        text: "A worktree whose changes cannot be checked is never deleted on close without asking"
+        scenarios: [QA-git-close-check-fails.mjs]
+      QA-git-12:
+        text: "Closing stops the task's program before saving its work, with no second confirmation"
+        scenarios: ["QA-git-close-while-agent-writes.mjs@darwin,linux"]
+      QA-git-13:
+        text: "Hermes' commits run the repository's hooks; a refusal is shown as the hook said it, with Archive instead"
+        scenarios: ["QA-git-commit-runs-hooks.mjs@darwin,linux"]
+      QA-git-14:
+        text: "A branch name git refuses leaves no branch behind and fails in words, without library codes or ids"
+        scenarios: [QA-git-branch-name-errors.mjs]
+      QA-git-15:
+        text: "Land never squash-merges over an uncommitted edit in the project folder, and names the file"
+        scenarios: [QA-git-land-into-dirty-folder.mjs]
+      QA-git-16:
+        text: "With the UI in German, the Land sheet, Uncommitted Changes and Branch In Use have no English left"
+        scenarios: [QA-git-german-dialogs.mjs]
+      QA-git-17:
+        text: "The Land sheet drafts the subject from the task, says only 'no remote' when there is none, asks before Archive stops an agent, and offers no pull request for a remote that is not on GitHub"
+        scenarios: ["QA-git-land-sheet-polish.mjs@darwin,linux"]
+      QA-git-18:
+        text: "Closing the session in front shows the session that becomes active"
+        scenarios: [QA-git-close-active-pane.mjs]
+      QA-git-19:
+        text: "A New Session in a repository with no commits goes ahead without isolation and says why"
+        scenarios: [QA-git-empty-repo-session.mjs]
   FIX-overlay-focus:
     # A bug fix, not new 2.0 work. Negative control (run by hand): a build of
     # main before the fix ends in RESULT: FAIL (the keyboard ends on <body>,
@@ -470,6 +536,132 @@ features:
       FIX-overlay-focus-2:
         text: "Opening the inbox, the command palette or the task launcher closes whichever of the others is open; the launcher keeps what was typed"
         scenarios: [FIX-overlay-focus.mjs]
+  FIX-launcher-draft:
+    # A bug fix, not new 2.0 work (the maintainer's test of 2.0). Negative
+    # control (run by hand): a build of main before the fix ends in
+    # RESULT: FAIL (no launcher after Settings closes; the draft was lost).
+    name: "What was typed in the launcher survives configuration and closing it by accident"
+    status: shipped
+    criteria:
+      FIX-launcher-draft-1:
+        text: "Opening Settings (Manage accounts, the Settings button, the app menu) from the open launcher keeps its task, every chip and the options, and the launcher comes back exactly as it was when Settings closes"
+        scenarios: [FIX-launcher-draft.mjs]
+      FIX-launcher-draft-2:
+        text: "Sign in from the launcher gives way to the sign-in terminal, and the launcher comes back as it was once that terminal is closed"
+        scenarios: [FIX-launcher-draft.mjs]
+      FIX-launcher-draft-3:
+        text: "Esc or a click outside closes the launcher but ⌘N brings the same draft back, saying so with Start over; only Start over or a launch forgets it"
+        scenarios: [FIX-launcher-draft.mjs, F15-launcher-flow.mjs]
+  FIX-launcher-safety:
+    # A bug fix, not new 2.0 work. Negative control (run by hand): a build of
+    # main ends in RESULT: FAIL (no warning in the chip row).
+    name: "Skip all is never picked for the person, and plan mode is findable"
+    status: shipped
+    criteria:
+      FIX-launcher-safety-1:
+        text: "A fresh profile starts Claude in its safety default (Accept edits); neither the usual combination, the agent's last launch nor a Settings default puts the launcher in Skip all, and it says so"
+        scenarios: [FIX-launcher-safety.mjs]
+      FIX-launcher-safety-2:
+        text: "Skip all chosen by hand is said in red in the chip row itself, also that a feature track's gates then rely on the agent stopping"
+        scenarios: [FIX-launcher-safety.mjs]
+      FIX-launcher-safety-3:
+        text: "The approval chip says what its mode does, Plan first is named as Claude's own plan mode, and the Feature track option says it is not that"
+        scenarios: [FIX-launcher-safety.mjs, F15-launcher-chips.mjs]
+  FIX-track-drives-agent:
+    # A bug fix, not new 2.0 work. Negative control (run by hand): a build of
+    # main ends in RESULT: FAIL (the agent's first prompt is the bare task).
+    # The same with the real claude: REAL-track-claude.mjs (local only).
+    name: "Track as a feature drives the agent phase by phase"
+    status: shipped
+    criteria:
+      FIX-track-drives-agent-1:
+        text: "A task tracked as a feature starts the agent with the track's first prompt (the task, the phases, the questions phase, its file and the gate), and the worktree has feature.md, the phase prompts and the /hermes-phase command"
+        scenarios: [FIX-track-drives-agent.mjs, F15-launcher-chips.mjs, F15-task-launcher.mjs]
+      FIX-track-drives-agent-2:
+        text: "The Track panel says in plain words what the agent is doing and what the person does next, with each phase file's size, and warns when the agent runs in Skip all"
+        scenarios: [FIX-track-drives-agent.mjs]
+      FIX-track-drives-agent-3:
+        text: "Approving (or skipping) a gate tells the writer agent, in one line, to run hi phase for the next phase"
+        scenarios: [FIX-track-drives-agent.mjs, F28-feature-tracks.mjs]
+  FIX-identity-tags:
+    # Found on main's CI (UI-chrome on macOS shard 2): a row's model tag went
+    # missing when Hermes's own identity update came after the agent's.
+    # Negative control (run by hand): UI-chrome on a build of main ends in
+    # RESULT: FAIL at the replayed update.
+    name: "A session row keeps the model its agent reported"
+    status: shipped
+    criteria:
+      FIX-identity-tags-1:
+        text: "Identity reports from several sources merge field by field: a later one without the model never erases the model the agent named"
+        scenarios: [UI-chrome.mjs]
+  QA-review:
+    # Bug fixes from the 2.0 QA pass on the Review Desk, the turn ledger,
+    # Feature Tracks, Done-When and the hi helper; not new 2.0 work, so not
+    # behind a feature flag. Every scenario's header names its negative
+    # control: a build of main before the fix ends in RESULT: FAIL.
+    name: "Review Desk, turns and Feature Tracks: what the QA pass found"
+    status: shipped
+    criteria:
+      QA-review-1:
+        text: "An agent can never skip a Feature Track phase (`hi phase skip` exits 3, people only); a refusal never suggests skipping"
+        scenarios: [QA-review-agent-skip.mjs]
+      QA-review-2:
+        text: "The Track writer is the agent, never a plain shell opened earlier: Send my edits reaches the agent and is never typed into the shell; the badge names the agent"
+        scenarios: [QA-review-writer-not-shell.mjs]
+      QA-review-3:
+        text: "The Track panel's toasts (skip, approve) are shown"
+        scenarios: [QA-review-track-toasts.mjs]
+      QA-review-4:
+        text: "The Done-When Stop hook does not send the agent back while a track plans or waits at a gate, and does in the implement phase"
+        scenarios: [QA-review-donewhen-planning.mjs]
+      QA-review-5:
+        text: "`hi check` and the Stop hook run a task's own checks (<git dir>/hermes/done-when.json); the Done-When chip shows them"
+        scenarios: [QA-review-task-checks.mjs]
+      QA-review-6:
+        text: "The turn ledger never charges the person's between-turn edits (or Hermes's review files) to an agent turn; they show as a 'Between turns · you' row without Revert"
+        scenarios: [QA-review-turn-blame.mjs]
+      QA-review-7:
+        text: "Send my edits at a waiting gate never asks the agent to apply edits already saved or to continue, and says not to run `hi phase done` again"
+        scenarios: [QA-review-review-file-wording.mjs]
+      QA-review-8:
+        text: "Skip is ⇧S with a confirmation; a skipped phase is drawn '– phase · skipped' with who and when, and recorded in feature.md"
+        scenarios: [QA-review-skip-confirm.mjs]
+      QA-review-9:
+        text: "Restore to Tn names the person's edits it sets aside, counts its own changes, and offers Undo that brings everything back"
+        scenarios: [QA-review-restore-undo.mjs]
+      QA-review-10:
+        text: "The Review Desk names the agent ('Claude Code'), never the task text, and counts read right (1 comment, 1 file)"
+        scenarios: [QA-review-desk-agent-labels.mjs]
+      QA-review-11:
+        text: "A review comment stays on its line after the next turn moves it, and is marked outdated when the line is gone"
+        scenarios: [QA-review-comment-anchor.mjs]
+      QA-review-12:
+        text: "A track's planning files are a collapsed 'Track files · N' group with readable names, left out of '+ all'"
+        scenarios: [QA-review-track-files.mjs]
+      QA-review-13:
+        text: "Edits to done_when and to an agent's own config (.claude/, .mcp.json, CLAUDE.md) carry a risk flag"
+        scenarios: [QA-review-risk-flags.mjs]
+      QA-review-14:
+        text: "Cancelling (or Esc in) the Land sheet brings the person back to the Review Desk they opened it from"
+        scenarios: [QA-review-land-cancel.mjs]
+      QA-review-15:
+        text: "A turn already reverted says so ('already reverted — nothing to undo') instead of offering a conflicting revert"
+        scenarios: [QA-review-revert-twice.mjs]
+      QA-review-16:
+        text: "The Review Desk diff ends at the file's last real line"
+        scenarios: [QA-review-phantom-line.mjs]
+      QA-review-17:
+        text: "The Review Desk and TURNS diffs render without font ligatures"
+        scenarios: [QA-review-diff-ligatures.mjs]
+      QA-review-18:
+        text: "On a branch Hermes did not make (main) the commit box starts empty"
+        scenarios: [QA-review-commit-draft.mjs]
+      QA-review-19:
+        text: "Make it a feature asks first, says what it writes, and its Undo removes exactly those files"
+        scenarios: [QA-review-make-feature-undo.mjs]
+      QA-review-20:
+        text: "The track watcher reads a file only when its size or time moved, and at most 256 KB of it; a huge feature.md says so"
+        scenarios: [QA-review-track-big-files.mjs]
   FIX-spawn-no-freeze:
     # A bug fix, not new 2.0 work. Found as N20-session-host's "the webview
     # did not answer" on the macOS CI runner: a restored terminal never
@@ -497,6 +689,32 @@ features:
       FIX-spawn-no-freeze-4:
         text: "While the AI tools check and the shell list run (held for 8 s) the app answers within 2.5 s, and both then answer"
         scenarios: [FIX-spawn-no-freeze.mjs]
+  QA-chrome:
+    # Bug fixes from the 2.0 QA pass (dialogs, Settings > Agents, the agent
+    # doctor, the Search and Usage panels, the light theme). Negative control
+    # (run by hand): each scenario ends in RESULT: FAIL on a build of main
+    # before the fix.
+    name: "Dialogs keep the keyboard; Settings, the doctor and the panels say what is true"
+    status: shipped
+    criteria:
+      QA-chrome-1:
+        text: "Settings, Keyboard Shortcuts and the Cost Dashboard, opened from the menu, take the keyboard from the terminal, keep Tab inside, close on Esc and give the keyboard back; nothing typed meanwhile reaches the shell"
+        scenarios: [QA-chrome-modal-keyboard.mjs]
+      QA-chrome-2:
+        text: "Esc while renaming a preset or naming an account cancels only that edit; an account name already taken (any case, or Default) is refused; Remove asks first, says what stays on disk and can run the CLI's own sign-out"
+        scenarios: [QA-chrome-agents-settings.mjs]
+      QA-chrome-3:
+        text: "A refused model is offered again once a launch with it finishes a turn, or after Check again; a refused default model (Codex's config) is named in the banner with where it is set, and the launcher no longer promises the default always works"
+        scenarios: [QA-chrome-refusals.mjs]
+      QA-chrome-4:
+        text: "An installed CLI that cannot start is reported as failing to start, never as signed out; the doctor's buttons name their agent, its columns are explained; Settings has Launch defaults and one Check again on Agents"
+        scenarios: [QA-chrome-doctor.mjs]
+      QA-chrome-5:
+        text: "The Search panel says whether a session or a project is missing (with Add project…) and is translated; the Usage panel names the session's agent and how to get usage"
+        scenarios: [QA-chrome-panels.mjs]
+      QA-chrome-6:
+        text: "In the Frosted Light theme the texts of the welcome, a session pane with a Claude task and Settings > Agents meet WCAG AA contrast"
+        scenarios: [QA-chrome-light-contrast.mjs]
   FIX-launcher-reopen:
     # A bug fix, not new 2.0 work. Negative control (run by hand): a build of
     # main before the fix fails the step (no launcher comes up).
@@ -1100,15 +1318,63 @@ features:
         text: "A project header or status bar total that leaves out sessions whose cost is unknown says so: the known sum and how many sessions are n/a, on screen whole at the default sidebar width, named in its tooltip; n/a when no cost is known"
         scenarios: [F31-partial-spend.mjs]
   F37:
-    # Behind the fleetControls flag. Turns come from a fake ledger (the e2e
-    # hook setFakeTurnLedger) until F20 fills the real one; turn ends travel
-    # the Rust side of the event channel. HERMES_E2E_F37_FLAG=off must fail.
+    # Behind the fleetControls flag. F37-collision-radar.mjs drives turns
+    # from a fake ledger (the e2e hook setFakeTurnLedger) with turn ends on
+    # the Rust side of the event channel; HERMES_E2E_F37_FLAG=off must fail.
+    # QA-status-radar-real-ledger.mjs drives the real one: two fake Claude
+    # Code agents end real turns through the Stop hook (no turn_end event),
+    # and the radar follows the turn ledger's own event.
     name: "Collision Radar v0"
     status: partial
     criteria:
       F37-1:
         text: "Two sessions editing the same file show an overlap badge on both rows"
-        scenarios: [F37-collision-radar.mjs]
+        scenarios: [F37-collision-radar.mjs, QA-status-radar-real-ledger.mjs]
+  QA-STATUS:
+    # Fixes from the 2.0 QA pass on the attention inbox, away messages, spend
+    # totals, the status bar and the session rows. Fake agents (tools/
+    # fake-agents) block through their own hooks; a local server stands in
+    # for the away address and the update manifest; the window's keyboard
+    # focus is stated through the test hooks.
+    name: "Attention, away messages, status bar and session rows (QA pass)"
+    status: partial
+    criteria:
+      QA-STATUS-1:
+        text: "The badge, the dock and ⌘I count the same agents; a Hermes notice is listed apart as Hermes · n notice(s) and never counted as an agent"
+        scenarios: [QA-status-attention-counts.mjs]
+      QA-STATUS-2:
+        text: "An away message goes out only when Hermes is not in front of you (or after the chosen delay unanswered, also for the session in view); Immediately sends at once"
+        scenarios: [QA-status-away-at-desk.mjs, QA-status-away-stepped-away.mjs]
+      QA-STATUS-3:
+        text: "Away messages say where each agent works (folder and session number) without prompt text; session names only when opted in"
+        scenarios: [QA-status-away-tells-agents-apart.mjs]
+      QA-STATUS-4:
+        text: "A failed away message raises one Hermes notice and shows under the address; Send test message tries the address"
+        scenarios: [QA-status-away-failure.mjs]
+      QA-STATUS-5:
+        text: "The status bar's spend says it covers the open sessions"
+        scenarios: [QA-status-spend-open-sessions.mjs]
+      QA-STATUS-6:
+        text: "⌘I with nothing waiting says so on screen for about 3 s"
+        scenarios: [QA-status-cmd-i-nothing-waiting.mjs]
+      QA-STATUS-7:
+        text: "Check for updates shows Checking…, then up to date or could not check (within 15 s)"
+        scenarios: [QA-status-update-check.mjs]
+      QA-STATUS-8:
+        text: "Eight agents at the default sidebar width: every row's meta line stays inside the row with the spend shown whole (it moves to a second line; an ellipsis and a full tooltip only past that), the selected row is not shifted, and each close button names its session"
+        scenarios: [QA-status-session-rows.mjs]
+      QA-STATUS-9:
+        text: "At 600 × 400 (English and German) every status-bar control is inside the window; Check for updates, Report a Bug and Keyboard Shortcuts fold into a ⋯ menu"
+        scenarios: [QA-status-min-window.mjs]
+      QA-STATUS-10:
+        text: "A Hermes notice alone lights the badge and the dock with \"!\" (never counted as an agent), and ⌘I opens the inbox on it"
+        scenarios: [QA-status-notice-visible.mjs]
+      QA-STATUS-11:
+        text: "From 761 to 1000 px (English and German) the status bar's spend amount is shown whole; the words before it and the folder name give way first"
+        scenarios: [QA-status-spend-mid-window.mjs]
+      QA-STATUS-12:
+        text: "Claude's silent moments: an approved long command leaves needs approval at the person's answer (working while it runs, the counts drop), an Esc rejection ends the turn as interrupted (idle, exact; the next prompt is the next turn), an unknown model runs no turn, and the quit question says an agent waits for you rather than still working"
+        scenarios: [FIX-claude-silent-answers.mjs]
   N22:
     # Behind the fleetControls flag; fake agents started as Custom agents.
     # HERMES_E2E_N22_CAP=off (no cap) must fail.
@@ -1214,6 +1480,9 @@ features:
       F14-3:
         text: "Terminal sessions show no gauge rather than a guess"
         scenarios: [F14-context-gauge.mjs]
+      F14-4:
+        text: "The window is the agent's own for each model (Claude Code's 1M for the Claude 5 models, Codex's model_context_window); a model with no known window shows no gauge"
+        scenarios: [F14-context-gauge.mjs]
   F24:
     name: "Fleet performance: many terminals"
     # Behind the fleetPerf flag. Budgets per OS: e2e/app/fleet-budgets.json.
@@ -1250,6 +1519,16 @@ features:
         # e2e/app/scenarios/REAL-launcher-claude.mjs, local only like the others.
         text: "From ⌘N with a model and an effort chosen on the chips, claude runs as hi run -> claude with exactly one --model and one --effort of those values and the task as its first prompt"
         scenarios: ["REAL-launcher-claude.mjs@darwin,linux"]
+      REAL-5:
+        # e2e/app/scenarios/REAL-track-claude.mjs, local only like the others.
+        text: "Track as a feature with the real claude (haiku): it writes questions.md, runs hi phase done and stops with the code untouched; approving moves it to research and it starts research"
+        scenarios: ["REAL-track-claude.mjs@darwin,linux"]
+      REAL-6:
+        text: "The context gauge equals the real claude's own /context (window, tokens within 1 % of the window, percent within a point) on haiku and on a 1M-window model"
+        scenarios: ["REAL-context-claude.mjs@darwin,linux"]
+      REAL-7:
+        text: "The context gauge equals the real codex's own /status (window, tokens used within 0.1K) and footer percent; the real agy shows no gauge"
+        scenarios: ["REAL-context-codex.mjs@darwin,linux"]
   UI:
     name: "One consistent control set (UI kit foundation)"
     # Foundation only: tokens, the base.css reset, the components in
@@ -1463,3 +1742,92 @@ features:
       REAL-STATUS-3:
         text: "Antigravity: working, done, a question and exited as exact within 2 s; its approval, which it never reports, as a guess within 3.5 s"
         scenarios: ["REAL-status-agy.mjs@darwin,linux"]
+  QA-HOST:
+    name: "QA sweep: session host, terminal keys and clipboard, quit, Agent view"
+    # Regressions found by the 2.0 QA personas (lead, chaos, cross-platform,
+    # planner). Partial: each listed scenario must be green where it runs;
+    # the ones that need the session host or a POSIX shell name their OSes.
+    status: partial
+    criteria:
+      QA-HOST-1:
+        text: "A session the host kept running (Keep running, or the app killed) reads its agent's reports again: its status, a new permission request, the badge and the morning view are right after the relaunch"
+        scenarios: ["QA-host-reattached-agent-reports.mjs@darwin,linux", "QA-host-morning-view-keep-running.mjs@darwin,linux", "QA-host-app-kill-reattach.mjs@darwin,linux"]
+      QA-HOST-2:
+        text: "A hook agent's prompt starts a turn and its Stop ends it (StopFailure fails it), as turn events in the session-event store"
+        scenarios: [QA-host-hook-turns.mjs]
+      QA-HOST-3:
+        text: "Quitting asks about a quiet running command (Keep running keeps it) and, without the session host, about every working session: Quitting stops them, Stop and quit or Cancel"
+        scenarios: ["QA-host-quit-quiet-command.mjs@darwin,linux", QA-host-quit-no-host.mjs]
+      QA-HOST-4:
+        text: "Windows/Linux terminal keys: Ctrl+1..9 switch sessions, Alt+Arrow and Ctrl+Alt+Arrow move between panes, Ctrl+Shift+C/V and right-click Paste copy and paste, Ctrl+C with a selection copies on Windows"
+        scenarios: [QA-host-pc-terminal-keys.mjs]
+      QA-HOST-5:
+        text: "Right-click menus show the chords that work on Windows/Linux; Ctrl+Shift+Z stays Redo in text fields"
+        scenarios: [QA-host-pc-menus-and-redo.mjs]
+      QA-HOST-6:
+        text: "OSC 9;9 sets the session's folder and is never a notification"
+        scenarios: ["QA-host-osc-9-9-cwd.mjs@darwin,linux"]
+      QA-HOST-7:
+        text: "A cd in zsh or bash moves the session's folder"
+        scenarios: ["QA-host-cd-tracked.mjs@darwin,linux"]
+      QA-HOST-8:
+        text: "A paste over 4 MB reaches a hosted terminal's program whole"
+        scenarios: ["QA-host-big-paste.mjs@darwin,linux"]
+      QA-HOST-9:
+        text: "A font size of 0 in the settings never freezes the window; the restored history keeps typed commands on one line; after a clean quit the database file alone holds the data"
+        scenarios: [QA-host-font-size-zero.mjs, QA-host-restored-scrollback.mjs, QA-host-data-in-db-file.mjs]
+      QA-HOST-10:
+        text: "A hung Agent-view agent can be force-stopped; a crash stays marked in the conversation and the next turn's timer starts at 0"
+        scenarios: [QA-host-stop-hung-agent.mjs, QA-host-agent-crash-marker.mjs]
+      QA-HOST-11:
+        text: "The pane header never contradicts the status; the task's context file is inside the agent's folder and ignored by git"
+        scenarios: [QA-host-pane-header-status.mjs, QA-host-context-in-worktree.mjs]
+      QA-HOST-12:
+        text: "Quitting with Stop ends every program the session host runs for the app, also one a crash left unlisted"
+        scenarios: ["QA-host-ghost-stopped-on-quit.mjs@darwin,linux"]
+  QA-launcher:
+    # Bug fixes from the QA pass over the task launcher, its accounts,
+    # presets and queue, the first-run welcome and the overlays (not new
+    # work). Each scenario is the QA reproduction, kept: a build before the
+    # fix ends in RESULT: FAIL (its header names how). The quit question
+    # with queued tasks rides on the session host, which runs on macOS and
+    # Linux.
+    name: "The launcher, its accounts and queue, and the welcome do what they say, by keyboard too"
+    status: shipped
+    criteria:
+      QA-launcher-1:
+        text: "Launch & next keeps what was typed while the launch ran; only the launched text is cleared"
+        scenarios: [QA-launcher-launch-next-keeps-typing.mjs]
+      QA-launcher-2:
+        text: "The keyboard never lands on the page while the launcher is open: closing a preset form, an offer or a branch row gives it to the task field; a key on the page does too; ⌘N on the open sheet gives it back; Tab stays inside the sheet"
+        scenarios: [QA-launcher-focus-lost.mjs, QA-launcher-tab-trap.mjs]
+      QA-launcher-3:
+        text: "Switching the project brings that project's usual combination, or says what it usually runs once the person changed the choice; ⌘N from a plain shell or a sign-in terminal starts on the project"
+        scenarios: [QA-launcher-usual-per-project.mjs, QA-launcher-start-project.mjs]
+      QA-launcher-4:
+        text: "An added account signs in in its own profile, is judged by its own sign-in (not the default profile's), shows its own models, and a preset on a signed-out account waits for a sign-in or an explicit 'use the default profile this time'"
+        scenarios: [QA-launcher-signin-account.mjs, QA-launcher-default-signed-out.mjs, QA-launcher-models-per-account.mjs, QA-launcher-preset-account-held.mjs]
+      QA-launcher-5:
+        text: "Queued tasks are kept across a quit, which says so, start with their full launch (feature.md, checks, record), and a queued launch says so on screen with Start now; queue rows say which task and where"
+        scenarios: ["QA-launcher-queue-kept-on-quit.mjs@darwin,linux", QA-launcher-queued-task-setup.mjs, QA-launcher-queued-feedback.mjs]
+      QA-launcher-6:
+        text: "Track as a feature on the current checkout creates the feature in the project folder; the task's checks are kept next to its worktree, outside the repository"
+        scenarios: [QA-launcher-track-current-checkout.mjs, QA-launcher-checks-kept.mjs]
+      QA-launcher-7:
+        text: "The unfinished welcome owns the menu bar; its first task survives Back and is never thrown away without asking; the step-2 repository becomes a project; a sign-in done meanwhile is seen at once"
+        scenarios: [QA-launcher-welcome-menu-gate.mjs, QA-launcher-welcome-finish-task.mjs, QA-launcher-signin-recheck.mjs]
+      QA-launcher-8:
+        text: "The welcome is modal for the keyboard (focus per step, Tab inside, Enter in a repository path moves on) and says what a typed path is: missing, no repository, or the repository ~ names"
+        scenarios: [QA-launcher-welcome-keyboard.mjs, QA-launcher-welcome-paths.mjs]
+      QA-launcher-9:
+        text: "Window keys behind an open overlay act on the overlay; Settings, Keyboard Shortcuts and the New Session dialog join one-overlay-at-a-time; a session can be closed by keyboard; the palette's ⌘1–9 are the sessions ⌘1–9 open"
+        scenarios: [QA-launcher-menu-keys-overlay.mjs, QA-launcher-overlays-stack.mjs, QA-launcher-close-session.mjs, QA-launcher-palette-numbers.mjs]
+      QA-launcher-10:
+        text: "Chips: a pick closes the menu and the next Enter launches; Enter in the path field confirms the folder; the reason Launch is off stays beside it"
+        scenarios: [QA-launcher-chip-pick-enter.mjs, QA-launcher-path-enter.mjs, QA-launcher-reason-visible.mjs]
+      QA-launcher-11:
+        text: "Branches: the same task again gets the next free name, names git refuses are flagged before Launch, an empty repository is said, and the current checkout is never carried over and is said in red"
+        scenarios: [QA-launcher-same-task-twice.mjs, QA-launcher-branch-names.mjs, QA-launcher-empty-repo.mjs, QA-launcher-current-checkout-not-sticky.mjs]
+      QA-launcher-12:
+        text: "Presets: names are unique whatever their case, an empty offer name keeps the offer, typed Claude model ids launch, and the preview says what the launch passes"
+        scenarios: [QA-launcher-preset-names.mjs, QA-launcher-offer-empty-name.mjs, QA-launcher-typed-model.mjs, QA-launcher-preview.mjs]

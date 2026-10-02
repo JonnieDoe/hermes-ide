@@ -24,7 +24,7 @@ import { fmt, isMac, PLATFORM } from "./utils/platform";
 import { matchAppShortcut } from "./utils/shortcuts";
 import { shortcutLabel } from "./utils/keymap";
 import { installAppChordListener } from "./hooks/appChordListener";
-import { triggerMenuBarActionFromKeyboard } from "./hooks/nativeMenuBridge";
+import { isMenuGated, triggerMenuBarActionFromKeyboard } from "./hooks/nativeMenuBridge";
 import { createProject } from "./api/projects";
 import { SessionProvider, useSession, useActiveSession, useSessionList, useSidebarOrderedSessions } from "./state/SessionContext";
 import { workingSessionIds } from "./state/tileLayout";
@@ -37,9 +37,9 @@ import { SessionList } from "./components/SessionList";
 import { hideOpeningOverlay, showOpeningOverlay } from "./utils/sessionCreatorOverlay";
 import { ActivityBar, SessionsIcon, ContextIcon, UsageIcon, WorkbenchIcon, PlusIcon, PluginsIcon, SettingsIcon, TrackIcon } from "./components/ActivityBar";
 import { useTrackWatching } from "./track/useTrackWatching";
-import { editorCommandFor } from "./track/rules";
-import { getTrackState, noteOwnApproval } from "./track/store";
-import { trackApprove, trackPromote } from "./track/api";
+import { attachedSessions, editorCommandFor, gateMovedLine, isAgentSession, submitLineBytes } from "./track/rules";
+import { getTrackState, hasTurnHistory, noteOwnApproval } from "./track/store";
+import { trackApprove } from "./track/api";
 import { slugFromBranch } from "./track/rules";
 import { writeToSession } from "./api/sessions";
 import { utf8ToBase64 } from "./utils/encoding";
@@ -53,7 +53,7 @@ import { CloseSessionDialog } from "./components/CloseSessionDialog";
 import { LandSheetHost } from "./land/LandSheetHost";
 import { QuitWithAgentsDialog, type WorkingSession } from "./components/QuitWithAgentsDialog";
 import { DialogGalleryHost } from "./e2e/DialogGalleryHost";
-import { sessionHostQuit } from "./api/sessions";
+import { sessionHostQuit, sessionHostSetQueued } from "./api/sessions";
 import { FlowToast } from "./components/FlowToast";
 import { copyContextToClipboard } from "./utils/copyContextToClipboard";
 import { ProjectPicker } from "./components/ProjectPicker";
@@ -65,7 +65,7 @@ import { setSetting } from "./api/settings";
 import { SplitDirection, collectPanes } from "./state/layoutTypes";
 import { getDraggedSession } from "./components/SplitPane";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { focusTerminal, refitActive } from "./terminal/TerminalPool";
+import { focusTerminal, getTerminal, refitActive } from "./terminal/TerminalPool";
 import { useNativeMenuEvents } from "./hooks/useNativeMenuEvents";
 import { useMenuStateSync } from "./hooks/useMenuStateSync";
 import { useAutoUpdater } from "./hooks/useAutoUpdater";
@@ -82,14 +82,15 @@ import { ToastContainer } from "./components/ToastContainer";
 import { WorktreeRecipePanel } from "./components/WorktreeRecipePanel";
 import { useToastStore } from "./hooks/useToastStore";
 import { useWorktreeErrorToasts } from "./hooks/useWorktreeErrorToasts";
+import { useSessionNoticeToasts } from "./hooks/useSessionNoticeToasts";
 import { PluginUpdateConfirmDialog } from "./components/PluginUpdateConfirmDialog";
 import { launchFailedMessage } from "./catalog/agentCatalog";
 import { OnboardingGate } from "./components/OnboardingGate";
-import { getAgent } from "./catalog/agentCatalog";
+import { agentDisplayName, getAgent } from "./catalog/agentCatalog";
 import { getProjectsOrdered, getSessionProjects } from "./api/projects";
 import { getSessionWorktreeInfo } from "./api/git";
-import { writeTaskFeatureFile } from "./api/launcher";
-import { handleUndeliveredTask, launchTask, normalizeRepoPath, type UndeliveredTask } from "./launcher/launchTask";
+import { probeTaskRepo, taskTrackPrompt, writeTaskDoneWhen, writeTaskFeatureFile } from "./api/launcher";
+import { finishQueuedLaunch, handleUndeliveredTask, launchTask, normalizeRepoPath, type LaunchTaskDeps, type UndeliveredTask } from "./launcher/launchTask";
 import { TASK_LAUNCHES_KEY } from "./launcher/taskLauncher";
 import { LauncherReopen } from "./launcher/launcherReopen";
 import type { TaskLaunchRequest, TaskLaunchResult } from "./components/TaskLauncher";
@@ -97,6 +98,8 @@ import { WhatsNewGate } from "./components/WhatsNewGate";
 import { ContainedErrorBoundary } from "./components/ContainedErrorBoundary";
 import { PanelResizeHandle } from "./components/PanelResizeHandle";
 import { useFleetControls } from "./fleet/useFleetControls";
+import { TASK_QUEUE_KEY, getOccupancy, listQueuedTasks, restoreTaskQueue, serializeTaskQueue, startTaskNow, subscribeTaskQueue, type QueuedTask } from "./fleet/taskQueue";
+import { useOverlay } from "./state/overlays";
 import type { CreateSessionOpts } from "./types/session";
 
 // Loaded on demand, off the startup path: the editor (CodeMirror) with the
@@ -198,10 +201,12 @@ function AppContent() {
   // Task launcher (F15, flag taskLauncher): ⌘N opens it; the creator above
   // stays at ⌘⇧N for SSH, tmux and existing branches.
   // `gen` names the sheet: a new one (fresh state) mounts when it changes.
-  const [taskLauncherOpen, setTaskLauncherOpen] = useState<false | { repo: string | null; gen: number }>(false);
+  const [taskLauncherOpen, setTaskLauncherOpen] = useState<false | { repo: string | null; gen: number; focus?: number }>(false);
   const taskLauncherOpenRef = useRef(taskLauncherOpen);
   taskLauncherOpenRef.current = taskLauncherOpen;
   const launcherGenRef = useRef(0);
+  // Where the launcher waits to come back (see openSettings below).
+  const launcherReturnRef = useRef<null | { kind: "settings" } | { kind: "sign-in"; sessionId: string | null }>(null);
   const [launcherReopen] = useState(() => new LauncherReopen());
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [cmdPaletteShortcut, setCmdPaletteShortcut] = useState("cmd_k");
@@ -331,11 +336,14 @@ function AppContent() {
     let unlisten: (() => void) | null = null;
     listen<{ sessionId: string; branchName: string; error: string }>("worktree-cleanup-failed", (event) => {
       if (cancelled) return;
-      const { branchName } = event.payload;
+      const { branchName, error } = event.payload;
+      // Kept on purpose (a submodule's commits exist only there): say so
+      // as the backend did, and leave the notice up.
+      const kept = /Kept the worktree at /.test(error ?? "");
       toastStoreRef.current.addToast({
-        message: `Failed to clean up branch worktree '${branchName}'. It will be retried on next startup.`,
+        message: kept ? error : `Failed to clean up branch worktree '${branchName}'. It will be retried on next startup.`,
         type: "warning",
-        duration: 8000,
+        duration: kept ? null : 8000,
       });
     }).then((u) => {
       if (cancelled) { u(); } else { unlisten = u; }
@@ -446,6 +454,28 @@ function AppContent() {
 
   // ── Worktree creation failures (#286) ──
   useWorktreeErrorToasts(toastStore.addToast);
+
+  // ── Sessions that ended on their own, worktrees kept on close ──
+  useSessionNoticeToasts(toastStore.addToast, {
+    // Same id: its worktree link and terminal output stay; a new program starts.
+    restart: (ids) => {
+      for (const id of ids) {
+        const s = state.sessions[id];
+        if (!s) continue;
+        void createSession({
+          sessionId: id,
+          label: s.label,
+          workingDirectory: s.working_directory || undefined,
+          color: s.color || undefined,
+          group: s.group ?? undefined,
+          aiProvider: s.ai_provider ?? undefined,
+        });
+      }
+    },
+    close: (ids) => {
+      for (const id of ids) void requestCloseSession(id);
+    },
+  });
 
   const pluginRuntimeRef = useRef<PluginRuntime | null>(null);
 
@@ -636,6 +666,8 @@ function AppContent() {
     const handler = (e: KeyboardEvent) => {
       const action = matchAppShortcut(e);
       if (!action) return;
+      // The unfinished first-run welcome owns the window (see setMenuGate).
+      if (isMenuGated()) return;
 
       // Cmd+Shift+P — always toggles command palette (alternative shortcut)
       if (action === "app.command-palette-alt") {
@@ -875,9 +907,10 @@ function AppContent() {
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | null = null;
-    listen<{ id: string; label: string }[]>("session-host-quit-requested", (event) => {
+    listen<{ id: string; label: string; hosted?: boolean; detected_agent?: unknown; ai_provider?: string | null }[]>("session-host-quit-requested", (event) => {
       if (cancelled) return;
-      setQuitAsk(event.payload.map((s) => ({ id: s.id, label: s.label })));
+      // Whether each can keep running (hosted) and is an agent or a program.
+      setQuitAsk(event.payload.map((s) => ({ id: s.id, label: s.label, hosted: s.hosted !== false, agent: !!(s.detected_agent || s.ai_provider) })));
     }).then((u) => {
       if (cancelled) { u(); } else { unlisten = u; }
     });
@@ -951,12 +984,20 @@ function AppContent() {
   activeIdRef.current = state.activeSessionId;
   /** A queued task starts in the background: whatever the user is looking
    *  at stays in front. */
-  const startQueuedTask = useCallback(async (opts: CreateSessionOpts) => {
+  // The launcher's launch steps (set below), for a launcher task that waited in the queue.
+  const launchDepsRef = useRef<(() => LaunchTaskDeps) | null>(null);
+  const startQueuedTask = useCallback(async (opts: CreateSessionOpts, task: QueuedTask) => {
     const before = activeIdRef.current;
     const session = await createSession(opts);
     if (session) {
       if (!layoutRootRef.current) dispatch({ type: "INIT_PANE", sessionId: session.id });
       else if (before) dispatch({ type: "SET_ACTIVE", id: before });
+      // A task from the ⌘N launcher finishes its launch as one that started
+      // at once: its feature.md, its checks, its record, its pairing.
+      const deps = launchDepsRef.current?.();
+      if (task.launch && deps) {
+        void finishQueuedLaunch(task.launch, session.id, deps).catch((err) => console.warn("[App] a queued task's launch did not finish:", err));
+      }
     }
     return session;
   }, [createSession, dispatch]);
@@ -982,17 +1023,114 @@ function AppContent() {
   const openTaskLauncher = useCallback(async (fresh = false) => {
     // The open sheet is finishing a launch and will close: it opens again then.
     if (!fresh && !launcherReopen.requestOpen(!!taskLauncherOpenRef.current)) return;
+    // Opened again (⌘N, or the configuration it waited for closed): nothing waits any more.
+    launcherReturnRef.current = null;
+    // Already open: it keeps its state and takes the keyboard back.
+    if (taskLauncherOpenRef.current && !fresh) {
+      setTaskLauncherOpen((cur) => (cur ? { ...cur, focus: (cur.focus ?? 0) + 1 } : cur));
+      return;
+    }
     const s = activeSessionRef.current;
     let repo: string | null = null;
-    if (s && !s.ssh_info) {
+    // The active session's repository, when it is in one. A plain shell in
+    // the home folder or a sign-in terminal is not a place to start a task:
+    // the launcher then starts on the most used project.
+    if (s && !s.ssh_info && !s.agent_launch?.login) {
+      let candidate = s.working_directory;
       try {
-        repo = (await getSessionProjects(s.id))[0]?.path ?? s.working_directory;
+        candidate = (await getSessionProjects(s.id))[0]?.path ?? s.working_directory;
       } catch {
-        repo = s.working_directory;
+        // the session's own folder
+      }
+      try {
+        repo = candidate ? (await probeTaskRepo(candidate)).git_root : null;
+      } catch {
+        repo = null;
       }
     }
     setTaskLauncherOpen((cur) => ({ repo, gen: cur && !fresh ? cur.gen : ++launcherGenRef.current }));
   }, [launcherReopen]);
+
+  /**
+   * Configuration opened from the launcher (Settings, Manage accounts, a
+   * sign-in) takes its place; the launcher keeps its draft (TaskLauncher
+   * saves it as it goes) and comes back exactly as it was when that
+   * configuration closes: Settings closing, or the sign-in terminal ending.
+   */
+  const openSettings = useCallback((tab: string) => {
+    if (taskLauncherOpenRef.current) {
+      launcherReturnRef.current = { kind: "settings" };
+      setTaskLauncherOpen(false);
+    }
+    setSettingsOpen(tab);
+  }, []);
+  const closeSettings = useCallback(() => {
+    setSettingsOpen(null);
+    if (launcherReturnRef.current?.kind === "settings") void openTaskLauncher();
+  }, [openTaskLauncher]);
+
+  // One overlay at a time (state/overlays.ts): Settings, Keyboard Shortcuts,
+  // the cost dashboard and the New Session wizard close when another overlay
+  // opens, and opening one of them closes the others (the launcher keeps its
+  // draft). Closed this way, Settings does not bring the launcher back.
+  useOverlay("settings", !!settingsOpen, () => {
+    launcherReturnRef.current = null;
+    setSettingsOpen(null);
+  });
+  useOverlay("shortcuts", shortcutsOpen, () => setShortcutsOpen(false));
+  useOverlay("cost", costDashboardOpen, () => setCostDashboardOpen(false));
+  useOverlay("creator", !!sessionCreatorOpen, () => {
+    setSessionCreatorOpen(false);
+    pendingSplit.current = null;
+  });
+
+  // N22: tasks waiting in the queue are kept while Hermes is closed and come
+  // back when it opens (setting task_queue), in their order.
+  const [queuedCount, setQueuedCount] = useState(0);
+  useEffect(() => {
+    let restored = false;
+    let cancelled = false;
+    getSetting(TASK_QUEUE_KEY)
+      .catch(() => "")
+      .then((raw) => {
+        if (cancelled) return;
+        restoreTaskQueue(raw);
+        restored = true;
+        setQueuedCount(listQueuedTasks().length);
+      });
+    const off = subscribeTaskQueue(() => {
+      const list = listQueuedTasks();
+      setQueuedCount(list.length);
+      // Not before the stored queue was read: writing first would lose it.
+      if (restored) setSetting(TASK_QUEUE_KEY, serializeTaskQueue(list)).catch((err) => console.warn("[App] could not keep the task queue:", err));
+    });
+    return () => {
+      cancelled = true;
+      off();
+    };
+  }, []);
+  // The quit asks first when tasks wait in the queue, also with no agent at work.
+  useEffect(() => {
+    sessionHostSetQueued(queuedCount).catch(() => {});
+  }, [queuedCount]);
+  /** A sign-in from the launcher (or from Settings opened from it): the launcher waits for that terminal. */
+  const launcherWaitsForSignIn = useCallback((): boolean => {
+    const from = !!taskLauncherOpenRef.current || launcherReturnRef.current?.kind === "settings";
+    if (from) launcherReturnRef.current = { kind: "sign-in", sessionId: null };
+    setTaskLauncherOpen(false);
+    return from;
+  }, []);
+  const signInStarted = useCallback((fromLauncher: boolean, sessionId: string | null) => {
+    if (!fromLauncher || launcherReturnRef.current?.kind !== "sign-in") return;
+    if (sessionId) launcherReturnRef.current = { kind: "sign-in", sessionId };
+    else void openTaskLauncher();
+  }, [openTaskLauncher]);
+  useEffect(() => {
+    const waiting = launcherReturnRef.current;
+    if (waiting?.kind !== "sign-in" || !waiting.sessionId) return;
+    const s = sessions.find((x) => x.id === waiting.sessionId);
+    if (!s || s.phase === "destroyed") void openTaskLauncher();
+  }, [sessions, openTaskLauncher]);
 
   /** The launcher sheet closed; a ⌘N pressed while it was launching opens a fresh one. */
   const onTaskLauncherClosed = useCallback(() => {
@@ -1008,24 +1146,26 @@ function AppContent() {
 
   /** ⌘⇧N: the full creator. */
   const openAdvancedCreator = useCallback(() => {
+    launcherReturnRef.current = null;
     setTaskLauncherOpen(false);
     setSessionCreatorOpen({});
   }, [setSessionCreatorOpen]);
 
   /** Sign in: the agent's own CLI in a terminal, where it asks the person to sign in. */
   const signInAgent = useCallback(async (agentId: string) => {
-    setTaskLauncherOpen(false);
+    const fromLauncher = launcherWaitsForSignIn();
     const session = await createSession({
       aiProvider: agentId,
       mode: "terminal",
       label: t("agentError.signInSessionLabel", { agent: getAgent(agentId)?.name ?? agentId }),
     });
     if (session) showSession(session.id);
-  }, [createSession, showSession, t]);
+    signInStarted(fromLauncher, session?.id ?? null);
+  }, [createSession, showSession, t, launcherWaitsForSignIn, signInStarted]);
 
   /** 2.0: sign an account Hermes added in: the CLI's sign-in, in that account's profile. */
   const signInAccount = useCallback(async (agentId: string, accountId: string) => {
-    setTaskLauncherOpen(false);
+    const fromLauncher = launcherWaitsForSignIn();
     const session = await createSession({
       aiProvider: agentId,
       mode: "terminal",
@@ -1033,41 +1173,72 @@ function AppContent() {
       agentLaunch: { accountId, purpose: "login" },
     });
     if (session) showSession(session.id);
-  }, [createSession, showSession, t]);
+    signInStarted(fromLauncher, session?.id ?? null);
+  }, [createSession, showSession, t, launcherWaitsForSignIn, signInStarted]);
+
+  /** What a launcher task's launch does to the app (launchTask's effects), for now or for when it leaves the queue. */
+  const launchDeps = useCallback((): LaunchTaskDeps => ({
+    projectFor: async (root) => {
+      const want = normalizeRepoPath(root, PLATFORM === "win");
+      const known = (await getProjectsOrdered()).find((p) => normalizeRepoPath(p.path, PLATFORM === "win") === want);
+      return known ? known.id : (await createProject(root, null)).id;
+    },
+    createSession,
+    // With a running-agents or memory cap and no free slot, the task
+    // waits in the queue instead of starting (N22).
+    queue: (opts, label, launch) => fleet.queueIfFull(opts, label, launch),
+    place: (sessionId, index, firstSessionId) => {
+      const paneId = layoutRef.current.focusedPaneId;
+      if (index === 0 || !firstSessionId || !paneId) {
+        showSession(sessionId);
+        return;
+      }
+      // The same task on a second agent opens beside the first. Creating
+      // it put it into the focused pane, so that pane gets the first back.
+      for (const action of splitAfterCreateActions({ paneId, sessionId: firstSessionId }, { paneId, direction: "horizontal" }, sessionId)) {
+        dispatch(action);
+      }
+    },
+    // A linked worktree only: a session on the repository's own checkout has none.
+    worktreePath: async (sessionId, projectId) => {
+      const info = await getSessionWorktreeInfo(sessionId, projectId);
+      return info && !info.isMainWorktree ? info.worktreePath : null;
+    },
+    writeFeatureFile: writeTaskFeatureFile,
+    writeDoneWhen: writeTaskDoneWhen,
+    trackPrompt: taskTrackPrompt,
+    copyText: (text) => navigator.clipboard.writeText(text),
+    readRecords: () => getSetting(TASK_LAUNCHES_KEY).catch(() => ""),
+    writeRecords: (raw) => setSetting(TASK_LAUNCHES_KEY, raw),
+    now: () => Date.now(),
+    notify: (message) => toastStoreRef.current.addToast({ message, type: "error", duration: 10000 }),
+  }), [createSession, dispatch, showSession, fleet]);
+  launchDepsRef.current = launchDeps;
 
   const runTaskLaunch = useCallback(async (req: TaskLaunchRequest): Promise<TaskLaunchResult> => {
-    const result = await launchTask(req, {
-      projectFor: async (root) => {
-        const want = normalizeRepoPath(root, PLATFORM === "win");
-        const known = (await getProjectsOrdered()).find((p) => normalizeRepoPath(p.path, PLATFORM === "win") === want);
-        return known ? known.id : (await createProject(root, null)).id;
-      },
-      createSession,
-      // With a running-agents or memory cap and no free slot, the task
-      // waits in the queue instead of starting (N22).
-      queue: (opts, label) => fleet.queueIfFull(opts, label),
-      place: (sessionId, index, firstSessionId) => {
-        const paneId = layoutRef.current.focusedPaneId;
-        if (index === 0 || !firstSessionId || !paneId) {
-          showSession(sessionId);
-          return;
-        }
-        // The same task on a second agent opens beside the first. Creating
-        // it put it into the focused pane, so that pane gets the first back.
-        for (const action of splitAfterCreateActions({ paneId, sessionId: firstSessionId }, { paneId, direction: "horizontal" }, sessionId)) {
-          dispatch(action);
-        }
-      },
-      worktreePath: async (sessionId, projectId) => (await getSessionWorktreeInfo(sessionId, projectId))?.worktreePath ?? null,
-      writeFeatureFile: writeTaskFeatureFile,
-      copyText: (text) => navigator.clipboard.writeText(text),
-      readRecords: () => getSetting(TASK_LAUNCHES_KEY).catch(() => ""),
-      writeRecords: (raw) => setSetting(TASK_LAUNCHES_KEY, raw),
-      now: () => Date.now(),
-    });
+    const result = await launchTask(req, launchDeps());
     if (!result.ok) return false;
-    return result.sessionIds.length === 0 && result.queued > 0 ? "queued" : true;
-  }, [createSession, dispatch, showSession, fleet]);
+    if (result.sessionIds.length === 0 && result.queued > 0) {
+      // Nothing started: said on screen (the queue may be out of view), with a way to start it anyway.
+      const running = getOccupancy().sessionIds.length;
+      toastStoreRef.current.addToast({
+        message: running === 0 ? t("fleet.queuedToastSlot") : running === 1 ? t("fleet.queuedToastOne") : t("fleet.queuedToast", { count: running }),
+        type: "info",
+        duration: 8000,
+        actions: [
+          {
+            label: t("fleet.queueStartNow"),
+            primary: true,
+            onClick: () => {
+              for (const q of listQueuedTasks()) if (q.launch?.launchId === result.launchId) startTaskNow(q.id);
+            },
+          },
+        ],
+      });
+      return "queued";
+    }
+    return true;
+  }, [launchDeps, t]);
 
   /** A launch from the ⌘N sheet, which closes itself once it is done (unless it stays open). */
   const runSheetLaunch = useCallback(async (req: TaskLaunchRequest): Promise<TaskLaunchResult> => {
@@ -1114,7 +1285,11 @@ function AppContent() {
     }
   }, [activeSession, createSession, state.layout, dispatch]);
   /** `r` in the Track panel: one tagged line to the writer's terminal. */
-  const sendLineToSession = useCallback((sessionId: string, line: string) => writeToSession(sessionId, utf8ToBase64(`${line}\r`)), []);
+  // Submitted as Enter would: a bracketed paste for a program that asked for one (see submitLineBytes).
+  const sendLineToSession = useCallback(
+    (sessionId: string, line: string) => writeToSession(sessionId, utf8ToBase64(submitLineBytes(line, getTerminal(sessionId)?.modes.bracketedPasteMode ?? false))),
+    [],
+  );
   /** Palette: approve the active worktree's waiting gate. */
   const approveActiveGate = useCallback(async () => {
     if (!activeSession) return;
@@ -1127,24 +1302,39 @@ function AppContent() {
     try {
       noteOwnApproval(activeSession.working_directory, feature.slug);
       const move = await trackApprove(activeSession.working_directory, feature.slug);
+      // The agent stopped at the gate: tell it (as the Track panel does).
+      const writer = attachedSessions(sessions, activeSession.working_directory, hasTurnHistory)[0];
+      if (writer && isAgentSession(writer, hasTurnHistory)) await sendLineToSession(writer.id, gateMovedLine(feature.slug, move, "approved")).catch(() => {});
       toastStore.addToast({ message: t("track.approvedToast", { slug: feature.slug, from: move.from, to: move.to }), type: "success", duration: 4000 });
     } catch (e) {
       toastStore.addToast({ message: String(e), type: "error", duration: 5000 });
     }
-  }, [activeSession, toastStore, t]);
+  }, [activeSession, toastStore, t, sessions, sendLineToSession]);
   /** Palette: "Make it a feature" for the active worktree (Light track). */
   const makeActiveFeature = useCallback(async () => {
     if (!activeSession) return;
     const track = getTrackState(activeSession.working_directory);
     try {
-      const out = await trackPromote(activeSession.working_directory, slugFromBranch(track.branch, activeSession.working_directory), "Light", null);
-      const made = t("track.featureCreated", { slug: out.slug, track: "Light" });
-      toastStore.addToast({ message: out.branch ? `${made} — ${out.branch}` : made, type: "success", duration: 4000 });
+      // An explicit palette command; its toast offers Undo like the Track panel.
+      const { promoteWithUndo } = await import("./track/promote");
+      await promoteWithUndo(activeSession.working_directory, slugFromBranch(track.branch, activeSession.working_directory), "Light", toastStore, t);
       if (!ui.trackPanelOpen) dispatch({ type: "TOGGLE_TRACK" });
     } catch (e) {
       toastStore.addToast({ message: String(e), type: "error", duration: 5000 });
     }
   }, [activeSession, toastStore, ui.trackPanelOpen, dispatch, t]);
+
+  // Help > Check for Updates… and the version chip: always say how it went
+  // (an update found opens its dialog).
+  const { manualCheck } = updater;
+  const checkForUpdatesNow = useCallback(async () => {
+    const result = await manualCheck();
+    if (result === "none") {
+      toastStoreRef.current.addToast({ message: t("statusbar.update.upToDate", { version: __APP_VERSION__ }), type: "success", duration: 5000 });
+    } else if (result === "error") {
+      toastStoreRef.current.addToast({ message: t("statusbar.update.checkFailed"), type: "error", duration: 8000 });
+    }
+  }, [manualCheck, t]);
 
   // ── Native menu bar event bridge ──
   useNativeMenuEvents({
@@ -1155,13 +1345,13 @@ function AppContent() {
     requestCloseSession,
     activeSessionId: state.activeSessionId,
     focusedPaneId: state.layout.focusedPaneId,
-    setSettingsOpen,
+    setSettingsOpen: (tab) => (tab === null ? closeSettings() : openSettings(tab)),
     setShortcutsOpen,
     setCostDashboardOpen,
     setSessionCreatorOpen,
     copyContextToClipboard: () => copyContextToClipboard(activeSession),
     pendingSplit,
-    onCheckForUpdates: () => updater.manualCheck(),
+    onCheckForUpdates: () => void checkForUpdatesNow(),
     commandPaletteShortcut: cmdPaletteShortcut,
     toggleReviewDesk: reviewDeskEnabled ? toggleReviewDesk : undefined,
   });
@@ -1287,8 +1477,8 @@ function AppContent() {
             }}
             topAction={{ icon: PlusIcon, label: `${t("session.new")} (${shortcutLabel("file.new-session")})`, onClick: openNewSession }}
             bottomActions={[
-              { icon: PluginsIcon, label: t("app.plugins"), onClick: () => setSettingsOpen("plugins") },
-              { icon: SettingsIcon, label: t("app.settings"), onClick: () => setSettingsOpen("general") },
+              { icon: PluginsIcon, label: t("app.plugins"), onClick: () => openSettings("plugins") },
+              { icon: SettingsIcon, label: t("app.settings"), onClick: () => openSettings("general") },
             ]}
           />
         )}
@@ -1355,7 +1545,7 @@ function AppContent() {
         )}
         {ui.searchPanelOpen && !ui.flowMode && !activePluginPanel && (
           <Suspense fallback={null}>
-            <SearchPanel visible={ui.searchPanelOpen} />
+            <SearchPanel visible={ui.searchPanelOpen} onAddProject={() => setProjectPickerOpen(true)} />
           </Suspense>
         )}
         {activePluginPanel && !ui.flowMode && (() => {
@@ -1605,21 +1795,24 @@ function AppContent() {
         updateVersion={updater.state.version}
         updateDownloading={updater.state.downloading}
         updateProgress={updater.state.progress}
+        updateChecking={updater.state.checking}
         onShowUpdate={() => updater.manualCheck()}
-        onCheckForUpdates={() => updater.manualCheck()}
+        onCheckForUpdates={() => void checkForUpdatesNow()}
       />
 
       {ui.commandPaletteOpen && (
         <Suspense fallback={null}>
         <CommandPalette
           onClose={() => dispatch({ type: "TOGGLE_PALETTE" })}
-          sessions={sessions}
+          sessions={sidebarSessions}
+          onCloseSession={state.activeSessionId ? () => { if (state.activeSessionId) requestCloseSession(state.activeSessionId); } : undefined}
+          onCloseSessionRemoveWorktree={state.activeSessionId ? () => { if (state.activeSessionId) requestCloseSession(state.activeSessionId); } : undefined}
           activeSessionId={state.activeSessionId}
           onSelectSession={setActive}
           onNewSession={openNewSession}
           onToggleContext={() => dispatch({ type: "TOGGLE_CONTEXT" })}
           onToggleSessions={() => dispatch({ type: "TOGGLE_SIDEBAR" })}
-          onOpenSettings={(tab) => setSettingsOpen(tab || "general")}
+          onOpenSettings={(tab) => openSettings(tab || "general")}
           onOpenWorkspace={() => setWorkspaceOpen(true)}
           onOpenCostDashboard={fleetOn ? undefined : () => setCostDashboardOpen(true)}
           onToggleFlowMode={() => dispatch({ type: "TOGGLE_FLOW_MODE" })}
@@ -1683,7 +1876,7 @@ function AppContent() {
       {settingsOpen && (
         <Suspense fallback={null}>
         <Settings
-          onClose={() => setSettingsOpen(null)}
+          onClose={closeSettings}
           initialTab={settingsOpen}
           pluginRuntime={pluginRuntime}
           pluginRefreshTrigger={pluginUpdater.updateResults.length}
@@ -1756,13 +1949,12 @@ function AppContent() {
           <TaskLauncher
             key={taskLauncherOpen.gen}
             defaultRepo={taskLauncherOpen.repo}
+            focusNonce={taskLauncherOpen.focus}
             onClose={onTaskLauncherClosed}
             onOpenAdvanced={openAdvancedCreator}
-            onSignIn={(agentId) => void signInAgent(agentId)}
-            onManageAccounts={() => {
-              setTaskLauncherOpen(false);
-              setSettingsOpen("agents");
-            }}
+            onSignIn={(agentId, accountId) => void (accountId ? signInAccount(agentId, accountId) : signInAgent(agentId))}
+            onManageAccounts={() => openSettings("agents")}
+            onStartOver={() => setTaskLauncherOpen((cur) => (cur ? { ...cur, gen: ++launcherGenRef.current } : cur))}
             onLaunch={runSheetLaunch}
           />
         </Suspense>
@@ -1795,7 +1987,16 @@ function AppContent() {
             // createSession(), which makes the new session active and swaps
             // it into the focused pane.
             const focusedBefore = focusedPaneSnapshot(state.layout);
-            const session = await createSession(opts);
+            // A worktree that could not be made (a toast says why) keeps the
+            // wizard open with everything chosen, so another way can be
+            // picked; a cancel closes it as before.
+            let worktreeFailed = false;
+            const onWorktreeErrors = (e: Event) => {
+              if ((e as CustomEvent<{ fatal?: boolean }>).detail?.fatal) worktreeFailed = true;
+            };
+            window.addEventListener("hermes:worktree-errors", onWorktreeErrors);
+            const session = await createSession(opts).finally(() => window.removeEventListener("hermes:worktree-errors", onWorktreeErrors));
+            if (!session && worktreeFailed) return;
             setSessionCreatorOpen(false);
             if (session) {
               const split = pendingSplit.current;
@@ -1846,7 +2047,7 @@ function AppContent() {
 
       <OnboardingGate
         onLaunch={runTaskLaunch}
-        onSignIn={(agentId) => void signInAgent(agentId)}
+        onSignIn={(agentId, accountId) => void (accountId ? signInAccount(agentId, accountId) : signInAgent(agentId))}
         onOpenShell={() => void createSessionDirect()}
       />
       <LandSheetHost />
@@ -1856,6 +2057,11 @@ function AppContent() {
         <CloseSessionDialog
           sessionId={state.pendingCloseSessionId}
           sessionMode={state.sessions[state.pendingCloseSessionId]?.mode}
+          label={state.sessions[state.pendingCloseSessionId]?.label}
+          agentName={(() => {
+            const s = state.sessions[state.pendingCloseSessionId];
+            return s ? agentDisplayName(s) ?? getAgent(s.ai_provider)?.name ?? null : null;
+          })()}
           onConfirm={(id) => {
             dispatch({ type: "CANCEL_CLOSE_SESSION" });
             closeSession(id);
@@ -1868,9 +2074,10 @@ function AppContent() {
         />
       )}
 
-      {quitAsk && quitAsk.length > 0 && (
+      {quitAsk && (quitAsk.length > 0 || queuedCount > 0) && (
         <QuitWithAgentsDialog
           sessions={quitAsk}
+          queuedCount={queuedCount}
           onKeep={() => { void answerQuit(true); }}
           onStop={() => { void answerQuit(false); }}
           onCancel={() => setQuitAsk(null)}

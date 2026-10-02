@@ -147,6 +147,8 @@ try {
   assert(JSON.stringify(modes.map((m) => m.id)) === JSON.stringify(["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"]), "Claude's modes, in order");
   assert(modes.find((m) => m.id === "bypassPermissions")?.danger && /Skip all/.test(modes.find((m) => m.id === "bypassPermissions").text), "Skip all is marked dangerous");
   await bridge.click('.task-launcher-approval-modes [data-mode="bypassPermissions"]');
+  // A pick closes the menu; open again to read the chosen mode's note.
+  await openChip(bridge, "approval");
   const skip = await bridge.eval(`return { note: e2e.norm(e2e.first(".task-launcher-approval-note")?.innerText ?? ""), red: !!e2e.first(".task-launcher-approval-note.danger"), flag: e2e.first(".task-launcher-approval code")?.textContent };`);
   assert(skip.red && /Never asks, for anything/.test(skip.note), `its note, in red: "${skip.note}"`);
   assert(skip.flag === "--permission-mode bypassPermissions", `and its flag: ${skip.flag}`);
@@ -178,7 +180,8 @@ try {
   await typeInto(bridge, ".task-launcher-check-input", "npm run check");
   assert(!(await bridge.eval(`return /\\bSize\\b/.test(e2e.first(".task-launcher-options").innerText);`)), "there is no Size choice any more");
   const featureNote = await bridge.eval(`return e2e.norm(e2e.first(".task-launcher-feature").innerText);`);
-  assert(/Questions → research → design → plan before any code/.test(featureNote), "Track as a feature explains itself");
+  assert(/Questions → research → design → structure → plan → implement, before any code/.test(featureNote) && /Not the same as Claude Code's own plan mode \(Approval › Plan first\)/.test(featureNote), `Track as a feature explains itself, and that it is not Claude's plan mode ("${featureNote}")`);
+  assert((await bridge.eval(`return e2e.all(".task-launcher-opt-label").map((l) => e2e.norm(l.innerText));`)).includes("Feature track"), "its row is called Feature track (not Planning)");
   await bridge.click(".task-launcher-feature-box");
   await bridge.click(".task-launcher-also-toggle");
   await bridge.waitFor("the second agent's choices", `return !!e2e.first(".task-launcher-also-agent");`);
@@ -192,11 +195,11 @@ try {
   const [claudeLine, codexLine] = st.preview.split(" + ");
   const inOrder = (line, words) => words.every((w, i) => line.indexOf(w) >= 0 && (i === 0 || line.indexOf(w) > line.indexOf(words[i - 1])));
   assert(
-    inOrder(claudeLine, [...(PREFIX ? [PREFIX] : []), "claude", "--permission-mode plan", "--model opus", "--effort high", `"${TASK}"`, "--channels plugin:proof", "--extra-proof"]),
+    inOrder(claudeLine, [...(PREFIX ? [PREFIX] : []), "claude", "--permission-mode plan", "--model opus", "--effort high", `'${TASK}'`, "--channels plugin:proof", "--extra-proof"]),
     `Hermes will run: the claude line with every choice (${claudeLine})`,
   );
   assert(
-    inOrder(codexLine ?? "", ["codex", "--dangerously-bypass-approvals-and-sandbox", `-m ${CODEX_MODEL}`, "model_reasoning_effort", `"${TASK}"`]) && /model_reasoning_effort=\\?"?high/.test(codexLine),
+    inOrder(codexLine ?? "", ["codex", "--dangerously-bypass-approvals-and-sandbox", `-m ${CODEX_MODEL}`, "model_reasoning_effort", `'${TASK}'`]) && /model_reasoning_effort=\\?"?high/.test(codexLine),
     `and the codex line with its own (${codexLine})`,
   );
   assert(/in worktree hermes\/fix-the-flaky-login-test from develop/.test(st.preview), "and where: a new worktree from develop");
@@ -216,13 +219,16 @@ try {
   assert(rc && rx, "claude and codex both started");
   assert(rc.sessionIdArg && rc.settingsFile, "claude was started by the launch helper");
   assert(hasSeq(rc.argv, ["--permission-mode", "plan"]), "claude: --permission-mode plan");
-  assert(rc.argv.some((a) => String(a).startsWith(TASK)), "claude: the task is its first prompt");
+  // Tracked as a feature: the first prompt is the track's (the task, the
+  // questions phase, the gate), not the bare task.
+  const trackPrompt = (argv) => argv.find((a) => String(a).startsWith("Hermes Feature Track (Full)")) ?? "";
+  assert(trackPrompt(rc.argv).includes(TASK) && /Current phase: questions \(1 of 6\)/.test(trackPrompt(rc.argv)) && /hi phase done`, then STOP/.test(trackPrompt(rc.argv)), "claude: its first prompt is the feature track's, with the task");
   assert(hasSeq(rc.argv, ["--channels", "plugin:proof"]), "claude: --channels plugin:proof");
   assert(hasSeq(rc.argv, ["--model", "opus"]) && hasSeq(rc.argv, ["--effort", "high"]) && rc.argv.at(-1) === "--extra-proof", "claude: --model opus --effort high, and --extra-proof last");
   if (PREFIX) assert(rc.env.HERMES_PREFIX_PROOF === "launcher", "claude ran through the Settings prefix");
   assert(rx.argv.includes("--dangerously-bypass-approvals-and-sandbox"), "codex: its own approval (Skip all)");
   assert(hasSeq(rx.argv, ["-m", CODEX_MODEL]) && codexEffort(rx.argv, "high"), "codex: its own model and effort");
-  assert(rx.argv.some((a) => String(a).startsWith(TASK)), "codex: the same task");
+  assert(trackPrompt(rx.argv).includes(TASK), "codex: the same task, in the same track prompt");
   const develop = fx.git("rev-parse", "develop");
   const wts = fx.worktrees();
   const wtClaude = wts.find((w) => w.branch === "hermes/fix-the-flaky-login-test");

@@ -61,6 +61,17 @@ export function resetE2eDataDir() {
     throw new Error(`refusing to reset unexpected directory: ${dir}`);
   }
   if (existsSync(dir)) rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  // Windows keeps the webview's own storage (localStorage: the UI language,
+  // the keyboard rules a scenario emulates) apart, under %LOCALAPPDATA%: a
+  // first launch starts without it too, or one scenario's leaks into the next.
+  if (platform() === "win32" && process.env.LOCALAPPDATA) {
+    const webview = join(process.env.LOCALAPPDATA, E2E_IDENTIFIER, "EBWebView");
+    try {
+      if (existsSync(webview)) rmSync(webview, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    } catch (e) {
+      console.warn(`[e2e] could not reset the webview's storage at ${webview}: ${e.message}`);
+    }
+  }
 }
 
 // ─── Logging ─────────────────────────────────────────────────────────
@@ -642,6 +653,9 @@ export async function launchApp({
       TMP: appTmp,
       TEMP: appTmp,
       ...(flagDefaults ? { HERMES_E2E_FLAG_DEFAULTS: JSON.stringify(flagDefaults) } : {}),
+      // Local runs on a nearly full disk: the free space the disk guard sees
+      // (a scenario that sets its own, N14, keeps it). The CI workflow never sets it.
+      ...(process.env.HERMES_E2E_LOCAL_FREE_SPACE_BYTES ? { HERMES_E2E_FREE_SPACE_BYTES: process.env.HERMES_E2E_LOCAL_FREE_SPACE_BYTES } : {}),
       ...extraEnv,
     },
     stdio: ["ignore", fd, fd],
@@ -715,7 +729,7 @@ export async function launchApp({
         await sleep(100);
         if (!answered && !exited) {
           const clicked = await bridge
-            .eval(`const b = e2e.first('[data-testid="quit-with-agents-dialog"] .quit-dialog-btn-stop'); if (!b) return false; b.click(); return true;`)
+            .eval(`const b = e2e.first('[data-testid="quit-with-agents-dialog"] .quit-dialog-btn-stop, [data-testid="quit-with-agents-dialog"] .quit-dialog-btn-quit'); if (!b) return false; b.click(); return true;`)
             .catch(() => false);
           if (clicked) {
             answered = true;

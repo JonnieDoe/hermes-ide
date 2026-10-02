@@ -133,6 +133,10 @@ pub struct AccountCaps {
     /// Add account.
     pub profile_dir: Option<String>,
     pub login: Option<Vec<String>>,
+    /// The CLI's own sign-out (`codex logout`), run in an account's profile
+    /// when the person removes it with "Remove and sign out".
+    #[serde(default)]
+    pub logout: Option<Vec<String>>,
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -293,6 +297,10 @@ pub struct Signals {
     /// agent's app server reports, passed as this launch's hook state).
     #[serde(default)]
     pub hook_trust: Option<String>,
+    /// The shell the agent runs a hook command string with on Windows
+    /// (`powershell` for Gemini), so the command is written in its syntax.
+    #[serde(default)]
+    pub hook_shell: Option<String>,
 }
 
 fn default_confidence() -> String {

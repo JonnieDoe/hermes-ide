@@ -28,6 +28,21 @@ export function rememberedForm(choice: LaunchChoice): LaunchChoice {
   return out;
 }
 
+/**
+ * A choice as the launch history keeps it (the usual combination, what was
+ * last launched with an agent): its remembered form, except that "current
+ * checkout" is never carried over to the next task, which would then edit
+ * the project folder without anyone asking for it again. A preset keeps it:
+ * that is an explicit choice.
+ */
+export function historyForm(choice: LaunchChoice): LaunchChoice {
+  const out = rememberedForm(choice);
+  const isolate = (c: LaunchChoice): LaunchChoice => (c.where.kind === "current-checkout" ? { ...c, where: { kind: "new-worktree", baseBranch: "", branch: "" } } : c);
+  const main = isolate(out);
+  if (main.alsoOn) main.alsoOn = isolate(main.alsoOn);
+  return main;
+}
+
 /** A preset name the list does not have yet: "Claude Code · opus", then "Claude Code · opus 2". */
 export function uniquePresetName(base: string, presets: readonly { name: string }[]): string {
   const name = base.trim() || "Preset";
@@ -35,6 +50,13 @@ export function uniquePresetName(base: string, presets: readonly { name: string 
   if (!taken.has(name.toLowerCase())) return name;
   for (let n = 2; n < 100; n++) if (!taken.has(`${name} ${n}`.toLowerCase())) return `${name} ${n}`;
   return `${name} ${Date.now().toString(36)}`;
+}
+
+/** The preset already called `name` (letter case and surrounding spaces ignored), other than `exceptId`. */
+export function presetNamed<P extends { id: string; name: string }>(name: string, presets: readonly P[], exceptId?: string): P | null {
+  const want = name.trim().toLowerCase();
+  if (!want) return null;
+  return presets.find((p) => p.id !== exceptId && p.name.trim().toLowerCase() === want) ?? null;
 }
 
 export function modelOf(caps: AgentCapabilities | undefined, modelId: string): ModelOption | undefined {
@@ -76,4 +98,30 @@ export function switchAgent(choice: LaunchChoice, agentId: string, fresh: Launch
   if (choice.alsoOn && choice.alsoOn.agentId !== agentId) next.alsoOn = choice.alsoOn;
   else delete next.alsoOn;
   return next;
+}
+
+/**
+ * A starting choice without a dangerous approval mode (Skip all): the usual
+ * combination, what was last launched with an agent and the Settings
+ * default never put the launcher in it by themselves. A dangerous mode is
+ * replaced by `safe(agentId)` (the agent's safety default), for the second
+ * agent too. Presets and the person's own clicks keep it: those are
+ * explicit choices. `dropped`: something was replaced.
+ */
+export function withoutDanger(
+  choice: LaunchChoice,
+  caps: Readonly<Record<string, AgentCapabilities | undefined>>,
+  safe: (agentId: string) => string,
+): { choice: LaunchChoice; dropped: boolean } {
+  const isDanger = (c: LaunchChoice) => !!caps[c.agentId]?.approvalModes.find((m) => m.id === c.approvalModeId)?.danger;
+  let dropped = false;
+  const fix = (c: LaunchChoice): LaunchChoice => {
+    if (!isDanger(c)) return c;
+    dropped = true;
+    return { ...c, approvalModeId: safe(c.agentId) };
+  };
+  const main = fix(choice);
+  const out: LaunchChoice = main === choice ? { ...choice } : main;
+  if (choice.alsoOn) out.alsoOn = fix(choice.alsoOn);
+  return { choice: dropped ? out : choice, dropped };
 }

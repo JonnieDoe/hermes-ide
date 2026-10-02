@@ -268,11 +268,23 @@
 
 .git-file-path {
   flex: 1;
+  min-width: 0;
+  display: flex;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text-1);
   font-size: var(--text-xs);
+}
+/* Middle truncation: the folder shrinks (with an ellipsis), the name stays. */
+.git-file-dir {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-3);
+}
+.git-file-base {
+  flex: 0 0 auto;
 }
 
 .git-file-actions {
@@ -1427,4 +1439,27 @@
 .git-conflict-line {
   padding: 0 var(--space-3);
   min-height: 1.6em;
+}
+
+/* ─── Branch switcher: questions (switch a task's worktree, unmerged delete) ── */
+
+.git-branch-ask {
+  margin: var(--space-1) var(--space-2);
+  padding: var(--space-2);
+  border-left: calc(var(--space-1) / 2) solid var(--yellow);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+}
+
+.git-branch-ask-text {
+  font-size: var(--text-sm);
+  color: var(--text-0);
+  line-height: var(--leading-normal);
+  margin-bottom: var(--space-2);
+}
+
+.git-branch-ask-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
 }

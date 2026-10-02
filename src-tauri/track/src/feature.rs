@@ -5,7 +5,7 @@
 //!   hi phase done     gate: waiting               (the person reviews the file)
 //!   hi approve        phase: next, gate: approved (people only)
 //!   hi phase          starts the approved phase   (gate back to none)
-//!   hi phase skip     phase: next, gate: none     (not while a gate is waiting)
+//!   hi phase skip     phase: next, gate: none     (people only; recorded in `skipped:`)
 //! ```
 //!
 //! Every write replaces the file atomically (write a sibling, then rename),
@@ -222,7 +222,7 @@ pub struct CreateOutcome {
     pub seeded: Vec<PathBuf>,
 }
 
-const CLAUDE_COMMAND: &str = "---\ndescription: Run a Hermes feature-track phase (questions, research, design, structure, plan, implement, done, skip)\n---\nRun `hi phase $ARGUMENTS` in the terminal and follow the instructions it prints. It tells you which file to write, its line cap, and how to hand the phase over for review (`hi phase done`). Never edit the `gate:` line of feature.md yourself; a person approves gates from Hermes.\n";
+const CLAUDE_COMMAND: &str = "---\ndescription: Run a Hermes feature-track phase (questions, research, design, structure, plan, implement, done)\n---\nRun `hi phase $ARGUMENTS` in the terminal and follow the instructions it prints. It tells you which file to write, its line cap, and how to hand the phase over for review (`hi phase done`). Never edit the `gate:` line of feature.md yourself; a person approves (or skips) phases from Hermes.\n";
 
 /// Create `.hermes/features/<slug>/feature.md` for a Light or Full track,
 /// seed the repository's phase prompts and the one Claude slash command
@@ -260,12 +260,7 @@ pub fn create(
         &file,
         &front_matter::render_new(slug, track, first, title, body),
     )?;
-    let mut seeded = seed_phase_prompts(root)?;
-    let command = root.join(CLAUDE_COMMAND_FILE);
-    if !command.exists() {
-        write_atomic(&command, CLAUDE_COMMAND)?;
-        seeded.push(command);
-    }
+    let seeded = seed_repo_files(root)?;
     Ok(CreateOutcome {
         created: true,
         track,
@@ -302,6 +297,60 @@ pub fn ensure_branch(root: &Path, slug: &str) -> Option<String> {
             "Stayed on the current branch (git not available: {e})"
         )),
     }
+}
+
+/// The phase prompts (`.hermes/phases/`) and the one Claude slash command,
+/// where they are missing. Returns what was written.
+pub fn seed_repo_files(root: &Path) -> Result<Vec<PathBuf>, TrackError> {
+    let mut seeded = seed_phase_prompts(root)?;
+    let command = root.join(CLAUDE_COMMAND_FILE);
+    if !command.exists() {
+        write_atomic(&command, CLAUDE_COMMAND)?;
+        seeded.push(command);
+    }
+    Ok(seeded)
+}
+
+/// The first message an agent gets for a task tracked as a feature: the
+/// task, how the track works, and the first phase's instructions (the
+/// repository's `.hermes/phases/<phase>.md`, else the built-in), ending with
+/// the gate: hand the file over with `hi phase done`, then stop and wait for
+/// a person. Without it the agent only sees the task and does all of it at
+/// once, while the Track panel waits for questions that never come.
+pub fn first_prompt(root: &Path, slug: &str, track: Track, task: &str) -> String {
+    let phases = track_phases(track);
+    let Some(first) = phases.first().copied() else {
+        return task.trim().to_string();
+    };
+    let (prompt, _) = prompt_for(root, first);
+    let names = phases
+        .iter()
+        .map(|p| p.as_str())
+        .collect::<Vec<_>>()
+        .join(" → ");
+    let dir = format!("{FEATURES_DIR}/{slug}");
+    let mut text = format!(
+        "Hermes Feature Track ({track}): this task is planned in phases before any code is written, and every phase stops at a gate for a person's approval.\n\n\
+         The task (feature \"{slug}\", {dir}/feature.md):\n{task}\n\n\
+         Phases: {names}. Do only the current phase. Do not write or change code before the implement phase.\n\n\
+         Current phase: {first} (1 of {count}).\n\n{prompt}\n\n",
+        track = track.as_str(),
+        task = task.trim(),
+        first = first.as_str(),
+        count = phases.len(),
+        prompt = prompt.trim(),
+    );
+    if let (Some(file), Some(cap)) = (first.file_name(), first.line_cap()) {
+        text.push_str(&format!("Write {dir}/{file} (at most {cap} lines). "));
+    }
+    text.push_str(
+        "When it is written, run `hi phase done`, then STOP: end your turn and wait. \
+         A person reviews the file in Hermes and approves it or sends you edits. \
+         Never edit the gate: line of feature.md yourself. \
+         When Hermes tells you the phase was approved, run `hi phase` and follow what it prints for the next phase, the same way. \
+         (`hi` is Hermes's helper on your PATH; if your shell does not find it, run \"$HERMES_BIN_DIR/hi\".)",
+    );
+    text
 }
 
 /// Copy the built-in prompts into `.hermes/phases/` where none exist, so a
@@ -387,7 +436,7 @@ pub fn start_phase(
         }
         Gate::None | Gate::Approved if target > meta.phase => {
             return Err(TrackError::Refused(format!(
-                "finish {} first (`hi phase done`), or skip it (`hi phase skip`)",
+                "finish {} first, then run `hi phase done`",
                 meta.phase.as_str()
             )));
         }
@@ -419,10 +468,10 @@ pub fn start_phase(
     text.push_str("\n\n—\n");
     match (&file, cap) {
         (Some(path), Some(cap)) => text.push_str(&format!(
-            "Write {} (at most {cap} lines). When it is ready: hi phase done\n",
+            "Write {} (at most {cap} lines). When it is ready: hi phase done\nThen stop and wait: a person approves the phase in Hermes before the next one starts.\n",
             display_relative(root, path)
         )),
-        _ => text.push_str("When the work is finished and the checks pass: hi phase done\n"),
+        _ => text.push_str("When the work is finished and the checks pass: hi phase done\nThen stop and wait for the person's review in Hermes.\n"),
     }
     Ok(StartOutcome {
         phase: target,
@@ -562,24 +611,90 @@ pub fn finish_phase(root: &Path, slug: &str) -> Result<Phase, TrackError> {
     Ok(meta.phase)
 }
 
-/// `hi phase skip`: move on without a review. An agent cannot skip past a
-/// gate that is waiting; a person can (from Hermes).
+/// `hi phase skip`: move on without a review. Only a person skips (from
+/// Hermes or their own shell); an agent never does, waiting gate or not:
+/// deciding that a phase needs no review is the person's call. The skipped
+/// phase is recorded in feature.md (`skipped:`, with when), so a skipped
+/// phase is never mistaken for an approved one.
 pub fn skip_phase(root: &Path, slug: &str, by_person: bool) -> Result<(Phase, Phase), TrackError> {
+    skip_phase_at(root, slug, by_person, &utc_now_text())
+}
+
+/// [`skip_phase`] with the time to record.
+pub fn skip_phase_at(
+    root: &Path,
+    slug: &str,
+    by_person: bool,
+    when: &str,
+) -> Result<(Phase, Phase), TrackError> {
     let feature = FeatureDir::new(root, slug);
     let loaded = feature.load()?;
     let meta = &loaded.meta;
-    if meta.phase == Phase::Done {
-        return Err(TrackError::Refused(format!("{slug} is already done")));
-    }
-    if meta.gate == Gate::Waiting && !by_person {
+    if !by_person {
         return Err(TrackError::Refused(format!(
-            "{} is waiting for a person's approval; only a person can skip it (from Hermes)",
+            "only a person can skip a phase; finish {} first, then run `hi phase done`",
             meta.phase.as_str()
         )));
     }
+    if meta.phase == Phase::Done {
+        return Err(TrackError::Refused(format!("{slug} is already done")));
+    }
     let next = next_phase(meta.track, meta.phase);
-    feature.set(&loaded.text, &[("phase", next.as_str()), ("gate", "none")])?;
+    let path = feature.feature_file();
+    let fm_err = |e: front_matter::FrontMatterError| TrackError::FrontMatter {
+        path: path.clone(),
+        message: e.message,
+        line: e.line,
+    };
+    let text = front_matter::set_keys(&loaded.text, &[("phase", next.as_str()), ("gate", "none")])
+        .map_err(fm_err)?;
+    let mut skipped: Vec<String> = front_matter::list_value(&text, SKIPPED_KEY)
+        .into_iter()
+        .filter(|s| skipped_phase_of(s) != Some(meta.phase))
+        .collect();
+    skipped.push(format!("{} ({when})", meta.phase.as_str()));
+    let text = front_matter::set_list(&text, SKIPPED_KEY, &skipped).map_err(fm_err)?;
+    write_atomic(&path, &text)?;
     Ok((meta.phase, next))
+}
+
+/// The front matter key listing the phases a person skipped, each as
+/// `research (2026-10-01 14:05 UTC)`.
+pub const SKIPPED_KEY: &str = "skipped";
+
+/// The phase of one `skipped:` item.
+pub fn skipped_phase_of(item: &str) -> Option<Phase> {
+    Phase::parse(item.split_whitespace().next()?)
+}
+
+/// Now, as `2026-10-01 14:05 UTC` (no comma: it goes in an inline list).
+pub fn utc_now_text() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    utc_text(secs)
+}
+
+/// Seconds since the epoch as `2026-10-01 14:05 UTC`.
+pub fn utc_text(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // The civil date of a day count (Howard Hinnant's days_from_civil, inverted).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        rem / 3600,
+        (rem % 3600) / 60
+    )
 }
 
 /// `hi approve` / ⌘⏎: a person approves the waiting phase. The file moves
@@ -623,6 +738,66 @@ mod tests {
 
     fn meta(root: &Path, slug: &str) -> Meta {
         FeatureDir::new(root, slug).load().unwrap().meta
+    }
+
+    #[test]
+    fn the_first_prompt_carries_the_task_the_first_phase_and_the_gate() {
+        let dir = repo();
+        let text = first_prompt(
+            dir.path(),
+            "fail-notice",
+            Track::Full,
+            "  Build the failure notification  ",
+        );
+        assert!(text.contains("The task (feature \"fail-notice\", .hermes/features/fail-notice/feature.md):\nBuild the failure notification\n"), "{text}");
+        assert!(
+            text.contains("Phases: questions → research → design → structure → plan → implement."),
+            "{text}"
+        );
+        assert!(
+            text.contains("Current phase: questions (1 of 6)."),
+            "{text}"
+        );
+        // The built-in questions prompt, without its template.
+        assert!(text.contains("# Phase: questions"), "{text}");
+        assert!(!text.contains("## Template"), "{text}");
+        assert!(
+            text.contains("Write .hermes/features/fail-notice/questions.md (at most 40 lines)."),
+            "{text}"
+        );
+        assert!(
+            text.contains("run `hi phase done`, then STOP: end your turn and wait."),
+            "{text}"
+        );
+        // The repository's own prompt wins.
+        let phases = dir.path().join(PHASES_DIR);
+        fs::create_dir_all(&phases).unwrap();
+        fs::write(
+            phases.join("questions.md"),
+            "# Phase: questions\n\nAsk about the database only.\n\n## Template\n# Q\n",
+        )
+        .unwrap();
+        let own = first_prompt(dir.path(), "fail-notice", Track::Light, "x");
+        assert!(own.contains("Ask about the database only."), "{own}");
+        assert!(
+            own.contains("Phases: questions → plan → implement."),
+            "{own}"
+        );
+        assert!(own.contains("Current phase: questions (1 of 3)."), "{own}");
+        // A Quick track has no phases: just the task.
+        assert_eq!(
+            first_prompt(dir.path(), "q", Track::Quick, " do it "),
+            "do it"
+        );
+    }
+
+    #[test]
+    fn seeding_writes_the_phase_prompts_and_the_command_once() {
+        let dir = repo();
+        let first = seed_repo_files(dir.path()).unwrap();
+        assert_eq!(first.len(), PROMPTED_PHASES.len() + 1);
+        assert!(dir.path().join(CLAUDE_COMMAND_FILE).exists());
+        assert!(seed_repo_files(dir.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -689,9 +864,12 @@ mod tests {
                 .starts_with("# Questions")
         );
 
-        // Cannot jump ahead without finishing or skipping.
+        // Cannot jump ahead without finishing; the refusal never offers a skip.
         let e = start_phase(root, "demo", Some(Phase::Plan)).unwrap_err();
-        assert!(e.to_string().contains("finish questions first"), "{e}");
+        assert_eq!(
+            e.to_string(),
+            "finish questions first, then run `hi phase done`"
+        );
         // Research is not a Light phase.
         let e = start_phase(root, "demo", Some(Phase::Research)).unwrap_err();
         assert!(
@@ -761,12 +939,69 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_never_skips_whatever_the_gate() {
+        let dir = repo();
+        let root = dir.path();
+        create(root, "full", Track::Full, "", "").unwrap();
+        let before = fs::read_to_string(root.join(".hermes/features/full/feature.md")).unwrap();
+        // Gate none, then approved (the person approved questions), then waiting.
+        let e = skip_phase(root, "full", false).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("finish questions first, then run `hi phase done`"),
+            "{e}"
+        );
+        start_phase(root, "full", None).unwrap();
+        finish_phase(root, "full").unwrap();
+        assert!(skip_phase(root, "full", false).is_err());
+        approve(root, "full").unwrap();
+        for _ in 0..5 {
+            assert!(skip_phase(root, "full", false).is_err());
+        }
+        let m = meta(root, "full");
+        assert_eq!((m.phase, m.gate), (Phase::Research, Gate::Approved));
+        assert!(!before.contains("skipped"));
+        assert!(front_matter::list_value(
+            &fs::read_to_string(root.join(".hermes/features/full/feature.md")).unwrap(),
+            SKIPPED_KEY
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_skip_is_recorded_with_when_and_survives_a_second_skip() {
+        let dir = repo();
+        let root = dir.path();
+        create(root, "full", Track::Full, "", "").unwrap();
+        skip_phase_at(root, "full", true, "2026-10-01 14:05 UTC").unwrap();
+        skip_phase_at(root, "full", true, "2026-10-01 14:06 UTC").unwrap();
+        let text = fs::read_to_string(root.join(".hermes/features/full/feature.md")).unwrap();
+        assert!(
+            text.contains(
+                "skipped: [questions (2026-10-01 14:05 UTC), research (2026-10-01 14:06 UTC)]"
+            ),
+            "{text}"
+        );
+        let items = front_matter::list_value(&text, SKIPPED_KEY);
+        assert_eq!(
+            items
+                .iter()
+                .map(|i| skipped_phase_of(i))
+                .collect::<Vec<_>>(),
+            vec![Some(Phase::Questions), Some(Phase::Research)]
+        );
+        assert_eq!(meta(root, "full").phase, Phase::Design);
+        assert_eq!(utc_text(0), "1970-01-01 00:00 UTC");
+        assert_eq!(utc_text(1_790_863_500), "2026-10-01 14:05 UTC");
+    }
+
+    #[test]
     fn skip_moves_on_without_a_gate_and_revert_puts_a_gate_back() {
         let dir = repo();
         let root = dir.path();
         create(root, "full", Track::Full, "", "").unwrap();
         assert_eq!(
-            skip_phase(root, "full", false).unwrap(),
+            skip_phase(root, "full", true).unwrap(),
             (Phase::Questions, Phase::Research)
         );
         assert_eq!(meta(root, "full").gate, Gate::None);

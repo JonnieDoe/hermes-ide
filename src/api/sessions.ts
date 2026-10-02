@@ -81,9 +81,19 @@ export interface SessionHostStatus {
   quit_decision: boolean | null;
 }
 
+/** Whether the session host is running (and which sessions it hosts). */
+export function sessionHostStatus(): Promise<SessionHostStatus> {
+  return invoke<SessionHostStatus>("session_host_status");
+}
+
 /** The answer to "keep running or stop?": the backend acts on it and quits. */
 export function sessionHostQuit(keepRunning: boolean): Promise<void> {
   return invoke("session_host_quit", { keepRunning });
+}
+
+/** How many tasks wait in the queue: a quit then asks first (and says they start next time). */
+export function sessionHostSetQueued(count: number): Promise<void> {
+  return invoke("session_host_set_queued", { count });
 }
 
 /**

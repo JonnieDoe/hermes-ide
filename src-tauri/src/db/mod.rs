@@ -1589,6 +1589,35 @@ impl Database {
         Ok(entries)
     }
 
+    /// The branch a task's worktree was cut from (the launcher's base), which
+    /// Land lands into unless told otherwise.
+    pub fn set_worktree_base_branch(&self, id: &str, base_branch: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE session_worktrees SET base_branch = ?1 WHERE id = ?2",
+                params![base_branch, id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_worktree_base_branch(
+        &self,
+        session_id: &str,
+        project_id: &str,
+    ) -> Result<Option<String>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT base_branch FROM session_worktrees WHERE session_id = ?1 AND realm_id = ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let value: Option<Option<String>> = stmt
+            .query_row(params![session_id, project_id], |row| row.get(0))
+            .ok();
+        Ok(value.flatten().filter(|b| !b.is_empty()))
+    }
+
     pub fn update_worktree_branch(&self, id: &str, branch_name: &str) -> Result<(), String> {
         self.conn
             .execute(
@@ -2016,6 +2045,8 @@ const VALID_SETTING_KEYS: &[&str] = &[
     "session_mode_by_provider",
     // Task launcher (F15): what each launched task was (task, track, done-when), per session
     "task_launches",
+    // Task queue (N22): the tasks waiting for a free slot, kept while Hermes is closed
+    "task_queue",
     // Keyboard shortcuts
     "command_palette_shortcut",
     // Plugin updates
@@ -2040,6 +2071,10 @@ const VALID_SETTING_KEYS: &[&str] = &[
     "feature_flag_overrides",
     // Away notifications (N16): webhook / ntfy / Telegram address
     "away_notify_url",
+    // ...how long a blocked agent waits while Hermes is in front of you
+    // ("0" | "120" | "600" seconds), and whether messages name sessions
+    "away_notify_delay",
+    "away_notify_names",
     // Fleet controls (2.0: spend caps and the task queue — see src/fleet/)
     "fleet_spend_cap_session_usd",
     "fleet_spend_cap_feature_usd",
@@ -3008,6 +3043,8 @@ const EXPORT_EXCLUDED_KEYS: &[&str] = &[
     "worktree_recipe_trust",
     // Task launcher records — per session, with task text and branch names
     "task_launches",
+    // Tasks waiting in the queue (N22) — task text and paths, per install
+    "task_queue",
 ];
 
 /// Validate a settings file path for export or import.

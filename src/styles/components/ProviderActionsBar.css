@@ -23,7 +23,8 @@
   border-radius: var(--radius-pill);
   border: 1px solid var(--accent-dim);
   background: var(--accent-dim);
-  color: var(--accent);
+  /* The link ink, not --accent: 4.5:1 on the tint in the light themes too. */
+  color: var(--link-fg);
   cursor: pointer;
   white-space: nowrap;
   font-family: var(--font-ui);
@@ -73,6 +74,20 @@
   color: var(--text-1);
 }
 
+/* The pills share one row; those that do not fit wrap below it, out of
+   sight, so the Commands trigger after them is never pushed off the pane. */
+.pab-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  align-content: flex-start;
+  gap: calc(var(--space-1) * 1.5);
+  flex: 1 1 auto;
+  min-width: 0;
+  height: calc(var(--text-sm) * 1.5 + var(--space-1) + var(--control-border-width) * 2);
+  overflow: hidden;
+}
+
 /* ─── Spacer ──────────────────────────────────────────── */
 
 .pab-spacer {
@@ -119,7 +134,12 @@
   font-weight: 600;
 }
 
+/* Frosted Light: --text-3 on --bg-3 falls under 4.5:1. */
+html[data-theme="frosted-light"] .pab-commands-trigger:not(.pab-commands-trigger-active) .pab-commands-count {
+  color: var(--text-1);
+}
+
 .pab-commands-trigger-active .pab-commands-count {
   background: var(--accent-dim);
-  color: var(--accent);
+  color: var(--link-fg);
 }

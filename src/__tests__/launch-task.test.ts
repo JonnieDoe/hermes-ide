@@ -6,7 +6,7 @@
  * and the launch record.
  */
 import { describe, expect, it, vi } from "vitest";
-import { handleUndeliveredTask, launchTask, normalizeRepoPath, type LaunchTaskDeps } from "../launcher/launchTask";
+import { finishQueuedLaunch, handleUndeliveredTask, launchTask, normalizeRepoPath, queuedLaunchOpts, type LaunchTaskDeps, type QueuedLaunch } from "../launcher/launchTask";
 import { parseTaskLaunches } from "../launcher/taskLauncher";
 import type { CreateSessionOpts, SessionData } from "../types/session";
 import type { PlannedAgent, TaskLaunchRequest } from "../components/TaskLauncher";
@@ -68,6 +68,7 @@ function fakeDeps(over: Partial<LaunchTaskDeps> = {}) {
       records = raw;
     },
     now: () => 1000,
+    newLaunchId: () => "launch-1",
     ...over,
   };
   return { deps, created, placed, files, copied, records: () => parseTaskLaunches(records) };
@@ -121,6 +122,7 @@ describe("launchTask", () => {
         doneWhen: ["npm test"],
         pairedWith: null,
         createdAt: 1000,
+        launchId: "launch-1",
       },
     ]);
   });
@@ -175,6 +177,32 @@ describe("launchTask", () => {
     expect(f.files[0][2]).toContain("track: Full");
     expect(f.files[0][2]).toContain('  - "npm test"');
     expect(r.featureFiles).toEqual(["/fixture-home/wt/s1/.hermes/features/fix-the-login-bug/feature.md"]);
+  });
+
+  it("a Full track starts the agent with the track's first prompt (questions, then the gate), not the bare task", async () => {
+    const trackPrompt = vi.fn(async (root: string, slug: string, task: string) => `TRACK(${root}|${slug}|${task})`);
+    const f = fakeDeps({ trackPrompt });
+    await launchTask(req({ track: "Full", agents: [agent("claude", "terminal", "hermes/fix-the-login-bug"), agent("codex", "terminal", "hermes/fix-the-login-bug-codex")] }), f.deps);
+    expect(trackPrompt).toHaveBeenCalledWith("/fixture-home/repo", "fix-the-login-bug", "Fix the login bug");
+    expect(f.created.map((o) => o.initialPrompt)).toEqual([
+      "TRACK(/fixture-home/repo|fix-the-login-bug|Fix the login bug)",
+      "TRACK(/fixture-home/repo|fix-the-login-bug|Fix the login bug)",
+    ]);
+    // The launch record keeps the task as the person wrote it.
+    expect(f.records().map((r) => r.task)).toEqual(["Fix the login bug", "Fix the login bug"]);
+    // Quick: the bare task, no track prompt asked for.
+    const q = fakeDeps({ trackPrompt });
+    trackPrompt.mockClear();
+    await launchTask(req(), q.deps);
+    expect(trackPrompt).not.toHaveBeenCalled();
+    expect(q.created[0].initialPrompt).toBe("Fix the login bug");
+  });
+
+  it("a Full track whose prompt cannot be built still launches, with the bare task", async () => {
+    const f = fakeDeps({ trackPrompt: vi.fn(async () => Promise.reject(new Error("no repo"))) });
+    const r = await launchTask(req({ track: "Full" }), f.deps);
+    expect(r.ok).toBe(true);
+    expect(f.created[0].initialPrompt).toBe("Fix the login bug");
   });
 
   it("an agent that cannot take a first prompt gets the task on the clipboard", async () => {
@@ -247,6 +275,68 @@ describe("launchTask", () => {
       ["claude", "Fix the login bug", "Fix the login bug"],
       ["codex", "Fix the login bug", "Fix the login bug"],
     ]);
+  });
+
+  it("a queued agent finishes its launch when it starts: feature.md, checks, record, pairing (LEAD-03)", async () => {
+    const launches: QueuedLaunch[] = [];
+    const checks: [string, string[]][] = [];
+    const f = fakeDeps({
+      // The first agent starts at once, the second waits for a slot.
+      queue: (_opts, _label, launch) => (launch.agentIndex === 1 ? (launches.push(launch), true) : false),
+      writeDoneWhen: vi.fn(async (checkout: string, commands: string[]) => {
+        checks.push([checkout, commands]);
+        return `${checkout}.git/hermes/done-when.json`;
+      }),
+    });
+    const r = await launchTask(req({ track: "Full", agents: [agent("claude", "terminal", "hermes/x"), agent("codex", "terminal", "hermes/x-codex")] }), f.deps);
+    expect(r).toMatchObject({ ok: true, sessionIds: ["s1"], queued: 1, launchId: "launch-1" });
+    expect(launches).toHaveLength(1);
+    // Plain data, kept across a quit.
+    const stored: QueuedLaunch = JSON.parse(JSON.stringify(launches[0]));
+    expect(queuedLaunchOpts(stored)).toMatchObject({ aiProvider: "codex", branchSelections: { "proj-1": { branch: "hermes/x-codex", createNew: true } }, initialPrompt: "Fix the login bug" });
+    // The slot frees: the app creates the session, then the launch finishes.
+    const later = await finishQueuedLaunch(stored, "s9", f.deps);
+    expect(later.featureFiles).toEqual(["/fixture-home/wt/s9/.hermes/features/fix-the-login-bug/feature.md"]);
+    expect(checks).toEqual([
+      ["/fixture-home/wt/s1", ["npm test"]],
+      ["/fixture-home/wt/s9", ["npm test"]],
+    ]);
+    expect(f.records().map((x) => [x.sessionId, x.track, x.pairedWith])).toEqual([
+      ["s1", "Full", "s9"],
+      ["s9", "Full", "s1"],
+    ]);
+  });
+
+  it("a Full track on the current checkout writes the feature in the repository's own folder (PLN-04)", async () => {
+    const f = fakeDeps({ worktreePath: vi.fn(async () => null) });
+    const r = await launchTask(req({ track: "Full", agents: [agent("claude", "terminal", "", { createBranch: false, worktree: false })] }), f.deps);
+    expect(f.files.map(([checkout, slug]) => [checkout, slug])).toEqual([["/fixture-home/repo", "fix-the-login-bug"]]);
+    expect(r.featureFiles).toEqual(["/fixture-home/repo/.hermes/features/fix-the-login-bug/feature.md"]);
+  });
+
+  it("a feature track that cannot be written is said, and the launch stands (PLN-04)", async () => {
+    const notify = vi.fn();
+    const f = fakeDeps({ notify, writeFeatureFile: vi.fn(async () => Promise.reject(new Error("disk full"))) });
+    const r = await launchTask(req({ track: "Full" }), f.deps);
+    expect(r.ok).toBe(true);
+    expect(notify).toHaveBeenCalledWith("Couldn't create the feature track: disk full");
+    // A worktree session whose worktree cannot be found: said too, never written into the main checkout.
+    const g = fakeDeps({ notify, worktreePath: vi.fn(async () => null) });
+    await launchTask(req({ track: "Full" }), g.deps);
+    expect(g.files).toEqual([]);
+    expect(notify).toHaveBeenLastCalledWith("Couldn't create the feature track: the task's worktree could not be found");
+  });
+
+  it("keeps the task's checks next to its worktree only (PLN-10), none for the current checkout or without checks", async () => {
+    const writeDoneWhen = vi.fn(async () => "x");
+    const f = fakeDeps({ writeDoneWhen });
+    await launchTask(req({ doneWhen: [" npm test ", "", "cargo test"] }), f.deps);
+    expect(writeDoneWhen).toHaveBeenCalledWith("/fixture-home/wt/s1", ["npm test", "cargo test"]);
+    writeDoneWhen.mockClear();
+    const g = fakeDeps({ writeDoneWhen, worktreePath: vi.fn(async () => null) });
+    await launchTask(req({ agents: [agent("claude", "terminal", "", { createBranch: false, worktree: false })] }), g.deps);
+    await launchTask(req({ doneWhen: [] }), f.deps);
+    expect(writeDoneWhen).not.toHaveBeenCalled();
   });
 
   it("a record that cannot be saved does not undo the launch", async () => {

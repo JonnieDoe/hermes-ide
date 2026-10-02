@@ -35,6 +35,13 @@
 // `a` is a tool call the way Antigravity makes one: PreToolUse (run_command),
 // then it waits for the person's y/n without reporting that it waits; `y`
 // runs the command (a shell child, as long as `z`) and then PostToolUse.
+// `P` is a permission prompt the way Claude Code 2.1.287 answers it: the
+// PermissionRequest hook, then nothing until the person answers — `y` or
+// Enter runs the command (a shell child, as long as `z`) with no hook until
+// its PostToolUse; Esc rejects it: "Interrupted · What should Claude do
+// instead?", no hook at all, and the transcript gets the rejected tool
+// result, "[Request interrupted by user for tool use]" and the turn's
+// `turn_duration` line, as Claude Code writes them.
 //
 // As HERMES_FAKE_AGENT=antigravity, with no --settings, the hooks come from
 // `.agents/hooks.json` in the folder it runs in, in Antigravity's shape: one
@@ -124,6 +131,9 @@
 //   codex  `debug models --bundled` a small model catalog (JSON)
 //   agy    `models`               "slug<TAB>Name" lines, or "Authentication required"
 //   `auth login` / `login`        signs the profile in (see below) and exits 0
+//   `auth logout` / `logout`      signs the profile out ("out" in .fake-auth)
+// Codex started without -m runs the `model = "…"` of its config.toml
+// (CODEX_HOME, else ~/.codex), as the real CLI does.
 // Sign-in per profile: with the agent's profile variable set
 // (CLAUDE_CONFIG_DIR, CODEX_HOME, …) the state is the file `.fake-auth` in
 // that folder ("in"; missing = signed out, like an empty profile); without
@@ -152,6 +162,11 @@
 // Two more mode words for the refusal-safety scenario:
 //   wrap-prompt   the first prompt is drawn in rows of at most 40
 //                 characters (word-wrapped), as a TUI in a narrow pane does
+//   model-not-found-hooks
+//                 a refused model (Claude Code) is refused the way 2.1.287
+//                 does it with a first prompt: the SessionStart hooks, the
+//                 UserPromptSubmit hooks with the prompt, then StopFailure
+//                 with `error: "model_not_found"`, then the refusal on screen
 //   quote-errors  once ready, the agent "answers" with its reply mark
 //                 (Claude Code `⏺`, Codex `•`) quoting its CLI's own refusal
 //                 words, as an agent explaining an error does
@@ -327,6 +342,20 @@ function answerDoctorProbe(argv) {
 		process.stdout.write("Fetching available models...\ngemini-fake-flash-low\tGemini Fake Flash (Low)\ngemini-fake-pro-high\tGemini Fake Pro (High)\nclaude-fake-sonnet\tClaude Fake Sonnet (Thinking)\n");
 		return 0;
 	}
+	if (is("auth", "logout") || is("logout")) {
+		// Signs the profile out (`claude auth logout`, `codex logout`).
+		const dir = profileDir();
+		if (dir && fs.existsSync(dir)) fs.writeFileSync(path.join(dir, ".fake-auth"), "out\n");
+		process.stdout.write(`Signed out of fake ${FAKE_AGENT}.\n`);
+		if (RECORD_DIR) {
+			fs.mkdirSync(RECORD_DIR, { recursive: true });
+			fs.writeFileSync(
+				path.join(RECORD_DIR, `logout-${Date.now()}-${process.pid}.json`),
+				JSON.stringify({ kind: "fake-cli-logout", agent: FAKE_AGENT, argv, profileEnv: PROFILE_ENV, profileDir: dir }, null, 2) + "\n",
+			);
+		}
+		return 0;
+	}
 	if (is("auth", "login") || is("login")) {
 		// A sign-in in the profile Hermes created: remember it there.
 		const dir = profileDir();
@@ -367,6 +396,17 @@ if (probeExit !== null) {
 }
 
 const args = parseArgs(process.argv.slice(2));
+// Codex without -m runs the `model` its config.toml names (CODEX_HOME, else
+// ~/.codex), like the real CLI: a refusal of that model names it.
+if (FAKE_AGENT === "codex" && !args.model) {
+	const home = process.env.CODEX_HOME || path.join(process.env.HOME || process.env.USERPROFILE || "", ".codex");
+	try {
+		const configured = /^\s*model\s*=\s*"([^"]+)"/m.exec(fs.readFileSync(path.join(home, "config.toml"), "utf8"));
+		if (configured) args.model = configured[1];
+	} catch {
+		/* no config: the CLI's own default */
+	}
+}
 const TRANSCRIPT_DIR = RECORD_DIR ? path.join(RECORD_DIR, "transcripts") : null;
 const mode = readMode();
 const modeWords = new Set(mode.split(/\s+/).filter(Boolean));
@@ -588,9 +628,16 @@ function runHook(hook, payload) {
 	return new Promise((resolve) => {
 		const timeoutMs = Math.max(1, Number(hook.timeout) || 5) * 1000;
 		const exec = Array.isArray(hook.args);
+		const opts = { stdio: ["pipe", "pipe", "pipe"], env: process.env, cwd: process.cwd() };
+		// Gemini on Windows runs a hook's command string with PowerShell
+		// (`powershell -Command`, or pwsh), not cmd.exe: do the same, so a
+		// command that only works in cmd fails here as it would there.
+		const powershell = !exec && FAKE_AGENT === "gemini" && process.platform === "win32";
 		const child = exec
-			? spawn(hook.command, hook.args, { shell: false, stdio: ["pipe", "pipe", "pipe"], env: process.env, cwd: process.cwd() })
-			: spawn(hook.command, { shell: true, stdio: ["pipe", "pipe", "pipe"], env: process.env, cwd: process.cwd() });
+			? spawn(hook.command, hook.args, { ...opts, shell: false })
+			: powershell
+				? spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", hook.command], { ...opts, shell: false })
+				: spawn(hook.command, { ...opts, shell: true });
 		const started = Date.now();
 		let stdout = "";
 		let stderr = "";
@@ -825,6 +872,15 @@ async function refuse(kind) {
 		kind === "signed-out"
 			? "Not logged in · Please run /login"
 			: `There's an issue with the selected model (${model}). It may not exist or you may not have access to it. Run --model to pick a different model.`;
+	if (kind === "model" && has("model-not-found-hooks") && !resumed) {
+		// Claude Code 2.1.287 sends the first prompt before it learns the
+		// model does not exist.
+		await runHooks("SessionStart", { source: "startup" });
+		if (record.prompt) {
+			await runHooks("UserPromptSubmit", { prompt: record.prompt });
+			await runHooks("StopFailure", { error: "model_not_found", last_assistant_message: said });
+		}
+	}
 	if (resumed) remember([said]);
 	out(kind === "signed-out" ? `\r\n${said}\r\n` : `\r\n"${model}" isn't described by this version's model catalog; update Claude Code, or map it with behavesAs…\r\n${said}\r\n`);
 	out("> ");
@@ -1061,6 +1117,45 @@ async function main() {
 					if (answer === "n" || answer === "N") {
 						out("fake-cli: denied\r\n");
 						await runHooks("PermissionDenied", { tool_name: "Bash" });
+						break;
+					}
+				}
+				continue;
+			}
+			case "P": {
+				// Claude Code's permission prompt (see the header).
+				const command = "sleep-for-a-while";
+				out(`\r\nfake-cli: Bash(${command})  Do you want to proceed? [y/Enter, Esc]\r\n`);
+				await runHooks("PermissionRequest", { tool_name: "Bash", tool_input: { command } });
+				for (;;) {
+					const answer = await nextKey();
+					if (answer === null || answer === "\x03") {
+						await quit("interrupted-at-permission");
+						return;
+					}
+					if (answer === "y" || answer === "Y" || answer === "\r") {
+						out(`fake-cli: running the command for ${TOOL_MS} ms\r\n`);
+						note("tool", { shell: TOOL_IN_SHELL, ms: TOOL_MS, approved: true });
+						const argv = toolCommand();
+						await new Promise((resolve) => {
+							const child = spawn(argv[0], argv.slice(1), { stdio: "ignore", windowsHide: true });
+							child.on("exit", resolve);
+							child.on("error", resolve);
+						});
+						out("fake-cli: command finished\r\n");
+						await runHooks("PostToolUse", { tool_name: "Bash", tool_input: { command }, tool_response: {} });
+						break;
+					}
+					if (answer === ESC) {
+						appendTranscript({
+							type: "user",
+							toolUseResult: "User rejected tool use",
+							message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_fake", content: "The user doesn't want to proceed with this tool use.", is_error: true }] },
+						});
+						appendTranscript({ type: "user", message: { role: "user", content: [{ type: "text", text: "[Request interrupted by user for tool use]" }] } });
+						appendTranscript({ type: "system", subtype: "turn_duration", durationMs: 2815, messageCount: 4, isMeta: false });
+						note("rejected", { transcript: !!TRANSCRIPT_DIR });
+						out("  ⎿  Interrupted · What should Claude do instead?\r\n");
 						break;
 					}
 				}

@@ -32,6 +32,17 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 /// A model list can be long (`codex debug models` carries instructions).
 pub const LIST_OUTPUT_CAP: usize = 4 * 1024 * 1024;
 
+/// A model an account refused at an earlier launch (`store::rejections`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub model: String,
+    /// When (epoch ms).
+    pub at: i64,
+    /// The default model only: the model the CLI resolved "default" to, when
+    /// its refusal named it (Codex's `model` in its config.toml).
+    pub resolved: Option<String>,
+}
+
 /// Order of the approval modes, whatever order the catalog lists them in.
 const MODE_ORDER: &[&str] = &[
     "default",
@@ -93,6 +104,8 @@ pub trait Host {
     /// The home folder (profile folders and the default Claude config live there).
     fn home(&self) -> Option<PathBuf>;
     fn now_ms(&self) -> i64;
+    /// A variable of Hermes's own environment, when set and not empty.
+    fn env(&self, name: &str) -> Option<String>;
 }
 
 /// The accounts to probe for an agent: its default profile, then the ones
@@ -175,12 +188,12 @@ fn probe_auth(
 }
 
 /// Build one agent's capabilities for `account_id` (None: the active one).
-/// `rejections`: (model, epoch ms) the account refused at an earlier launch.
+/// `rejections`: the models the account refused at an earlier launch.
 pub fn discover(
     agent: &Agent,
     stored: &[StoredAccount],
     account_id: Option<&str>,
-    rejections: &dyn Fn(&str) -> Vec<(String, i64)>,
+    rejections: &dyn Fn(&str) -> Vec<Refusal>,
     host: &dyn Host,
 ) -> AgentCapabilities {
     let spec = agent.capabilities.as_ref();
@@ -236,6 +249,9 @@ pub fn discover(
         account_note: spec.and_then(|s| s.accounts.note.clone()),
         default_approval_mode_id: default_mode,
         checked_at: host.now_ms(),
+        default_profile_dir: spec
+            .and_then(|s| s.accounts.profile_env.as_deref())
+            .and_then(|name| host.env(name)),
     };
 
     // Installed, and which version.
@@ -244,12 +260,17 @@ pub fn discover(
         .as_ref()
         .and_then(|d| d.command.split_first())
         .and_then(|(bin, args)| host.find(bin).map(|p| (p, args.to_vec())));
+    // A CLI that cannot start (see `agent_doctor::broken_reason`) cannot say
+    // whether an account is signed in: its accounts are "unknown" with the
+    // reason, never "signed out" (a sign-in would fail the same way).
+    let mut broken: Option<String> = None;
     if let Some((path, args)) = &bin {
         caps.installed = true;
-        if let Probe::Exited { output, .. } = host.run(path, args, &[], 16 * 1024, VERSION_TIMEOUT)
-        {
-            caps.cli_version = crate::agent_doctor::parse_version(&output);
+        let run = host.run(path, args, &[], 16 * 1024, VERSION_TIMEOUT);
+        if let Probe::Exited { output, .. } = &run {
+            caps.cli_version = crate::agent_doctor::parse_version(output);
         }
+        broken = crate::agent_doctor::broken_reason(&run, caps.cli_version.as_deref());
     }
 
     // Accounts.
@@ -258,10 +279,16 @@ pub fn discover(
     for (id, label, profile_env) in &list {
         let mut info = AuthInfo {
             signed_in: None,
-            detail: String::new(),
+            detail: broken
+                .as_ref()
+                .map(|why| format!("fails to start: {why}"))
+                .unwrap_or_default(),
         };
-        if let (true, Some(probe)) = (caps.installed, spec.and_then(|s| s.accounts.probe.as_ref()))
-        {
+        if let (true, None, Some(probe)) = (
+            caps.installed,
+            broken.as_ref(),
+            spec.and_then(|s| s.accounts.probe.as_ref()),
+        ) {
             if let Some((pbin, pargs)) = probe.command.split_first() {
                 if let Some(ppath) = host.find(pbin) {
                     let mut listed = None;
@@ -432,19 +459,32 @@ pub fn discover(
         }
         .to_string();
     }
-    for (model, _at) in rejections(&active) {
-        if let Some(m) = caps
-            .models
-            .iter_mut()
-            .find(|m| m.id == model && m.id != DEFAULT_MODEL)
-        {
-            m.available = false;
-            m.unavailable_reason = Some(format!(
-                "{} was refused by this account at its last launch",
-                m.id
-            ));
+    for r in rejections(&active) {
+        let Some(m) = caps.models.iter_mut().find(|m| m.id == r.model) else {
+            continue;
+        };
+        if m.id == DEFAULT_MODEL {
+            // The default stays launchable (the CLI's own setting may have
+            // changed since), but it no longer reads as a sure thing.
+            m.unavailable_reason = Some(match &r.resolved {
+                Some(name) => format!(
+                    "{}'s default model, {name}, was refused by this account at its last launch",
+                    agent.name
+                ),
+                None => format!(
+                    "{}'s default model was refused by this account at its last launch",
+                    agent.name
+                ),
+            });
             m.unavailable_code = Some("refused".to_string());
+            continue;
         }
+        m.available = false;
+        m.unavailable_reason = Some(format!(
+            "{} was refused by this account at its last launch",
+            m.id
+        ));
+        m.unavailable_code = Some("refused".to_string());
     }
     caps
 }
@@ -496,6 +536,9 @@ impl Host for RealHost {
     }
     fn now_ms(&self) -> i64 {
         crate::turn_ledger::now_ms()
+    }
+    fn env(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.is_empty())
     }
 }
 
@@ -578,7 +621,29 @@ pub fn peek(agent_id: &str) -> Option<AgentCapabilities> {
         .map(|(_, c)| c.caps.clone())
 }
 
-pub fn store_cached(caps: &AgentCapabilities, requested_account: &str) {
+/// How many times each agent's cached results were forgotten. A probe that
+/// started before the last time (it read the accounts as they were then)
+/// is not cached: an account added meanwhile would otherwise stay missing
+/// until the result aged out.
+fn generations() -> &'static Mutex<HashMap<String, u64>> {
+    static GENERATIONS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The agent's cache generation now; pass it to `store_cached` after the probe.
+pub fn generation(agent_id: &str) -> u64 {
+    generations()
+        .lock()
+        .map(|g| g.get(agent_id).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// Keeps a probe's result, unless the agent's results were forgotten since
+/// the probe started (`started_at`, from `generation`).
+pub fn store_cached(caps: &AgentCapabilities, requested_account: &str, started_at: u64) {
+    if generation(&caps.agent_id) != started_at {
+        return;
+    }
     if let Ok(mut map) = cache().lock() {
         map.insert(
             (caps.agent_id.clone(), requested_account.to_string()),
@@ -591,8 +656,11 @@ pub fn store_cached(caps: &AgentCapabilities, requested_account: &str) {
 }
 
 /// Forget an agent's cached results (an account was added or removed, a
-/// model was refused).
+/// model was refused), and any probe of it still running.
 pub fn invalidate(agent_id: &str) {
+    if let Ok(mut g) = generations().lock() {
+        *g.entry(agent_id.to_string()).or_insert(0) += 1;
+    }
     if let Ok(mut map) = cache().lock() {
         map.retain(|(a, _), _| a != agent_id);
     }
@@ -610,6 +678,7 @@ pub(crate) mod tests {
         pub outputs: HashMap<String, (i32, String)>,
         pub files: HashMap<PathBuf, String>,
         pub ran: RefCell<Vec<String>>,
+        pub env: HashMap<String, String>,
     }
 
     impl FakeHost {
@@ -619,6 +688,7 @@ pub(crate) mod tests {
                 outputs: HashMap::new(),
                 files: HashMap::new(),
                 ran: RefCell::new(Vec::new()),
+                env: HashMap::new(),
             }
         }
         pub fn out(mut self, cmd: &str, code: i32, output: &str) -> Self {
@@ -668,13 +738,16 @@ pub(crate) mod tests {
         fn now_ms(&self) -> i64 {
             1_800_000_000_000
         }
+        fn env(&self, name: &str) -> Option<String> {
+            self.env.get(name).cloned()
+        }
     }
 
     fn agent(id: &str) -> &'static Agent {
         crate::agent_catalog::agent(id).unwrap()
     }
 
-    fn none(_: &str) -> Vec<(String, i64)> {
+    fn none(_: &str) -> Vec<Refusal> {
         Vec::new()
     }
 
@@ -772,7 +845,11 @@ pub(crate) mod tests {
             .out("codex debug models --bundled", 0, models);
         let refused = |acc: &str| {
             if acc == "default" {
-                vec![("gpt-5.5".to_string(), 5)]
+                vec![Refusal {
+                    model: "gpt-5.5".to_string(),
+                    at: 5,
+                    resolved: None,
+                }]
             } else {
                 vec![]
             }
@@ -798,6 +875,25 @@ pub(crate) mod tests {
         );
         assert_eq!(caps.accounts[0].detail, "ChatGPT account");
         assert!(!caps.accepts_typed_model);
+        assert!(caps.models[0].available && caps.models[0].unavailable_reason.is_none());
+
+        // The default model refused (Codex's own config named a model the
+        // account cannot use): still launchable, but it says so.
+        let refused_default = |_: &str| {
+            vec![Refusal {
+                model: "default".to_string(),
+                at: 9,
+                resolved: Some("gpt-5.2-codex".to_string()),
+            }]
+        };
+        let caps = discover(agent("codex"), &[], None, &refused_default, &host);
+        let d = &caps.models[0];
+        assert!(d.available, "the default is never taken away");
+        assert_eq!(d.unavailable_code.as_deref(), Some("refused"));
+        assert_eq!(
+            d.unavailable_reason.as_deref(),
+            Some("Codex's default model, gpt-5.2-codex, was refused by this account at its last launch")
+        );
     }
 
     #[test]
@@ -890,6 +986,53 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_default_profile_folder_comes_from_hermess_environment() {
+        let host = FakeHost::new(&[]);
+        let caps = discover(agent("codex"), &[], None, &none, &host);
+        assert_eq!(
+            caps.default_profile_dir, None,
+            "unset: the catalog's folder"
+        );
+        let mut host = FakeHost::new(&[]);
+        host.env
+            .insert("CODEX_HOME".into(), "/work-fixture/codex-home".into());
+        let caps = discover(agent("codex"), &[], None, &none, &host);
+        assert_eq!(
+            caps.default_profile_dir.as_deref(),
+            Some("/work-fixture/codex-home")
+        );
+        // Another agent's variable says nothing about Codex's.
+        let mut host = FakeHost::new(&[]);
+        host.env
+            .insert("CLAUDE_CONFIG_DIR".into(), "/work-fixture/c".into());
+        let caps = discover(agent("codex"), &[], None, &none, &host);
+        assert_eq!(caps.default_profile_dir, None);
+    }
+
+    #[test]
+    fn a_cli_that_cannot_start_is_not_called_signed_out() {
+        let host = FakeHost::new(&["codex"]).out(
+            "codex --version",
+            127,
+            "env: node: No such file or directory\n",
+        );
+        let caps = discover(agent("codex"), &[], None, &none, &host);
+        assert!(caps.installed);
+        let a = &caps.accounts[0];
+        assert_eq!(a.sign_in_state, "unknown");
+        assert!(a.signed_in, "unknown never blocks on a guess");
+        assert_eq!(
+            a.detail,
+            "fails to start: env: node: No such file or directory"
+        );
+        assert!(
+            !host.ran.borrow().iter().any(|c| c.contains("login status")),
+            "no sign-in probe after a failed start: {:?}",
+            host.ran.borrow()
+        );
+    }
+
+    #[test]
     fn the_requested_account_is_active_when_it_exists() {
         let host = FakeHost::new(&["codex"])
             .out("codex login status", 0, "Logged in using ChatGPT\n")
@@ -922,6 +1065,26 @@ pub(crate) mod tests {
                 .iter()
                 .any(|c| c == "codex debug models --bundled @CODEX_HOME=/p/.codex-two"),
             "the list runs in the active account's profile"
+        );
+    }
+
+    #[test]
+    fn a_probe_overtaken_by_an_account_change_is_not_cached() {
+        // A made-up agent id so no other test shares this cache entry.
+        let host = FakeHost::new(&["codex"]).out("codex login status", 0, "Logged in\n");
+        let mut caps = discover(agent("codex"), &[], None, &none, &host);
+        caps.agent_id = "qa-generation-agent".into();
+        let started = generation(&caps.agent_id);
+        invalidate(&caps.agent_id); // an account was added while the probe ran
+        store_cached(&caps, "default", started);
+        assert!(
+            peek(&caps.agent_id).is_none(),
+            "the stale result is dropped"
+        );
+        store_cached(&caps, "default", generation(&caps.agent_id));
+        assert!(
+            peek(&caps.agent_id).is_some(),
+            "a probe started after it is kept"
         );
     }
 }

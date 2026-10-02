@@ -296,18 +296,53 @@ export async function detachWorktree(sessionId: string, projectId: string): Prom
   return invoke<void>("git_detach_worktree", { sessionId, projectId });
 }
 
+/** Unlink the session from its worktree so closing it leaves the folder on disk. Returns the folder. */
+export async function keepWorktree(sessionId: string, projectId: string): Promise<string> {
+  return invoke<string>("git_keep_worktree", { sessionId, projectId });
+}
+
 /**
- * Commit a session worktree's uncommitted changes: on its own branch
- * ("session") or on a new hermes-archive/<branch> branch ("archive").
- * Never touches the stash.
+ * Close flow, after the session was stopped: commit the work of its kept
+ * (unlinked) worktree on `expectedBranch` or a new hermes-archive/ branch.
+ * Null when there was nothing left to commit.
  */
-export async function commitWorktree(
-  sessionId: string,
+export async function commitKeptWorktree(
   projectId: string,
+  worktreePath: string,
   message: string,
   target: "session" | "archive",
-): Promise<CommitOutcome> {
-  return invoke<CommitOutcome>("git_commit_worktree", { sessionId, projectId, message, target });
+  expectedBranch: string | null,
+): Promise<CommitOutcome | null> {
+  return invoke<CommitOutcome | null>("git_commit_kept_worktree", { projectId, worktreePath, message, target, expectedBranch });
+}
+
+/**
+ * Close flow, after the session was stopped: keep a detached HEAD's commits
+ * (and, with a message, the uncommitted changes) on a new
+ * hermes-archive/<branch>-detached branch. Returns it.
+ */
+export async function saveKeptDetachedHead(
+  projectId: string,
+  worktreePath: string,
+  recordedBranch: string | null,
+  message: string | null,
+): Promise<string> {
+  return invoke<string>("git_save_kept_detached_head", { projectId, worktreePath, recordedBranch, message });
+}
+
+/**
+ * Remove a worktree this Hermes made that no session uses: a leftover of a
+ * failed launch (Branch In Use → Remove it and retry), or a closed
+ * session's folder once its work is saved. Refuses one with unsaved work.
+ */
+export async function removeLeftoverWorktree(
+  projectId: string,
+  worktreePath: string,
+  sessionId?: string | null,
+  /** Its uncommitted work was just archived on a hermes-archive/ branch. */
+  archived = false,
+): Promise<void> {
+  return invoke<void>("git_remove_leftover_worktree", { projectId, worktreePath, sessionId: sessionId ?? null, archived });
 }
 
 export async function removeWorktree(

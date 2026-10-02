@@ -9,7 +9,8 @@
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   font-size: var(--text-sm);
   color: var(--text-1);
   outline: none;
@@ -160,6 +161,10 @@
   flex-direction: column;
   gap: 3px;
   border-top: 1px solid var(--border);
+  /* A long list scrolls here, so the actions below stay in reach. */
+  flex: 0 1 auto;
+  min-height: var(--space-8);
+  overflow-y: auto;
 }
 
 .track-question {
@@ -221,4 +226,62 @@
   padding: 6px 10px;
   font-size: var(--text-2xs);
   border-top: 1px solid var(--border);
+}
+
+/* What is happening and what the person does next, in plain words. */
+.track-explain {
+  margin: var(--space-1) calc(var(--space-1) * 2.5) 0;
+  font-size: var(--text-xs);
+  color: var(--text-1);
+  line-height: var(--leading-normal);
+}
+
+/* The writer runs in Skip all: the gates rely on the agent stopping. */
+.track-skip-all {
+  margin: var(--space-1) calc(var(--space-1) * 2.5) 0;
+  padding: var(--space-1) var(--space-2);
+  border: var(--control-border-width) solid var(--danger-border);
+  border-radius: var(--radius-md);
+  background: var(--danger-dim);
+  color: var(--danger-fg);
+  font-size: var(--text-xs);
+}
+
+/* A phase a person skipped: never drawn like an approved one. */
+.track-phase-skipped {
+  color: var(--text-3);
+}
+.track-phase-skipped .track-phase-name {
+  font-style: italic;
+}
+
+.track-promote-label {
+  font-size: var(--text-xs);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+/* Skip and "Make it a feature" ask first, inline. */
+.track-confirm {
+  margin: var(--space-2) var(--space-2) 0;
+  padding: var(--space-2);
+  border: var(--control-border-width) solid var(--brass-dim);
+  border-radius: var(--radius-sm);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.track-confirm p {
+  margin: 0;
+}
+.track-confirm-files {
+  margin: 0;
+  padding-left: var(--space-3);
+  font-size: var(--text-xs);
+  color: var(--text-2);
+}
+.track-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-1);
 }
