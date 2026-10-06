@@ -1699,6 +1699,88 @@ pub fn refused_launch_event(message: &str) -> crate::contract::SessionEvent {
     }
 }
 
+/// Why an agent cannot start in `cwd`, in words for the person, or None.
+///
+/// A program asks for its working folder's path as it starts, which needs
+/// permission to pass through that folder and every folder above it. Without
+/// it the shell shows "." as the folder name, and agent CLIs stop at once:
+/// Claude Code says "An unknown error occurred, possibly due to low max file
+/// descriptors", which points at the wrong thing. macOS privacy protection
+/// (Files and Folders) refuses even listing the folder.
+#[cfg(unix)]
+pub fn unreadable_folder_message(cwd: &Path) -> Option<String> {
+    if cwd.as_os_str().is_empty() {
+        return None;
+    }
+    let blocked = match std::fs::metadata(cwd.join(".")) {
+        Err(e) => e.kind() == std::io::ErrorKind::PermissionDenied,
+        // Plain permissions that hide only the listing do not stop a program
+        // (EACCES); privacy protection does (EPERM).
+        Ok(_) => {
+            matches!(std::fs::read_dir(cwd), Err(e) if e.raw_os_error() == Some(libc::EPERM))
+        }
+    };
+    blocked.then(|| folder_blocked_message(cwd))
+}
+
+/// What the person reads when an agent cannot start in `cwd`: the folder
+/// and how to fix it.
+pub fn folder_blocked_message(cwd: &Path) -> String {
+    let fix = if cfg!(target_os = "macos") {
+        "allow HERMES-IDE in System Settings › Privacy & Security › Files and Folders (or Full Disk Access), or check the folder's permissions"
+    } else {
+        "check the permissions of the folder and the folders above it"
+    };
+    format!(
+        "Hermes cannot open this session's folder ({}), so the agent was not started. To fix it, {fix}, then start the session again.",
+        cwd.display()
+    )
+}
+
+/// `command` typed after a `cd` into `dir`, written for `shell`: the command
+/// runs only when the `cd` worked. None for a shell Hermes does not know how
+/// to write it for (the command is then typed as it is).
+///
+/// A shell can start in its folder and still be unable to read it (macOS
+/// sometimes refuses a protected folder such as Documents to a process just
+/// as it starts; zsh then shows "." as the folder name). The agent then
+/// fails at once, while `cd <folder> && <agent>` in the same shell works.
+pub fn cd_then(shell: &str, dir: &str, command: &str) -> Option<String> {
+    let name = shell
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(shell)
+        .to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    match name {
+        "zsh" | "bash" | "sh" | "dash" | "ksh" | "mksh" | "yash" => Some(format!(
+            "cd -- '{}' && {command}",
+            dir.replace('\'', r"'\''")
+        )),
+        "fish" => Some(format!(
+            "cd '{}'; and {command}",
+            dir.replace('\\', r"\\").replace('\'', r"\'")
+        )),
+        // Windows PowerShell 5 has no `&&`.
+        "pwsh" | "powershell" => Some(format!(
+            "Set-Location -LiteralPath '{}'; if ($?) {{ {command} }}",
+            dir.replace('\'', "''")
+        )),
+        // No quote can be part of a Windows path.
+        "cmd" => Some(format!("cd /d \"{dir}\" && {command}")),
+        _ => None,
+    }
+}
+
+#[cfg(not(unix))]
+pub fn unreadable_folder_message(_cwd: &Path) -> Option<String> {
+    None
+}
+
+/// Said when the person had started typing in the shell before the agent's
+/// launch line was due: typing it then would run the two together.
+pub const TYPING_SKIPPED_MESSAGE: &str = "You started typing before the agent started, so Hermes did not type its launch command. Run the agent yourself, or start a new session.";
+
 /// A launcher task (F15) the typed vendor command cannot carry: the helper
 /// never applied to this launch (the flag is off, or the agent has no
 /// recipe), so without this the task would be lost silently. Only for
@@ -3062,6 +3144,143 @@ pub(crate) mod tests {
                     assert_eq!(source.as_deref(), Some("hermes"));
                 }
                 other => panic!("expected a status event, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn the_cd_before_a_typed_launch_is_written_for_each_shell() {
+            let dir = "/data/it's here";
+            assert_eq!(
+                cd_then("/bin/zsh", dir, "claude -x").unwrap(),
+                r"cd -- '/data/it'\''s here' && claude -x"
+            );
+            assert_eq!(
+                cd_then("bash", dir, "claude").unwrap(),
+                r"cd -- '/data/it'\''s here' && claude"
+            );
+            assert_eq!(
+                cd_then("/opt/homebrew/bin/fish", r"/a\b's", "claude").unwrap(),
+                r"cd '/a\\b\'s'; and claude"
+            );
+            assert_eq!(
+                cd_then("pwsh.exe", r"C:\it's", "claude").unwrap(),
+                r"Set-Location -LiteralPath 'C:\it''s'; if ($?) { claude }"
+            );
+            assert_eq!(
+                cd_then(r"C:\Windows\System32\cmd.exe", r"C:\a b", "claude").unwrap(),
+                r#"cd /d "C:\a b" && claude"#
+            );
+            assert_eq!(
+                cd_then("/usr/bin/nu", dir, "claude"),
+                None,
+                "unknown shell: as it was"
+            );
+        }
+
+        /// The line, run by the real shells on this machine, lands in the
+        /// folder whatever its name holds.
+        #[cfg(unix)]
+        #[test]
+        fn the_cd_line_works_in_the_real_shells() {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("it's a $HOME `x` \\ \"dir\"");
+            std::fs::create_dir_all(&dir).unwrap();
+            let want = dir.canonicalize().unwrap();
+            let mut tried = 0;
+            for shell in [
+                "/bin/sh",
+                "/bin/bash",
+                "/bin/zsh",
+                "/usr/bin/fish",
+                "/opt/homebrew/bin/fish",
+            ] {
+                if !Path::new(shell).exists() {
+                    continue;
+                }
+                tried += 1;
+                let line = cd_then(shell, &dir.to_string_lossy(), "pwd -P").unwrap();
+                let out = std::process::Command::new(shell)
+                    .arg("-c")
+                    .arg(&line)
+                    .current_dir("/")
+                    .output()
+                    .unwrap();
+                let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                assert_eq!(Path::new(&got), want, "{shell}: {line}");
+                // A refused cd runs nothing.
+                let line = cd_then(shell, "/nonexistent-hermes-dir", "echo RAN").unwrap();
+                let out = std::process::Command::new(shell)
+                    .arg("-c")
+                    .arg(&line)
+                    .output()
+                    .unwrap();
+                assert!(
+                    !String::from_utf8_lossy(&out.stdout).contains("RAN"),
+                    "{shell}"
+                );
+            }
+            assert!(tried >= 1);
+        }
+
+        #[test]
+        fn a_shell_refusing_the_cd_is_told_apart_from_other_output() {
+            use crate::pty::analyzer::is_cd_refusal;
+            assert!(is_cd_refusal("cd: permission denied: /data/Documents/p"));
+            assert!(is_cd_refusal(
+                "bash: cd: /data/Documents/p: Permission denied"
+            ));
+            assert!(is_cd_refusal(
+                "cd: /data/Documents/p: Operation not permitted"
+            ));
+            assert!(is_cd_refusal("cd: Permission denied: '/x'"));
+            assert!(is_cd_refusal(
+                "Set-Location: Access to the path 'C:\\x' is denied."
+            ));
+            assert!(!is_cd_refusal("cd: no such file or directory: /x"));
+            assert!(!is_cd_refusal("Claude Code v2.1.290"));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_folder_a_program_cannot_stand_in_stops_the_launch_with_the_fix() {
+            use std::os::unix::fs::PermissionsExt;
+            if unsafe { libc::geteuid() } == 0 {
+                return; // root passes through any folder
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let parent = tmp.path().join("locked");
+            let project = parent.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            let set = |p: &Path, mode| {
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+            };
+
+            assert_eq!(unreadable_folder_message(&project), None, "an open folder");
+            assert_eq!(unreadable_folder_message(Path::new("")), None);
+            assert_eq!(
+                unreadable_folder_message(&tmp.path().join("gone")),
+                None,
+                "a missing folder is reported elsewhere"
+            );
+            // A folder that can be entered but not listed: programs start there.
+            set(&project, 0o300);
+            assert_eq!(unreadable_folder_message(&project), None);
+            // The folder itself cannot be entered.
+            set(&project, 0o000);
+            let msg = unreadable_folder_message(&project).expect("blocked");
+            set(&project, 0o755);
+            // A folder above it cannot be passed through (the shell shows ".").
+            set(&parent, 0o000);
+            let above = unreadable_folder_message(&project);
+            set(&parent, 0o755);
+            let above = above.expect("blocked from above");
+
+            for m in [&msg, &above] {
+                assert!(m.contains(&project.display().to_string()), "{m}");
+                assert!(m.contains("the agent was not started"), "{m}");
+                if cfg!(target_os = "macos") {
+                    assert!(m.contains("Privacy & Security › Files and Folders"), "{m}");
+                }
             }
         }
 

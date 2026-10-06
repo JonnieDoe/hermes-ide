@@ -169,6 +169,16 @@ impl vte::Perform for SnapshotScreen {
     }
 }
 
+/// A shell's refusal to `cd` into a folder (zsh, bash, fish, PowerShell,
+/// cmd), as opposed to the folder missing.
+pub(crate) fn is_cd_refusal(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    (lower.contains("cd") || lower.contains("set-location"))
+        && (lower.contains("permission denied")
+            || lower.contains("operation not permitted")
+            || lower.contains("is denied"))
+}
+
 pub struct OutputAnalyzer {
     registry: ProviderRegistry,
     pub active_provider_idx: Option<usize>,
@@ -205,6 +215,8 @@ pub struct OutputAnalyzer {
     // Auto-launch / auto-inject tracking
     pub shell_ready: bool,
     pub pending_ai_launch: bool,
+    /// Text the person has on the shell's command line (see `typed_line`).
+    pub typed_line: crate::pty::typed_line::TypedLine,
     pub pending_context_inject: bool,
     pub context_injected: bool,
     prompt_count_after_agent: u32,
@@ -214,6 +226,11 @@ pub struct OutputAnalyzer {
     pub ai_launch_failed: Option<String>,
     /// Provider being launched (set before launch, cleared after check window).
     pub ai_launching_provider: Option<String>,
+    /// Lines to scan after a launch typed behind a `cd` for the shell's
+    /// refusal of that `cd`.
+    pub launch_cd_check_remaining: u32,
+    /// The shell refused the `cd` before the agent's command.
+    pub launch_cd_failed: bool,
     /// True when the terminal is currently inside an "alternate screen buffer"
     /// (DEC private modes 1049 / 1047 / 47), i.e. running a full-screen TUI
     /// like vim, less, htop, nano, ssh, or the Claude/Codex CLIs. While this
@@ -424,12 +441,15 @@ impl OutputAnalyzer {
             last_output_at: None,
             shell_ready: false,
             pending_ai_launch: false,
+            typed_line: Default::default(),
             pending_context_inject: false,
             context_injected: false,
             prompt_count_after_agent: 0,
             ai_launch_check_remaining: 0,
             ai_launch_failed: None,
             ai_launching_provider: None,
+            launch_cd_check_remaining: 0,
+            launch_cd_failed: false,
             in_alternate_screen: false,
             osc_parser: vte::Parser::new(),
             osc_open_len: 0,
@@ -656,6 +676,14 @@ impl OutputAnalyzer {
                 }
                 if self.ai_launch_check_remaining == 0 {
                     self.ai_launching_provider = None;
+                }
+            }
+
+            if self.launch_cd_check_remaining > 0 {
+                self.launch_cd_check_remaining -= 1;
+                if is_cd_refusal(trimmed) {
+                    self.launch_cd_failed = true;
+                    self.launch_cd_check_remaining = 0;
                 }
             }
 
