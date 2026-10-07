@@ -1,10 +1,18 @@
 pub mod adapters;
 pub mod analyzer;
 pub mod commands;
+pub mod hook_trust;
+pub mod launch;
 pub mod models;
+pub mod opencode_stream;
+pub mod os_activity;
+pub mod osc_signals;
 pub mod patterns;
+pub mod session_markers;
 pub mod shell_integration;
 pub mod spawn;
+pub mod transport;
+pub mod typed_line;
 
 // ─── Re-exports ─────────────────────────────────────────────────────
 // Maintain the existing public API so that `lib.rs`, `db/mod.rs`, and other
@@ -15,7 +23,6 @@ pub use models::*;
 // so that `lib.rs` can reference them as `pty::create_session` etc.
 pub use commands::*;
 
-use portable_pty::MasterPty;
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -25,23 +32,74 @@ use crate::pty::analyzer::OutputAnalyzer;
 // ─── PTY Session & Manager ──────────────────────────────────────────
 
 pub(crate) struct PtySession {
-    pub(crate) master: Box<dyn MasterPty + Send>,
+    /// Where the terminal lives: this process, or the session host (N20).
+    pub(crate) transport: Box<dyn transport::PtyTransport>,
     pub(crate) writer: Arc<StdMutex<Box<dyn Write + Send>>>,
     pub(crate) session: Arc<StdMutex<Session>>,
     pub(crate) analyzer: Arc<StdMutex<OutputAnalyzer>>,
-    pub(crate) child: Box<dyn portable_pty::Child + Send>,
-    /// Path to the PTY slave device (e.g., /dev/ttys042).
-    /// Used on macOS to send SIGINT directly to the foreground process group
-    /// when the PTY line discipline fails to convert \x03 into a signal.
-    #[cfg(target_os = "macos")]
-    pub(crate) tty_path: Option<std::path::PathBuf>,
     /// Shell integration state — tracks temp files for cleanup on session close.
     pub(crate) shell_integration: shell_integration::ShellIntegration,
+    /// Whether Hermes inline suggestions were on when this session was
+    /// spawned (the shell's own autosuggestion plugins were disabled then).
+    /// Fixed for the session's lifetime — the setting applies to new sessions.
+    pub(crate) hermes_suggestions: bool,
+    /// The terminal's size (rows, cols). Asking for the size it already has
+    /// changes nothing: no resize, no SIGWINCH.
+    pub(crate) size: (u16, u16),
+    /// The frontend measured the terminal (its first resize, applied or
+    /// not): the agent's launch line waits for this.
+    pub(crate) sized: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Wait until `flag` is set, at most `cap`. True when it was set.
+pub(crate) fn wait_until(flag: &std::sync::atomic::AtomicBool, cap: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + cap;
+    loop {
+        if flag.load(std::sync::atomic::Ordering::SeqCst) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Tell the shell its terminal changed size (SIGWINCH to its process group).
+/// Only for a real change: a SIGWINCH that reaches bash's line editor while
+/// it accepts a line makes it redraw the prompt and the line over the newline
+/// it had printed, and the program's first output then starts at the end of
+/// the command; and each redraw is output the status guesses take for work.
+pub(crate) fn nudge_shell_size(shell_pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = shell_pid.filter(|p| *p > 0 && *p <= i32::MAX as u32) {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGWINCH);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = shell_pid;
 }
 
 pub struct PtyManager {
     pub(crate) sessions: HashMap<String, PtySession>,
     pub(crate) session_counter: usize,
+    /// Terminals `create_session` is opening without holding the manager
+    /// (the spawn can take seconds): a close, typing or a resize that
+    /// arrives meanwhile is recorded here instead of being lost.
+    pub(crate) opening: HashMap<String, Opening>,
+}
+
+/// What happened to a terminal while it was being opened.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Opening {
+    /// `close_session` ran meanwhile: the new terminal is killed, and never
+    /// registered or written to the database.
+    pub(crate) closed: bool,
+    /// Input typed meanwhile, written once the terminal is registered.
+    pub(crate) input: Vec<u8>,
+    /// The last size asked for meanwhile, applied once it is registered.
+    pub(crate) size: Option<(u16, u16)>,
 }
 
 impl Default for PtyManager {
@@ -55,6 +113,101 @@ impl PtyManager {
         Self {
             sessions: HashMap::new(),
             session_counter: 0,
+            opening: HashMap::new(),
+        }
+    }
+
+    /// A terminal starts being opened (the manager is about to be released).
+    pub(crate) fn begin_opening(&mut self, session_id: &str) {
+        self.opening
+            .insert(session_id.to_string(), Opening::default());
+    }
+
+    /// The opening is over (registered, failed or refused): what happened
+    /// meanwhile, or None if it was not being opened.
+    pub(crate) fn finish_opening(&mut self, session_id: &str) -> Option<Opening> {
+        self.opening.remove(session_id)
+    }
+
+    /// A close for a session that is still being opened: true if it was.
+    pub(crate) fn close_opening(&mut self, session_id: &str) -> bool {
+        match self.opening.get_mut(session_id) {
+            Some(o) => {
+                o.closed = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Input for a session that is still being opened: kept for it (true),
+    /// or false if it is not being opened (or was closed meanwhile).
+    pub(crate) fn queue_opening_input(&mut self, session_id: &str, bytes: &[u8]) -> bool {
+        match self.opening.get_mut(session_id) {
+            Some(o) if !o.closed => {
+                o.input.extend_from_slice(bytes);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Resize a session's terminal and tell its shell (true), or do nothing
+    /// when it already has that size (false). The frontend asks for the same
+    /// size again on its own (a pane mounting, the window refitting); each
+    /// such SIGWINCH used to reach the shell, also while it was accepting the
+    /// agent's launch line.
+    pub(crate) fn resize(
+        &mut self,
+        session_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<bool, String> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("Session {} not found", session_id))?;
+        if session.size == (rows, cols) {
+            session
+                .sized
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Ok(false);
+        }
+        session
+            .transport
+            .resize(rows, cols)
+            .map_err(|e| format!("Resize failed: {}", e))?;
+        session.size = (rows, cols);
+        // Explicitly send SIGWINCH to the shell's process group: on macOS with
+        // posix_spawn(POSIX_SPAWN_SETSID), ioctl(TIOCSWINSZ) on the master fd
+        // does not deliver it from this process (it is in another session).
+        nudge_shell_size(session.transport.pid());
+        // Only now: a launch line waiting for the size comes after the signal.
+        session
+            .sized
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(true)
+    }
+
+    /// A resize for a session that is still being opened: the last one wins.
+    pub(crate) fn queue_opening_resize(&mut self, session_id: &str, rows: u16, cols: u16) -> bool {
+        match self.opening.get_mut(session_id) {
+            Some(o) if !o.closed => {
+                o.size = Some((rows, cols));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Forget the output a live session keeps for its scrollback snapshot, so
+    /// the next workspace save cannot write back what the user just deleted
+    /// with Delete Session Data. The terminal on screen is unchanged.
+    pub fn clear_snapshot_output(&self, session_id: &str) {
+        if let Some(ps) = self.sessions.get(session_id) {
+            if let Ok(mut analyzer) = ps.analyzer.lock() {
+                analyzer.clear_stripped_output();
+            }
         }
     }
 
@@ -198,43 +351,37 @@ impl PtyManager {
 
 // ─── Helper Functions ───────────────────────────────────────────────
 
+/// The line typed into the shell to start a session's agent, built from the
+/// agent catalog (`src/catalog/agents.json`): the agent's command, then the
+/// permission-mode arguments, wrapped in the user's prefix and suffix. The
+/// Custom agent uses the command the user typed instead. Unknown agents, and
+/// a Custom agent with no command, return `None` (nothing is launched).
+/// Mirrors `buildLaunchPreview` in `src/catalog/agentCatalog.ts`.
 pub(crate) fn ai_launch_command(
     provider: &str,
     permission_mode: &str,
     custom_prefix: &str,
     custom_suffix: &str,
+    custom_command: &str,
 ) -> Option<String> {
-    let base = match provider {
-        "claude" => "claude",
-        "aider" => "aider",
-        "codex" => "codex",
-        "gemini" => "gemini",
-        "kiro" => "kiro-cli",
-        "copilot" => {
-            return Some(wrap_prefix_suffix(
-                "gh copilot",
-                custom_prefix,
-                custom_suffix,
-            ))
+    let agent = crate::agent_catalog::agent(provider)?;
+    if agent.custom {
+        let cmd = sanitize_wrap(custom_command);
+        if cmd.is_empty() {
+            return None;
         }
-        _ => return None,
-    };
-    let mut cmd = base.to_string();
-    let flag = match (provider, permission_mode) {
-        ("claude", "acceptEdits") => " --permission-mode acceptEdits",
-        ("claude", "plan") => " --permission-mode plan",
-        ("claude", "auto") => " --permission-mode auto",
-        ("claude", "dontAsk") => " --permission-mode dontAsk",
-        ("claude", "bypassPermissions") => " --permission-mode bypassPermissions",
-        ("aider", "auto") => " --yes",
-        ("aider", "bypassPermissions") => " --yes-always",
-        ("codex", "auto") => " --full-auto",
-        ("codex", "bypassPermissions") => " --dangerously-bypass-approvals-and-sandbox",
-        ("gemini", "bypassPermissions") => " --yolo",
-        ("kiro", "auto") => " --trust-tools",
-        _ => "",
-    };
-    cmd.push_str(flag);
+        return Some(wrap_prefix_suffix(&cmd, custom_prefix, custom_suffix));
+    }
+    if agent.terminal.argv.is_empty() {
+        return None;
+    }
+    let mut cmd = agent.terminal.argv.join(" ");
+    if let Some(flags) = agent.terminal.permission_flags.get(permission_mode) {
+        if !flags.is_empty() {
+            cmd.push(' ');
+            cmd.push_str(&flags.join(" "));
+        }
+    }
     Some(wrap_prefix_suffix(&cmd, custom_prefix, custom_suffix))
 }
 
@@ -271,6 +418,30 @@ pub(crate) fn channels_suffix(channels: &[String]) -> String {
         suffix.push_str(&format!(" --channels {}", ch));
     }
     suffix
+}
+
+/// The quoted prompt put on an agent's launch line to point it at the
+/// session's context file. The shell running the line expands the variable,
+/// so it is written in that shell's syntax: PowerShell reads a bare
+/// `$HERMES_CONTEXT` as its own (empty) variable, and cmd.exe never expands
+/// `$` at all.
+pub(crate) fn context_prompt_arg(shell: &str) -> String {
+    let name = shell
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(shell)
+        .to_ascii_lowercase();
+    let var = if name.contains("pwsh") || name.contains("powershell") {
+        "$env:HERMES_CONTEXT"
+    } else if name == "cmd" || name == "cmd.exe" {
+        "%HERMES_CONTEXT%"
+    } else {
+        "$HERMES_CONTEXT"
+    };
+    format!(
+        "\"Read the file at {} for project context about the attached workspaces.\"",
+        var
+    )
 }
 
 pub(crate) fn detect_shell() -> String {
@@ -321,6 +492,172 @@ mod tests {
     use super::adapters::{is_input_needed_line, is_shell_prompt, LineAnalysis, PhaseHint};
     use super::analyzer::OutputAnalyzer;
     use super::models::SessionPhase;
+    use super::{Opening, PtyManager};
+
+    // ── resizing ──
+
+    /// A terminal that counts the resizes it gets.
+    struct CountingPty(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl super::transport::PtyTransport for CountingPty {
+        fn take_reader(&mut self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn take_writer(&mut self) -> std::io::Result<Box<dyn std::io::Write + Send>> {
+            Ok(Box::new(std::io::sink()))
+        }
+        fn resize(&self, _rows: u16, _cols: u16) -> std::io::Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn wait(&mut self) {}
+        fn pid(&self) -> Option<u32> {
+            // No real process: nothing to signal.
+            None
+        }
+        fn shell_owns_terminal(&self, _shell_pid: u32) -> Option<bool> {
+            None
+        }
+        fn hosted(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn asking_for_the_size_a_terminal_already_has_resizes_and_signals_nothing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        let resizes = Arc::new(AtomicUsize::new(0));
+        let mut mgr = PtyManager::new();
+        mgr.sessions.insert(
+            "s1".to_string(),
+            super::PtySession {
+                transport: Box::new(CountingPty(Arc::clone(&resizes))),
+                writer: Arc::new(Mutex::new(
+                    Box::new(std::io::sink()) as Box<dyn std::io::Write + Send>
+                )),
+                session: Arc::new(Mutex::new(crate::pty::launch::tests::test_session())),
+                analyzer: Arc::new(Mutex::new(OutputAnalyzer::new())),
+                shell_integration: super::shell_integration::ShellIntegration::None,
+                hermes_suggestions: false,
+                size: (33, 107),
+                sized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+        // The pane mounting and the shell becoming ready ask again for the
+        // size the terminal was opened with (CI: twice within 200 ms of the
+        // launch line): the shell must not get a SIGWINCH for it.
+        assert_eq!(mgr.resize("s1", 33, 107), Ok(false));
+        assert_eq!(mgr.resize("s1", 33, 107), Ok(false));
+        assert_eq!(resizes.load(Ordering::SeqCst), 0);
+        // A real change is applied once, then remembered.
+        assert_eq!(mgr.resize("s1", 40, 120), Ok(true));
+        assert_eq!(mgr.resize("s1", 40, 120), Ok(false));
+        assert_eq!(resizes.load(Ordering::SeqCst), 1);
+        // And going back is a change again.
+        assert_eq!(mgr.resize("s1", 33, 107), Ok(true));
+        assert_eq!(resizes.load(Ordering::SeqCst), 2);
+        assert!(mgr.resize("nope", 33, 107).is_err());
+    }
+
+    #[test]
+    fn a_resize_marks_the_terminal_measured_only_after_its_signal() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        let sized = Arc::new(AtomicBool::new(false));
+        let mut mgr = PtyManager::new();
+        mgr.sessions.insert(
+            "s1".to_string(),
+            super::PtySession {
+                transport: Box::new(CountingPty(Arc::new(AtomicUsize::new(0)))),
+                writer: Arc::new(Mutex::new(
+                    Box::new(std::io::sink()) as Box<dyn std::io::Write + Send>
+                )),
+                session: Arc::new(Mutex::new(crate::pty::launch::tests::test_session())),
+                analyzer: Arc::new(Mutex::new(OutputAnalyzer::new())),
+                shell_integration: super::shell_integration::ShellIntegration::None,
+                hermes_suggestions: false,
+                size: (24, 80),
+                sized: Arc::clone(&sized),
+            },
+        );
+        // Nobody measured it yet: a launch line waits the whole cap.
+        let t = std::time::Instant::now();
+        assert!(!super::wait_until(
+            &sized,
+            std::time::Duration::from_millis(60)
+        ));
+        assert!(t.elapsed() >= std::time::Duration::from_millis(60));
+        // The pane measures it (a real change): the wait ends at once.
+        assert_eq!(mgr.resize("s1", 33, 107), Ok(true));
+        assert!(sized.load(Ordering::SeqCst));
+        let t = std::time::Instant::now();
+        assert!(super::wait_until(&sized, std::time::Duration::from_secs(5)));
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_launch_waiting_for_the_size_goes_as_soon_as_it_is_measured() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let sized = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&sized);
+        let t = std::time::Instant::now();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            setter.store(true, Ordering::SeqCst);
+        });
+        assert!(super::wait_until(&sized, std::time::Duration::from_secs(5)));
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
+        h.join().unwrap();
+    }
+
+    // ── terminals being opened ──
+
+    #[test]
+    fn a_close_during_the_opening_is_remembered_for_create_session() {
+        let mut mgr = PtyManager::new();
+        mgr.begin_opening("s1");
+        assert!(mgr.close_opening("s1"));
+        // Input after the close is refused (nothing is kept for a dead session).
+        assert!(!mgr.queue_opening_input("s1", b"ls\r"));
+        assert!(!mgr.queue_opening_resize("s1", 40, 120));
+        let opened = mgr.finish_opening("s1").expect("was being opened");
+        assert!(opened.closed);
+        assert!(opened.input.is_empty());
+        assert_eq!(opened.size, None);
+        // Finished: nothing is left behind.
+        assert!(mgr.finish_opening("s1").is_none());
+        assert!(mgr.opening.is_empty());
+    }
+
+    #[test]
+    fn a_close_of_a_session_that_is_not_being_opened_marks_nothing() {
+        let mut mgr = PtyManager::new();
+        assert!(!mgr.close_opening("s1"));
+        mgr.begin_opening("s2");
+        assert!(!mgr.close_opening("s1"));
+        assert_eq!(mgr.finish_opening("s2"), Some(Opening::default()));
+    }
+
+    #[test]
+    fn input_and_resize_during_the_opening_are_kept_in_order_and_last_size_wins() {
+        let mut mgr = PtyManager::new();
+        mgr.begin_opening("s1");
+        assert!(mgr.queue_opening_input("s1", b"ec"));
+        assert!(mgr.queue_opening_input("s1", b"ho hi\r"));
+        assert!(mgr.queue_opening_resize("s1", 30, 100));
+        assert!(mgr.queue_opening_resize("s1", 40, 120));
+        // Another session's input is not kept for it.
+        assert!(!mgr.queue_opening_input("other", b"x"));
+        let opened = mgr.finish_opening("s1").unwrap();
+        assert!(!opened.closed);
+        assert_eq!(opened.input, b"echo hi\r".to_vec());
+        assert_eq!(opened.size, Some((40, 120)));
+    }
 
     // ── is_input_needed_line ──
 
@@ -427,6 +764,18 @@ mod tests {
         assert!(SessionPhase::Busy.accepts_input());
         assert!(!SessionPhase::Closing.accepts_input());
         assert!(!SessionPhase::Destroyed.accepts_input());
+    }
+
+    #[test]
+    fn destroyed_phase_is_terminal() {
+        // A closed session must never be revived by late PTY output —
+        // otherwise the frontend re-adds it as a black "ghost" session.
+        assert!(!SessionPhase::Destroyed.can_transition_to(&SessionPhase::Idle));
+        assert!(!SessionPhase::Destroyed.can_transition_to(&SessionPhase::Busy));
+        assert!(!SessionPhase::Destroyed.can_transition_to(&SessionPhase::NeedsInput));
+        assert!(!SessionPhase::Idle.can_transition_to(&SessionPhase::Idle));
+        assert!(SessionPhase::Idle.can_transition_to(&SessionPhase::Busy));
+        assert!(SessionPhase::Busy.can_transition_to(&SessionPhase::NeedsInput));
     }
 
     #[test]
@@ -661,6 +1010,100 @@ mod tests {
         assert!(!analyzer.pending_ai_launch);
     }
 
+    // ── Context prompt on the launch line ──
+
+    #[test]
+    fn context_prompt_uses_each_shells_variable_syntax() {
+        use super::context_prompt_arg;
+        let posix = "\"Read the file at $HERMES_CONTEXT for project context about the attached workspaces.\"";
+        assert_eq!(context_prompt_arg("/bin/zsh"), posix);
+        assert_eq!(context_prompt_arg("/usr/bin/bash"), posix);
+        assert_eq!(context_prompt_arg("/opt/homebrew/bin/fish"), posix);
+
+        let ps = "\"Read the file at $env:HERMES_CONTEXT for project context about the attached workspaces.\"";
+        assert_eq!(context_prompt_arg("pwsh"), ps);
+        assert_eq!(context_prompt_arg("powershell"), ps);
+        assert_eq!(
+            context_prompt_arg(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            ps
+        );
+        assert_eq!(
+            context_prompt_arg(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            ps
+        );
+
+        let cmd = "\"Read the file at %HERMES_CONTEXT% for project context about the attached workspaces.\"";
+        assert_eq!(context_prompt_arg("cmd.exe"), cmd);
+        assert_eq!(context_prompt_arg(r"C:\Windows\System32\CMD.EXE"), cmd);
+    }
+
+    /// Runs the launch-line prompt through a real shell and checks what the
+    /// agent would receive as its argument.
+    #[cfg(unix)]
+    #[test]
+    fn context_prompt_expands_to_the_context_path_in_a_real_shell() {
+        use super::context_prompt_arg;
+        let script = format!("printf '%s' {}", context_prompt_arg("/bin/sh"));
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .env("HERMES_CONTEXT", "/tmp/test/context.md")
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "Read the file at /tmp/test/context.md for project context about the attached workspaces."
+        );
+    }
+
+    /// Same check through PowerShell when it is installed (it is on Windows
+    /// runners; skipped where it is not).
+    #[test]
+    fn context_prompt_expands_to_the_context_path_in_powershell() {
+        use super::context_prompt_arg;
+        let exe = ["pwsh", "powershell"].into_iter().find(|exe| {
+            std::process::Command::new(exe)
+                .args(["-NoProfile", "-Command", "exit 0"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        let Some(exe) = exe else {
+            eprintln!("PowerShell not installed; skipping");
+            return;
+        };
+        let script = format!("Write-Output {}", context_prompt_arg(exe));
+        let out = std::process::Command::new(exe)
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .env("HERMES_CONTEXT", "/tmp/test/context.md")
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "Read the file at /tmp/test/context.md for project context about the attached workspaces."
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn context_prompt_expands_to_the_context_path_in_cmd() {
+        use super::context_prompt_arg;
+        use std::os::windows::process::CommandExt;
+        let script = format!("echo {}", context_prompt_arg("cmd.exe"));
+        // raw_arg: cmd.exe parses its own command line; Rust's argument
+        // quoting would escape the quotes it needs to see.
+        let out = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C"])
+            .raw_arg(&script)
+            .env("HERMES_CONTEXT", r"C:\test\context.md")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains(r"Read the file at C:\test\context.md for project context"),
+            "cmd.exe printed: {text}"
+        );
+    }
+
     // ── AI launch command coverage ──
 
     #[test]
@@ -668,30 +1111,30 @@ mod tests {
         use super::ai_launch_command;
 
         assert_eq!(
-            ai_launch_command("claude", "default", "", ""),
+            ai_launch_command("claude", "default", "", "", ""),
             Some("claude".into())
         );
         assert_eq!(
-            ai_launch_command("aider", "default", "", ""),
+            ai_launch_command("aider", "default", "", "", ""),
             Some("aider".into())
         );
         assert_eq!(
-            ai_launch_command("codex", "default", "", ""),
+            ai_launch_command("codex", "default", "", "", ""),
             Some("codex".into())
         );
         assert_eq!(
-            ai_launch_command("gemini", "default", "", ""),
+            ai_launch_command("gemini", "default", "", "", ""),
             Some("gemini".into())
         );
         assert_eq!(
-            ai_launch_command("copilot", "default", "", ""),
-            Some("gh copilot".into())
+            ai_launch_command("copilot", "default", "", "", ""),
+            Some("copilot".into())
         );
         assert_eq!(
-            ai_launch_command("kiro", "default", "", ""),
-            Some("kiro-cli".into())
+            ai_launch_command("kiro", "default", "", "", ""),
+            Some("kiro-cli chat".into())
         );
-        assert_eq!(ai_launch_command("unknown", "default", "", ""), None);
+        assert_eq!(ai_launch_command("unknown", "default", "", "", ""), None);
     }
 
     #[test]
@@ -700,64 +1143,65 @@ mod tests {
 
         // Claude supports all modes
         assert_eq!(
-            ai_launch_command("claude", "acceptEdits", "", ""),
+            ai_launch_command("claude", "acceptEdits", "", "", ""),
             Some("claude --permission-mode acceptEdits".into())
         );
         assert_eq!(
-            ai_launch_command("claude", "plan", "", ""),
+            ai_launch_command("claude", "plan", "", "", ""),
             Some("claude --permission-mode plan".into())
         );
         assert_eq!(
-            ai_launch_command("claude", "auto", "", ""),
+            ai_launch_command("claude", "auto", "", "", ""),
             Some("claude --permission-mode auto".into())
         );
         assert_eq!(
-            ai_launch_command("claude", "bypassPermissions", "", ""),
+            ai_launch_command("claude", "bypassPermissions", "", "", ""),
             Some("claude --permission-mode bypassPermissions".into())
         );
 
         // Claude dontAsk mode
         assert_eq!(
-            ai_launch_command("claude", "dontAsk", "", ""),
+            ai_launch_command("claude", "dontAsk", "", "", ""),
             Some("claude --permission-mode dontAsk".into())
         );
 
         // Other providers: auto and bypass modes
         assert_eq!(
-            ai_launch_command("aider", "auto", "", ""),
-            Some("aider --yes".into())
-        );
-        assert_eq!(
-            ai_launch_command("aider", "bypassPermissions", "", ""),
+            ai_launch_command("aider", "auto", "", "", ""),
             Some("aider --yes-always".into())
         );
         assert_eq!(
-            ai_launch_command("codex", "auto", "", ""),
-            Some("codex --full-auto".into())
+            ai_launch_command("aider", "bypassPermissions", "", "", ""),
+            Some("aider --yes-always".into())
         );
         assert_eq!(
-            ai_launch_command("codex", "bypassPermissions", "", ""),
+            ai_launch_command("codex", "auto", "", "", ""),
+            Some("codex --sandbox workspace-write --ask-for-approval on-request".into())
+        );
+        assert_eq!(
+            ai_launch_command("codex", "bypassPermissions", "", "", ""),
             Some("codex --dangerously-bypass-approvals-and-sandbox".into())
         );
         assert_eq!(
-            ai_launch_command("gemini", "bypassPermissions", "", ""),
+            ai_launch_command("gemini", "bypassPermissions", "", "", ""),
             Some("gemini --yolo".into())
         );
 
-        // Kiro: auto mode uses --trust-tools
+        // Kiro: trust flags live on the `chat` subcommand; `--trust-tools`
+        // requires a tool list, so auto mode uses `--trust-all-tools`.
         assert_eq!(
-            ai_launch_command("kiro", "auto", "", ""),
-            Some("kiro-cli --trust-tools".into())
+            ai_launch_command("kiro", "auto", "", "", ""),
+            Some("kiro-cli chat --trust-all-tools".into())
         );
 
         // Unsupported modes fall back to no flag
         assert_eq!(
-            ai_launch_command("aider", "plan", "", ""),
+            ai_launch_command("aider", "plan", "", "", ""),
             Some("aider".into())
         );
         assert_eq!(
-            ai_launch_command("copilot", "bypassPermissions", "", ""),
-            Some("gh copilot".into())
+            ai_launch_command("copilot", "bypassPermissions", "", "", ""),
+            Some("copilot --allow-all".into())
         );
     }
 
@@ -766,21 +1210,21 @@ mod tests {
         use super::ai_launch_command;
 
         assert_eq!(
-            ai_launch_command("claude", "default", "", "--model opus"),
+            ai_launch_command("claude", "default", "", "--model opus", ""),
             Some("claude --model opus".into())
         );
         assert_eq!(
-            ai_launch_command("claude", "plan", "", "--verbose"),
+            ai_launch_command("claude", "plan", "", "--verbose", ""),
             Some("claude --permission-mode plan --verbose".into())
         );
         // Suffix is trimmed
         assert_eq!(
-            ai_launch_command("aider", "default", "", "  --dark-mode  "),
+            ai_launch_command("aider", "default", "", "  --dark-mode  ", ""),
             Some("aider --dark-mode".into())
         );
         // Empty suffix
         assert_eq!(
-            ai_launch_command("claude", "default", "", "   "),
+            ai_launch_command("claude", "default", "", "   ", ""),
             Some("claude".into())
         );
     }
@@ -791,43 +1235,43 @@ mod tests {
 
         // macOS: caffeinate wrapper
         assert_eq!(
-            ai_launch_command("claude", "default", "caffeinate -i", ""),
+            ai_launch_command("claude", "default", "caffeinate -i", "", ""),
             Some("caffeinate -i claude".into())
         );
         // Prefix + permission flag
         assert_eq!(
-            ai_launch_command("claude", "acceptEdits", "caffeinate -i", ""),
+            ai_launch_command("claude", "acceptEdits", "caffeinate -i", "", ""),
             Some("caffeinate -i claude --permission-mode acceptEdits".into())
         );
         // Windows: wsl wrapper
         assert_eq!(
-            ai_launch_command("claude", "default", "wsl", ""),
+            ai_launch_command("claude", "default", "wsl", "", ""),
             Some("wsl claude".into())
         );
         // Linux: nice wrapper
         assert_eq!(
-            ai_launch_command("gemini", "default", "nice -n 10", ""),
+            ai_launch_command("gemini", "default", "nice -n 10", "", ""),
             Some("nice -n 10 gemini".into())
         );
-        // Copilot (has special wrapping) supports prefix
+        // Copilot supports prefix
         assert_eq!(
-            ai_launch_command("copilot", "default", "caffeinate -i", ""),
-            Some("caffeinate -i gh copilot".into())
+            ai_launch_command("copilot", "default", "caffeinate -i", "", ""),
+            Some("caffeinate -i copilot".into())
         );
         // Prefix is trimmed
         assert_eq!(
-            ai_launch_command("claude", "default", "  caffeinate -i  ", ""),
+            ai_launch_command("claude", "default", "  caffeinate -i  ", "", ""),
             Some("caffeinate -i claude".into())
         );
         // Embedded newlines/CR are stripped (defense against paste-a-second-command)
         assert_eq!(
-            ai_launch_command("claude", "default", "caffeinate -i\nrm -rf /", ""),
+            ai_launch_command("claude", "default", "caffeinate -i\nrm -rf /", "", ""),
             Some("caffeinate -i rm -rf / claude".into())
         );
         // Empty prefix ⇒ byte-identical to no-prefix case
         assert_eq!(
-            ai_launch_command("claude", "default", "   ", ""),
-            ai_launch_command("claude", "default", "", "")
+            ai_launch_command("claude", "default", "   ", "", ""),
+            ai_launch_command("claude", "default", "", "", "")
         );
     }
 
@@ -837,28 +1281,96 @@ mod tests {
 
         // Both prefix and suffix: prefix wraps the binary, suffix appends flags
         assert_eq!(
-            ai_launch_command("claude", "acceptEdits", "caffeinate -i", "--model opus"),
+            ai_launch_command("claude", "acceptEdits", "caffeinate -i", "--model opus", ""),
             Some("caffeinate -i claude --permission-mode acceptEdits --model opus".into())
         );
         // Only suffix, no prefix
         assert_eq!(
-            ai_launch_command("claude", "default", "", "--model opus"),
+            ai_launch_command("claude", "default", "", "--model opus", ""),
             Some("claude --model opus".into())
         );
         // Only prefix, no suffix
         assert_eq!(
-            ai_launch_command("claude", "default", "caffeinate -i", ""),
+            ai_launch_command("claude", "default", "caffeinate -i", "", ""),
             Some("caffeinate -i claude".into())
         );
         // Both trimmed
         assert_eq!(
-            ai_launch_command("aider", "default", "  nice -n 10  ", "  --dark-mode  "),
+            ai_launch_command("aider", "default", "  nice -n 10  ", "  --dark-mode  ", ""),
             Some("nice -n 10 aider --dark-mode".into())
         );
         // Copilot with both
         assert_eq!(
-            ai_launch_command("copilot", "default", "wsl", "--debug"),
-            Some("wsl gh copilot --debug".into())
+            ai_launch_command("copilot", "default", "wsl", "--debug", ""),
+            Some("wsl copilot --debug".into())
+        );
+    }
+
+    #[test]
+    fn ai_launch_command_custom_agent() {
+        use super::ai_launch_command;
+
+        // The typed command is launched as is, wrapped in prefix/suffix.
+        assert_eq!(
+            ai_launch_command(
+                "custom",
+                "default",
+                "",
+                "",
+                "node fake-agent.mjs --name demo"
+            ),
+            Some("node fake-agent.mjs --name demo".into())
+        );
+        assert_eq!(
+            ai_launch_command("custom", "default", "nice -n 10", "--verbose", "  aider  "),
+            Some("nice -n 10 aider --verbose".into())
+        );
+        // Permission modes add nothing to a command Hermes does not know.
+        assert_eq!(
+            ai_launch_command("custom", "bypassPermissions", "", "", "aider"),
+            Some("aider".into())
+        );
+        // Line breaks cannot smuggle a second command.
+        assert_eq!(
+            ai_launch_command("custom", "default", "", "", "aider\nrm -rf /"),
+            Some("aider rm -rf /".into())
+        );
+        // No command: nothing is launched.
+        assert_eq!(ai_launch_command("custom", "default", "", "", "   "), None);
+        // A command given to a catalog agent is ignored.
+        assert_eq!(
+            ai_launch_command("claude", "default", "", "", "rm -rf /"),
+            Some("claude".into())
+        );
+    }
+
+    #[test]
+    fn ai_launch_command_new_catalog_agents() {
+        use super::ai_launch_command;
+
+        assert_eq!(
+            ai_launch_command("antigravity", "default", "", "", ""),
+            Some("agy".into())
+        );
+        assert_eq!(
+            ai_launch_command("antigravity", "bypassPermissions", "", "", ""),
+            Some("agy --dangerously-skip-permissions".into())
+        );
+        assert_eq!(
+            ai_launch_command("opencode", "auto", "", "", ""),
+            Some("opencode --auto".into())
+        );
+        assert_eq!(
+            ai_launch_command("goose", "default", "", "", ""),
+            Some("goose session".into())
+        );
+        assert_eq!(
+            ai_launch_command("hermes-agent", "bypassPermissions", "", "", ""),
+            Some("hermes --yolo".into())
+        );
+        assert_eq!(
+            ai_launch_command("gemini", "acceptEdits", "", "", ""),
+            Some("gemini --approval-mode auto_edit".into())
         );
     }
 
@@ -867,10 +1379,10 @@ mod tests {
     #[test]
     fn every_ai_cli_provider_has_launch_command() {
         use super::ai_launch_command;
-        use crate::platform::AI_CLI_PROVIDERS;
+        use crate::platform::ai_cli_providers;
 
-        for (provider_id, binary_name) in AI_CLI_PROVIDERS {
-            let result = ai_launch_command(provider_id, "default", "", "");
+        for (provider_id, binary_name) in ai_cli_providers().iter() {
+            let result = ai_launch_command(provider_id, "default", "", "", "");
             assert!(
                 result.is_some(),
                 "AI_CLI_PROVIDERS has '{}' (binary '{}') but ai_launch_command returns None for it. \
@@ -882,10 +1394,11 @@ mod tests {
         }
     }
 
+    /// Agents on the stable channel must be recognised in terminal output.
+    /// (Beta entries of the catalog may not have an adapter yet.)
     #[test]
-    fn every_ai_cli_provider_has_adapter_in_registry() {
+    fn every_stable_ai_cli_provider_has_adapter_in_registry() {
         use super::adapters::ProviderRegistry;
-        use crate::platform::AI_CLI_PROVIDERS;
 
         let registry = ProviderRegistry::new();
 
@@ -901,7 +1414,12 @@ mod tests {
         .into_iter()
         .collect();
 
-        for (provider_id, _) in AI_CLI_PROVIDERS {
+        let stable = crate::agent_catalog::catalog()
+            .agents
+            .iter()
+            .filter(|a| a.channel == "stable" && a.detect.is_some())
+            .map(|a| a.id.as_str());
+        for provider_id in stable {
             let test_line = detection_lines.get(provider_id).unwrap_or_else(|| {
                 panic!(
                     "No detection test line defined for provider '{}'. \
@@ -952,7 +1470,7 @@ mod tests {
     fn test_full_claude_command_with_prompt_and_channels() {
         use super::{ai_launch_command, channels_suffix};
         // Simulate the call-site pattern: base + prompt + channels
-        let base = ai_launch_command("claude", "bypassPermissions", "", "").unwrap();
+        let base = ai_launch_command("claude", "bypassPermissions", "", "", "").unwrap();
         let prompt = format!("{} \"Read context\"", base);
         let channels = vec!["plugin:telegram@claude-plugins-official".to_string()];
         let full = format!("{}{}", prompt, channels_suffix(&channels));

@@ -1,6 +1,6 @@
 [package]
 name = "hermes-ide"
-version = "1.3.2"
+version = "2.1.2"
 description = "AI-native terminal"
 authors = ["Gabriel Anhaia"]
 edition = "2021"
@@ -11,6 +11,69 @@ crate-type = ["lib", "cdylib", "staticlib"]
 [[bin]]
 name = "hermes-ide"
 path = "src/main.rs"
+
+[features]
+# Test-only automation bridge (src/e2e_bridge.rs). Off by default and refuses
+# to compile in a release build. The platform crates below are only for the
+# bridge's in-process window screenshots.
+e2e = [
+  "dep:objc2",
+  "dep:objc2-foundation",
+  "dep:objc2-app-kit",
+  "dep:objc2-web-kit",
+  "dep:block2",
+  "dep:gtk",
+  "windows-sys/Win32_Foundation",
+  "windows-sys/Win32_Graphics_Gdi",
+  "windows-sys/Win32_Storage_Xps",
+  "windows-sys/Win32_UI_WindowsAndMessaging",
+]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+block2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = [
+  "std",
+  "NSData",
+  "NSError",
+  "NSObject",
+  "NSString",
+  "NSValue",
+] }
+objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = [
+  "std",
+  "NSImage",
+  # The attention badge read-back (dock tile badge label).
+  "NSApplication",
+  "NSDockTile",
+  "NSResponder",
+] }
+objc2-web-kit = { version = "0.3", optional = true, default-features = false, features = [
+  "std",
+  "block2",
+  "objc2-app-kit",
+  "WKWebView",
+  "WKSnapshotConfiguration",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Free disk space for the disk guard; the console Ctrl+C event for spend
+# caps. The e2e feature adds what the bridge's window screenshots need.
+# Keeping the machine awake while an agent works uses a power request.
+windows-sys = { version = "0.61", features = [
+  "Win32_Storage_FileSystem",
+  "Win32_Foundation",
+  "Win32_System_Console",
+  "Win32_System_Power",
+  "Win32_System_Threading",
+  # Block cloning on ReFS / Dev Drive (git/cow_clone.rs)
+  "Win32_System_IO",
+  "Win32_System_Ioctl",
+  "Win32_System_SystemServices",
+] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -30,6 +93,7 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 strip-ansi-escapes = "0.2"
+vte = { version = "0.14", default-features = false }
 libc = "0.2"
 log = "0.4"
 env_logger = "0.11"
@@ -37,7 +101,7 @@ walkdir = "2"
 base64 = "0.22"
 regex = "1"
 lazy_static = "1"
-sysinfo = { version = "0.38", features = ["system", "user"] }
+sysinfo = { version = "0.39.6", features = ["system", "user"] }
 git2 = { version = "0.20", features = ["vendored-openssl"] }
 ignore = "0.4"
 dirs = "6"
@@ -47,13 +111,36 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 flate2 = "1"
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
 tar = "0.4"
+# Unpacks the bridge runtime archive (zstd), pure Rust: no C toolchain on any target.
+ruzstd = "0.9"
+sha2 = "0.10"
+# The prompt library's signed catalog updates (already used by the app updater).
+minisign-verify = "0.2"
 anyhow = "1"
 notify = "8"
+dunce = "1"
+# Private index files and patch files for the Review Desk (src/review).
+tempfile = "3"
+# Feature Tracks (F28): the .hermes/features files, shared with the hi helper.
+hermes-track = { path = "track" }
+# The session host (src-tauri/pty-host): the app links its protocol and
+# client; the binary itself is built by build.rs and ships next to the app.
+hermes-pty-host = { path = "pty-host" }
 
 [dev-dependencies]
-tempfile = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
+# Signs test catalogs with a fresh minisign key (already in the tree via rustls).
+ring = "0.17"
 
 [[bench]]
 name = "analyzer"
 harness = false
+
+# Unpacking the bridge runtime (about 80 MB of zstd, 256 MB out) takes ~13 s
+# with these crates unoptimised and ~2 s optimised; debug and test builds
+# (the e2e rig, `tauri dev`) unpack it too.
+[profile.dev.package.ruzstd]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3

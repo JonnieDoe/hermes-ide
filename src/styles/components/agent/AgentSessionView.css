@@ -2625,6 +2625,30 @@ html[data-theme="newsprint"] .agent-md-h2 {
   background: transparent;
 }
 
+/* Where the agent stopped unexpectedly (CHAOS-20): stays in the history
+ * after the agent is back, same quiet marginalia as the exit notice. */
+.agent-crash-marker {
+  margin: var(--space-1) 0 var(--space-3);
+  padding: var(--space-1-5) 0 var(--space-1-5) var(--space-3);
+  border-left: var(--space-0-5) solid var(--tool-error);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--ink-secondary);
+}
+
+/* A turn that ignored ◼ Stop (CHAOS-10): the word, then Force stop. */
+.agent-session-hung {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-left: var(--space-2);
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+  line-height: var(--leading-none);
+  color: var(--ink-secondary);
+}
+
 /* Slash-command receipt card — replaces the "(no content)" placeholder
  * Claude emits for /compact, /clear, /init, /review.  Brass checkmark
  * + one-line label + one-line description, sized like a quiet status
@@ -3745,4 +3769,23 @@ html[data-agent-timeline-style="classic"] .agent-message {
   color: var(--danger, var(--red));
   opacity: 0.6;
   cursor: default;
+}
+
+/* F14: the agent compacted its context here. A rule across the column
+ * with the word in the middle, quiet like the other flow markers. */
+.agent-compaction-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 0;
+  color: var(--text-3);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.agent-compaction-divider::before,
+.agent-compaction-divider::after {
+  content: "";
+  flex: 1;
+  border-top: 1px dashed var(--border, rgba(127, 127, 127, 0.35));
 }

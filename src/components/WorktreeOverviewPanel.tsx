@@ -1,14 +1,62 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
+import { basename } from "../utils/paths";
 import {
   listAllWorktrees,
   detectOrphanWorktrees,
   worktreeDiskUsage,
   cleanupOrphanWorktrees,
+  getDiskStatus,
+  getWorktreeUsage,
+  reclaimBuildOutput,
+  listOrphanFolders,
+  sweepOrphanFolders,
 } from "../api/git";
-import type { WorktreeOverviewEntry, OrphanWorktree, CleanupResult } from "../types/git";
+import type {
+  WorktreeOverviewEntry, OrphanWorktree, CleanupResult, DiskStatus, WorktreeUsage, OrphanFolder, SweepResult,
+} from "../types/git";
+import { isFeatureFlagEnabled } from "../featureFlags";
 import "../styles/components/WorktreeOverviewPanel.css";
+import { Button, Checkbox, IconButton, Input } from "./ui";
 
 // ─── Helpers ──────────────────────────────────────────────────────────
+
+/** Decimal units ("4.2 GB"), as the OS shows disk space; matches the 10 GB guard. */
+export function formatDiskBytes(bytes: number): string {
+  if (bytes < 1000) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = -1;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit++;
+  }
+  return `${value < 100 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+}
+
+/** An orphaned folder from the disk-guard scan, in the shape the list renders. */
+export function orphanFolderToEntry(folder: OrphanFolder): OrphanWorktree {
+  return {
+    worktree_path: folder.worktree_path,
+    branch_name: folder.branch_hint,
+    kind: "directory_only",
+    root_path: folder.repo_path,
+    session_id: null,
+  };
+}
+
+/**
+ * The flag-on orphan list: every orphaned folder from the disk-guard scan,
+ * plus records whose folder is already gone (only the old detection finds
+ * those; its folder entries are left out, the scan covers them).
+ */
+export function mergeOrphanLists(folders: OrphanFolder[], detected: OrphanWorktree[]): OrphanWorktree[] {
+  return [...folders.map(orphanFolderToEntry), ...detected.filter((o) => o.kind === "record_only")];
+}
+
+/** Sweep results in the shape the results strip renders. */
+export function sweepToCleanupResults(results: SweepResult[]): CleanupResult[] {
+  return results.map((r) => ({ path: r.path, success: r.removed, error: r.error }));
+}
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
@@ -76,7 +124,7 @@ export function friendlyWorktreeTooltip(
   if (sessionLabel) parts.push(sessionLabel);
   if (parts.length > 0) return parts.join(" — ");
   // Fallback: use last segment of path
-  return worktreePath.split("/").pop() || worktreePath;
+  return basename(worktreePath);
 }
 
 // ─── Types ────────────────────────────────────────────────────────────
@@ -104,6 +152,13 @@ export function WorktreeOverviewPanel() {
   const [confirmCleanup, setConfirmCleanup] = useState(false);
   const [cleanupResults, setCleanupResults] = useState<CleanupResult[] | null>(null);
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
+  // Disk guard (feature flag): free space, per-worktree usage, build output.
+  const diskGuard = isFeatureFlagEnabled("diskGuard");
+  const [diskStatus, setDiskStatus] = useState<DiskStatus | null>(null);
+  const [usage, setUsage] = useState<Record<string, WorktreeUsage>>({});
+  const [reclaiming, setReclaiming] = useState<Set<string>>(new Set());
+  const [reclaimNote, setReclaimNote] = useState<string | null>(null);
+  const [sweepNote, setSweepNote] = useState<{ folders: number; bytes: number; records: number } | null>(null);
 
   // Load data on mount
   useEffect(() => {
@@ -125,12 +180,23 @@ export function WorktreeOverviewPanel() {
     try {
       const [wts, orps] = await Promise.all([
         listAllWorktrees(),
-        detectOrphanWorktrees(),
+        diskGuard
+          ? Promise.all([listOrphanFolders(), detectOrphanWorktrees().catch(() => [])]).then(([f, d]) =>
+            mergeOrphanLists(f, d),
+          )
+          : detectOrphanWorktrees(),
       ]);
       setWorktrees(wts);
       setOrphans(orps);
+      if (diskGuard) {
+        setUsage({});
+        setDiskUsage({});
+        getDiskStatus().then(setDiskStatus).catch(() => setDiskStatus(null));
+      }
       // Auto-expand all projects on first load
       const projectIds = new Set(wts.map((w) => w.project_id));
+      // Disk guard: orphans of repos with no live worktree are shown open too.
+      if (diskGuard) for (const o of orps) projectIds.add(o.root_path || o.worktree_path);
       setExpandedProjects(projectIds);
     } catch (e) {
       console.error("Failed to load worktree overview:", e);
@@ -138,7 +204,34 @@ export function WorktreeOverviewPanel() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [diskGuard]);
+
+  // Disk guard: measure every linked worktree and orphan, one at a time (a
+  // walk over node_modules is heavy), so each row shows the disk it uses.
+  useEffect(() => {
+    if (!diskGuard) return;
+    let cancelled = false;
+    const paths = [
+      ...worktrees.filter((w) => !w.is_main_worktree).map((w) => w.worktree_path),
+      ...orphans.filter((o) => o.kind === "directory_only").map((o) => o.worktree_path),
+    ];
+    (async () => {
+      for (const path of paths) {
+        if (cancelled) return;
+        try {
+          const u = await getWorktreeUsage(path);
+          if (cancelled) return;
+          setUsage((prev) => ({ ...prev, [path]: u }));
+          setDiskUsage((prev) => ({ ...prev, [path]: u.total_bytes }));
+        } catch {
+          // Folder vanished or is not a worktree folder: no size to show.
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [diskGuard, worktrees, orphans]);
 
   // Group worktrees by project
   const projectGroups = useMemo((): ProjectGroup[] => {
@@ -178,7 +271,7 @@ export function WorktreeOverviewPanel() {
         if (!group) {
           group = {
             projectId: key,
-            projectName: orphan.root_path ? orphan.root_path.split("/").pop() || "Unknown" : "Orphaned",
+            projectName: orphan.root_path ? basename(orphan.root_path) || "Unknown" : "Orphaned",
             rootPath: orphan.root_path || "",
             worktrees: [],
             orphans: [],
@@ -217,6 +310,11 @@ export function WorktreeOverviewPanel() {
   // Total stats
   const totalWorktrees = worktrees.length + orphans.length;
   const totalDiskUsage = Object.values(diskUsage).reduce((sum, v) => sum + v, 0);
+  const orphanBytes = orphans.reduce((sum, o) => sum + (usage[o.worktree_path]?.total_bytes ?? 0), 0);
+  const selectedOrphanBytes = Array.from(selectedOrphans).reduce(
+    (sum, path) => sum + (usage[path]?.total_bytes ?? 0),
+    0,
+  );
 
   // ─── Handlers ─────────────────────────────────────────────────────
 
@@ -264,7 +362,25 @@ export function WorktreeOverviewPanel() {
     setCleaning(true);
     setConfirmCleanup(false);
     try {
-      const results = await cleanupOrphanWorktrees(Array.from(selectedOrphans));
+      let results: CleanupResult[];
+      if (diskGuard) {
+        // Folders go through the sweep; records whose folder is gone only
+        // need their row removed, which the old cleanup does.
+        const recordOnly = new Set(orphans.filter((o) => o.kind === "record_only").map((o) => o.worktree_path));
+        const selected = Array.from(selectedOrphans);
+        const folderPaths = selected.filter((p) => !recordOnly.has(p));
+        const recordPaths = selected.filter((p) => recordOnly.has(p));
+        const swept = folderPaths.length > 0 ? await sweepOrphanFolders(folderPaths) : [];
+        const cleared = recordPaths.length > 0 ? await cleanupOrphanWorktrees(recordPaths) : [];
+        results = [...sweepToCleanupResults(swept), ...cleared];
+        setSweepNote({
+          folders: swept.filter((r) => r.removed).length,
+          bytes: swept.reduce((sum, r) => sum + r.freed_bytes, 0),
+          records: cleared.filter((r) => r.success).length,
+        });
+      } else {
+        results = await cleanupOrphanWorktrees(Array.from(selectedOrphans));
+      }
       setCleanupResults(results);
       const failed = results.filter((r) => !r.success);
       if (failed.length > 0) {
@@ -278,7 +394,39 @@ export function WorktreeOverviewPanel() {
     } finally {
       setCleaning(false);
     }
-  }, [selectedOrphans, loadData]);
+  }, [selectedOrphans, loadData, diskGuard, orphans]);
+
+  /** Disk guard: one action for every orphan — select them all and ask once. */
+  const requestRemoveAllOrphans = useCallback(() => {
+    setSelectedOrphans(new Set(orphans.map((o) => o.worktree_path)));
+    setConfirmCleanup(true);
+  }, [orphans]);
+
+  const handleReclaim = useCallback(async (path: string, label: string) => {
+    setReclaiming((prev) => new Set(prev).add(path));
+    try {
+      const result = await reclaimBuildOutput(path);
+      const removed = result.removed.length;
+      setReclaimNote(
+        removed === 0
+          ? `No build output to remove in ${label}.`
+          : `Removed ${result.removed.join(", ")} from ${label}: freed ${formatDiskBytes(result.freed_bytes)}.` +
+            (result.failed.length > 0 ? ` Could not remove: ${result.failed.join("; ")}` : ""),
+      );
+      const u = await getWorktreeUsage(path);
+      setUsage((prev) => ({ ...prev, [path]: u }));
+      setDiskUsage((prev) => ({ ...prev, [path]: u.total_bytes }));
+      getDiskStatus().then(setDiskStatus).catch(() => {});
+    } catch (e) {
+      setError(formatWorktreeError(String(e)));
+    } finally {
+      setReclaiming((prev) => {
+        const next = new Set(prev);
+        next.delete(path);
+        return next;
+      });
+    }
+  }, []);
 
   const handleCopyPath = useCallback((path: string) => {
     navigator.clipboard.writeText(path).catch(() => {});
@@ -298,22 +446,61 @@ export function WorktreeOverviewPanel() {
     <div className="worktree-overview">
       {/* Search + Refresh */}
       <div className="worktree-overview-search">
-        <input
+        <Input
+          size="sm"
+          type="search"
           className="worktree-overview-search-input"
           placeholder="Search working copies..."
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           aria-label="Search working copies"
         />
-        <button
+        <IconButton
+          size="sm"
           className="worktree-overview-refresh"
           onClick={loadData}
           title="Refresh"
-          aria-label="Refresh working copies"
-        >
-          &#8635;
-        </button>
+          label="Refresh working copies"
+          icon={
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <polyline points="23 4 23 10 17 10" />
+              <polyline points="1 20 1 14 7 14" />
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+            </svg>
+          }
+        />
       </div>
+
+      {diskGuard && diskStatus && (
+        <div
+          className={`worktree-disk-status ${diskStatus.below_threshold ? "worktree-disk-status-low" : ""}`}
+          data-free-bytes={diskStatus.free_bytes ?? ""}
+        >
+          {diskStatus.free_bytes === null
+            ? "Free disk space: unknown"
+            : `Free disk space: ${formatDiskBytes(diskStatus.free_bytes)}`}
+          {diskStatus.below_threshold && (
+            <span className="worktree-disk-status-warning">
+              {` — under ${formatDiskBytes(diskStatus.required_bytes)}: new worktrees are refused`}
+            </span>
+          )}
+        </div>
+      )}
+
+      {diskGuard && reclaimNote && (
+        <div className="worktree-reclaim-note" role="status">{reclaimNote}</div>
+      )}
+
+      {diskGuard && sweepNote && cleanupResults && (
+        <div className="worktree-sweep-note" role="status">
+          {(sweepNote.folders > 0 || sweepNote.records === 0
+            ? `Removed ${sweepNote.folders} orphaned folder${sweepNote.folders !== 1 ? "s" : ""}: freed ${formatDiskBytes(sweepNote.bytes)}.`
+            : "") +
+            (sweepNote.records > 0
+              ? `${sweepNote.folders > 0 ? " " : ""}Cleared ${sweepNote.records} record${sweepNote.records !== 1 ? "s" : ""} of working copies already deleted.`
+              : "")}
+        </div>
+      )}
 
       {error && (
         <div className="worktree-overview-error">{error}</div>
@@ -327,7 +514,7 @@ export function WorktreeOverviewPanel() {
               key={r.path}
               className={r.success ? "worktree-overview-result-success" : "worktree-overview-result-failure"}
             >
-              {r.success ? "\u2713" : "\u2717"} {r.path.split("/").pop()}
+              {r.success ? "\u2713" : "\u2717"} {basename(r.path)}
               {r.error && ` - ${r.error}`}
             </div>
           ))}
@@ -381,7 +568,7 @@ export function WorktreeOverviewPanel() {
                 <div className="worktree-overview-project-body">
                   {/* Active worktrees */}
                   {group.worktrees.map((wt) => (
-                    <div key={wt.worktree_path} className="worktree-overview-entry">
+                    <div key={wt.worktree_path} className="worktree-overview-entry" data-worktree-path={wt.worktree_path}>
                       <span className="worktree-overview-entry-icon">
                         {wt.is_main_worktree ? "\u25CF" : "\u25CB"}
                       </span>
@@ -407,13 +594,29 @@ export function WorktreeOverviewPanel() {
                               Active: {timeAgo(wt.last_activity_at)}
                             </span>
                           )}
-                          {diskUsage[wt.worktree_path] !== undefined && (
+                          {diskGuard && !wt.is_main_worktree && (
+                            <span
+                              className="worktree-overview-disk-size"
+                              data-total-bytes={usage[wt.worktree_path]?.total_bytes ?? ""}
+                              data-build-output-bytes={usage[wt.worktree_path]?.build_output_bytes ?? ""}
+                              title="Disk used by this working copy"
+                            >
+                              {usage[wt.worktree_path]
+                                ? formatDiskBytes(usage[wt.worktree_path].total_bytes) +
+                                  (usage[wt.worktree_path].build_output_bytes > 0
+                                    ? ` (build output ${formatDiskBytes(usage[wt.worktree_path].build_output_bytes)})`
+                                    : "")
+                                : "measuring\u2026"}
+                            </span>
+                          )}
+                          {!diskGuard && diskUsage[wt.worktree_path] !== undefined && (
                             <span className="worktree-overview-disk-size">
                               {formatBytes(diskUsage[wt.worktree_path])}
                             </span>
                           )}
-                          {diskUsage[wt.worktree_path] === undefined && (
-                            <button
+                          {!diskGuard && diskUsage[wt.worktree_path] === undefined && (
+                            <Button
+                              variant="link"
                               className="worktree-overview-disk-btn"
                               onClick={(e) => {
                                 e.stopPropagation();
@@ -423,12 +626,28 @@ export function WorktreeOverviewPanel() {
                               title="Show disk usage"
                             >
                               {diskLoading.has(wt.worktree_path) ? "..." : "\u2022 size"}
-                            </button>
+                            </Button>
                           )}
                         </div>
                       </div>
                       <div className="worktree-overview-actions">
-                        <button
+                        {diskGuard && !wt.is_main_worktree && (usage[wt.worktree_path]?.build_output_bytes ?? 0) > 0 && (
+                          <Button
+                            size="sm"
+                            className="worktree-overview-action-btn worktree-reclaim-btn"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleReclaim(wt.worktree_path, wt.branch_name || wt.session_label);
+                            }}
+                            disabled={reclaiming.has(wt.worktree_path)}
+                            title="Remove node_modules, target and dist folders that git ignores (they can be rebuilt)"
+                          >
+                            {reclaiming.has(wt.worktree_path) ? "Removing\u2026" : "Remove build output"}
+                          </Button>
+                        )}
+                        <Button
+                          size="sm"
+                          variant="quiet"
                           className="worktree-overview-action-btn worktree-overview-action-btn-open"
                           onClick={(e) => {
                             e.stopPropagation();
@@ -437,7 +656,7 @@ export function WorktreeOverviewPanel() {
                           title={`Copy path: ${friendlyWorktreeTooltip(wt.worktree_path, wt.branch_name, wt.session_label)}`}
                         >
                           Copy
-                        </button>
+                        </Button>
                       </div>
                     </div>
                   ))}
@@ -447,14 +666,14 @@ export function WorktreeOverviewPanel() {
                     <div
                       key={orphan.worktree_path}
                       className="worktree-overview-entry worktree-overview-orphan"
+                      data-worktree-path={orphan.worktree_path}
                     >
-                      <input
-                        type="checkbox"
+                      <Checkbox
                         className="worktree-overview-orphan-checkbox"
                         checked={selectedOrphans.has(orphan.worktree_path)}
                         onChange={() => toggleOrphanSelection(orphan.worktree_path)}
                         onClick={(e) => e.stopPropagation()}
-                        aria-label={`Select orphan ${orphan.worktree_path}`}
+                        label={<span className="h-visually-hidden">{`Select orphan ${orphan.worktree_path}`}</span>}
                       />
                       <span className="worktree-overview-orphan-icon">
                         &#9888;
@@ -470,13 +689,24 @@ export function WorktreeOverviewPanel() {
                           <span className="worktree-overview-orphan-kind">
                             {orphan.kind === "directory_only" ? "Leftover directory" : "Missing directory"}
                           </span>
-                          {diskUsage[orphan.worktree_path] !== undefined && (
+                          {diskGuard && orphan.kind === "directory_only" && (
+                            <span
+                              className="worktree-overview-disk-size"
+                              data-total-bytes={usage[orphan.worktree_path]?.total_bytes ?? ""}
+                            >
+                              {usage[orphan.worktree_path]
+                                ? formatDiskBytes(usage[orphan.worktree_path].total_bytes)
+                                : "measuring…"}
+                            </span>
+                          )}
+                          {!diskGuard && diskUsage[orphan.worktree_path] !== undefined && (
                             <span className="worktree-overview-disk-size">
                               {formatBytes(diskUsage[orphan.worktree_path])}
                             </span>
                           )}
-                          {diskUsage[orphan.worktree_path] === undefined && (
-                            <button
+                          {!diskGuard && diskUsage[orphan.worktree_path] === undefined && (
+                            <Button
+                              variant="link"
                               className="worktree-overview-disk-btn"
                               onClick={(e) => {
                                 e.stopPropagation();
@@ -486,12 +716,14 @@ export function WorktreeOverviewPanel() {
                               title="Show disk usage"
                             >
                               {diskLoading.has(orphan.worktree_path) ? "..." : "\u2022 size"}
-                            </button>
+                            </Button>
                           )}
                         </div>
                       </div>
                       <div className="worktree-overview-actions">
-                        <button
+                        <Button
+                          size="sm"
+                          variant="quiet"
                           className="worktree-overview-action-btn worktree-overview-action-btn-open"
                           onClick={(e) => {
                             e.stopPropagation();
@@ -500,7 +732,7 @@ export function WorktreeOverviewPanel() {
                           title={`Copy path: ${friendlyWorktreeTooltip(orphan.worktree_path, orphan.branch_name)}`}
                         >
                           Copy
-                        </button>
+                        </Button>
                       </div>
                     </div>
                   ))}
@@ -515,20 +747,25 @@ export function WorktreeOverviewPanel() {
       {confirmCleanup && (
         <div className="worktree-overview-confirm">
           <span className="worktree-overview-confirm-text">
-            Clean up {selectedOrphans.size} orphan{selectedOrphans.size > 1 ? "s" : ""}?
+            Clean up {selectedOrphans.size} orphan{selectedOrphans.size > 1 ? "s" : ""}
+            {diskGuard && selectedOrphanBytes > 0 ? ` (${formatDiskBytes(selectedOrphanBytes)})` : ""}?
+            {diskGuard && " Their files are deleted; uncommitted work is first saved as a backup in its repo when the repo still exists."}
           </span>
-          <button
-            className="worktree-overview-confirm-yes worktree-overview-confirm-destructive"
-            onClick={handleCleanup}
-          >
-            {`Delete ${selectedOrphans.size} working ${selectedOrphans.size !== 1 ? "copies" : "copy"}`}
-          </button>
-          <button
+          <Button
+            size="sm"
             className="worktree-overview-confirm-no"
             onClick={() => setConfirmCleanup(false)}
           >
             Cancel
-          </button>
+          </Button>
+          <Button
+            size="sm"
+            variant="danger-solid"
+            className="worktree-overview-confirm-yes"
+            onClick={handleCleanup}
+          >
+            {`Delete ${selectedOrphans.size} working ${selectedOrphans.size !== 1 ? "copies" : "copy"}`}
+          </Button>
         </div>
       )}
 
@@ -537,26 +774,42 @@ export function WorktreeOverviewPanel() {
         <div className="worktree-overview-footer-stats">
           <span>{totalWorktrees} working {totalWorktrees !== 1 ? "copies" : "copy"}</span>
           {totalDiskUsage > 0 && (
-            <span>{formatBytes(totalDiskUsage)}</span>
+            <span>{diskGuard ? formatDiskBytes(totalDiskUsage) : formatBytes(totalDiskUsage)}</span>
           )}
-          {orphans.length > 0 && (
+          {orphans.length > 0 && !diskGuard && (
             <span>
               {orphans.length} orphan{orphans.length !== 1 ? "s" : ""}
               {selectedOrphans.size < orphans.length && (
-                <button
+                <Button
+                  variant="link"
                   className="worktree-overview-disk-btn"
                   onClick={selectAllOrphans}
                   title="Select all orphans"
-                  style={{ marginLeft: 4 }}
                 >
                   select all
-                </button>
+                </Button>
               )}
             </span>
           )}
         </div>
+        {diskGuard && orphans.length > 0 && !confirmCleanup && (
+          <Button
+            size="sm"
+            variant="danger"
+            className="worktree-overview-cleanup-btn worktree-sweep-btn"
+            onClick={requestRemoveAllOrphans}
+            disabled={cleaning}
+            title="Delete every orphaned worktree folder (folders no session owns)"
+          >
+            {cleaning
+              ? "Removing…"
+              : `Remove all orphans (${orphans.length}${orphanBytes > 0 ? `, ${formatDiskBytes(orphanBytes)}` : ""})`}
+          </Button>
+        )}
         {selectedOrphans.size > 0 && !confirmCleanup && (
-          <button
+          <Button
+            size="sm"
+            variant="danger"
             className="worktree-overview-cleanup-btn"
             onClick={() => setConfirmCleanup(true)}
             disabled={cleaning}
@@ -565,7 +818,7 @@ export function WorktreeOverviewPanel() {
             {cleaning
               ? "Cleaning..."
               : `Clean up (${selectedOrphans.size})`}
-          </button>
+          </Button>
         )}
       </div>
     </div>

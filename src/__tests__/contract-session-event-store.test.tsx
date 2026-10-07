@@ -1,0 +1,249 @@
+// @vitest-environment jsdom
+/**
+ * C0 contracts: the per-session event store, its React hook and the
+ * Rust -> frontend channel.
+ */
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { act, renderHook } from "@testing-library/react";
+import {
+  _resetSessionEventStoreForTest,
+  clearSessionEvents,
+  dispatchSessionEvent,
+  getSessionEventSnapshot,
+  reduceSessionEvent,
+  SESSION_EVENT_CAP,
+  sessionIdsWithEvents,
+  subscribeAllSessionEvents,
+  subscribeSessionEvents,
+  tapSessionEvents,
+  useSessionEvents,
+} from "../agent/contract/sessionEventStore";
+import {
+  _resetSessionEventChannelForTest,
+  receiveSessionEventEnvelope,
+  SESSION_EVENT_CHANNEL,
+  startSessionEventChannel,
+} from "../agent/contract/channel";
+import type { SessionEvent } from "../agent/contract/events";
+import { UNKNOWN_STATUS, type AgentStatusKind } from "../agent/contract/status";
+
+const status = (kind: AgentStatusKind, at = 1): SessionEvent => ({
+  type: "status",
+  at,
+  status: { kind, confidence: "exact", detail: "" },
+});
+
+beforeEach(() => {
+  _resetSessionEventStoreForTest();
+  _resetSessionEventChannelForTest();
+});
+
+describe("reduceSessionEvent", () => {
+  const empty = getSessionEventSnapshot("s");
+
+  it.each<[string, SessionEvent, (s: ReturnType<typeof reduceSessionEvent>) => void]>([
+    ["status sets the status", status("needs_approval"), (s) => expect(s.status.kind).toBe("needs_approval")],
+    ["turn_start opens a turn", { type: "turn_start", at: 1, n: 1 }, (s) => expect(s.turn).toEqual({ current: 1, completed: 0 })],
+    ["attention keeps the detail", { type: "attention", at: 1, detail: "look" }, (s) => expect(s.attention).toBe("look")],
+    [
+      "identity fills the identity",
+      { type: "identity", at: 1, vendorSessionId: "v1", model: "m", permissionMode: "plan" },
+      (s) => expect(s.identity).toEqual({ vendorSessionId: "v1", model: "m", permissionMode: "plan" }),
+    ],
+    [
+      "exit records the exit and sets status exited, exactly",
+      { type: "exit", at: 1, code: 2, signal: null },
+      (s) => {
+        expect(s.exit).toEqual({ code: 2, signal: null });
+        expect(s.status).toEqual({ kind: "exited", confidence: "exact", detail: "" });
+      },
+    ],
+  ])("%s", (_name, event, check) => {
+    const next = reduceSessionEvent(empty, event);
+    check(next);
+    expect(next.version).toBe(1);
+    expect(next.events).toEqual([event]);
+    expect(Object.isFrozen(next)).toBe(true);
+    expect(empty.version).toBe(0);
+  });
+
+  it("identity from several sources merges: a later report without the model keeps the model the agent named", () => {
+    // The order seen on CI: the agent's SessionStart named the model, then
+    // Hermes's own view of the terminal (no model, the launch's permission
+    // mode, the conversation id) arrived. The row lost its model tag.
+    const reported = reduceSessionEvent(empty, { type: "identity", at: 1, source: "transcript:claude", vendorSessionId: null, model: "fake-default-model", permissionMode: "acceptEdits" });
+    const observed = reduceSessionEvent(reported, { type: "identity", at: 2, source: "hermes", vendorSessionId: "v1", model: null, permissionMode: "acceptEdits" });
+    expect(observed.identity).toEqual({ vendorSessionId: "v1", model: "fake-default-model", permissionMode: "acceptEdits" });
+    // A real change still replaces (a /model switch, a new permission mode).
+    const switched = reduceSessionEvent(observed, { type: "identity", at: 3, vendorSessionId: null, model: "other-model", permissionMode: "plan" });
+    expect(switched.identity).toEqual({ vendorSessionId: "v1", model: "other-model", permissionMode: "plan" });
+    // And the other order gives the same result.
+    const first = reduceSessionEvent(empty, { type: "identity", at: 1, source: "hermes", vendorSessionId: "v1", model: null, permissionMode: "acceptEdits" });
+    expect(reduceSessionEvent(first, { type: "identity", at: 2, vendorSessionId: null, model: "fake-default-model", permissionMode: "acceptEdits" }).identity).toEqual(observed.identity);
+  });
+
+  it("closes a turn on end, failure or interruption and counts it", () => {
+    for (const type of ["turn_end", "turn_failed", "turn_interrupted"] as const) {
+      const started = reduceSessionEvent(empty, { type: "turn_start", at: 1, n: 2 });
+      const ended = reduceSessionEvent(started, type === "turn_failed" ? { type, at: 2, n: 2, detail: "boom" } : { type, at: 2, n: 2 });
+      expect(ended.turn, type).toEqual({ current: null, completed: 1 });
+    }
+    // Exit while a turn runs counts that turn as over.
+    const started = reduceSessionEvent(empty, { type: "turn_start", at: 1, n: 1 });
+    expect(reduceSessionEvent(started, { type: "exit", at: 2, code: null, signal: "SIGKILL" }).turn).toEqual({ current: null, completed: 1 });
+    expect(reduceSessionEvent(started, { type: "exit", at: 2, code: null, signal: "SIGKILL" }).exit).toEqual({ code: null, signal: "SIGKILL" });
+  });
+
+  it("keeps at most SESSION_EVENT_CAP events, dropping the oldest", () => {
+    let snap = empty;
+    for (let i = 1; i <= SESSION_EVENT_CAP + 5; i++) snap = reduceSessionEvent(snap, { type: "turn_start", at: i, n: i });
+    expect(snap.events).toHaveLength(SESSION_EVENT_CAP);
+    expect(snap.events[0]).toEqual({ type: "turn_start", at: 6, n: 6 });
+    expect(snap.version).toBe(SESSION_EVENT_CAP + 5);
+  });
+});
+
+describe("the store", () => {
+  it("returns a stable empty snapshot until an event lands", () => {
+    const a = getSessionEventSnapshot("s1");
+    expect(a).toBe(getSessionEventSnapshot("s1"));
+    expect(a.status).toBe(UNKNOWN_STATUS);
+    expect(sessionIdsWithEvents()).toEqual([]);
+    dispatchSessionEvent("s1", status("working"));
+    const b = getSessionEventSnapshot("s1");
+    expect(b).not.toBe(a);
+    expect(b).toBe(getSessionEventSnapshot("s1"));
+    expect(sessionIdsWithEvents()).toEqual(["s1"]);
+  });
+
+  it("wakes only the subscribers of the session that changed", () => {
+    const s1 = vi.fn();
+    const s2 = vi.fn();
+    const off = subscribeSessionEvents("s1", s1);
+    subscribeSessionEvents("s2", s2);
+    dispatchSessionEvent("s1", status("working"));
+    expect(s1).toHaveBeenCalledTimes(1);
+    expect(s2).not.toHaveBeenCalled();
+    off();
+    dispatchSessionEvent("s1", status("idle"));
+    expect(s1).toHaveBeenCalledTimes(1);
+  });
+
+  it("forgets a cleared session and tells its subscribers", () => {
+    const l = vi.fn();
+    subscribeSessionEvents("s1", l);
+    dispatchSessionEvent("s1", status("working"));
+    clearSessionEvents("s1");
+    expect(l).toHaveBeenCalledTimes(2);
+    expect(getSessionEventSnapshot("s1").version).toBe(0);
+    expect(sessionIdsWithEvents()).toEqual([]);
+  });
+});
+
+describe("useSessionEvents", () => {
+  it("re-renders with the new snapshot of its session only", () => {
+    const { result, rerender } = renderHook(({ id }) => useSessionEvents(id), { initialProps: { id: "s1" } });
+    expect(result.current.version).toBe(0);
+    act(() => {
+      dispatchSessionEvent("s2", status("working"));
+    });
+    expect(result.current.version).toBe(0);
+    act(() => {
+      dispatchSessionEvent("s1", status("needs_answer"));
+    });
+    expect(result.current.status.kind).toBe("needs_answer");
+    rerender({ id: "s2" });
+    expect(result.current.status.kind).toBe("working");
+  });
+});
+
+describe("the Rust -> frontend channel", () => {
+  it("folds a well-formed envelope into the store and refuses the rest", () => {
+    expect(receiveSessionEventEnvelope({ sessionId: "s1", event: status("working") })).toBe(true);
+    expect(getSessionEventSnapshot("s1").status.kind).toBe("working");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(receiveSessionEventEnvelope({ sessionId: "s1", event: { type: "nope", at: 1 } })).toBe(false);
+    expect(receiveSessionEventEnvelope({ sessionId: "", event: status("idle") })).toBe(false);
+    expect(receiveSessionEventEnvelope("junk")).toBe(false);
+    expect(receiveSessionEventEnvelope(null)).toBe(false);
+    warn.mockRestore();
+    expect(getSessionEventSnapshot("s1").version).toBe(1);
+  });
+
+  it("listens once on the one channel and feeds the store", async () => {
+    const handlers: Array<(msg: { payload: unknown }) => void> = [];
+    const listen = vi.fn(async (name: string, handler: (msg: { payload: unknown }) => void) => {
+      expect(name).toBe(SESSION_EVENT_CHANNEL);
+      handlers.push(handler);
+      return () => {};
+    });
+    await startSessionEventChannel(listen as never);
+    await startSessionEventChannel(listen as never);
+    expect(listen).toHaveBeenCalledTimes(1);
+    handlers[0]({ payload: { sessionId: "s9", event: { type: "identity", at: 1, vendorSessionId: null, model: "m9", permissionMode: null } } });
+    expect(getSessionEventSnapshot("s9").identity.model).toBe("m9");
+  });
+});
+
+describe("listening to every session (F36 addition)", () => {
+  it("hears every accepted event after the store has it, with the snapshot before and after", () => {
+    const heard: Array<[string, string, number, number]> = [];
+    const off = subscribeAllSessionEvents((sessionId, event, next, prev) => {
+      expect(getSessionEventSnapshot(sessionId)).toBe(next);
+      heard.push([sessionId, event?.type ?? "cleared", prev.version, next.version]);
+    });
+    dispatchSessionEvent("a", status("working"));
+    dispatchSessionEvent("b", { type: "attention", at: 2, detail: "x" });
+    dispatchSessionEvent("a", { type: "exit", at: 3, code: 0, signal: null });
+    clearSessionEvents("b");
+    off();
+    dispatchSessionEvent("a", status("idle"));
+    expect(heard).toEqual([
+      ["a", "status", 0, 1],
+      ["b", "attention", 0, 1],
+      ["a", "exit", 1, 2],
+      // A cleared session: no event, the empty snapshot after it.
+      ["b", "cleared", 1, 0],
+    ]);
+  });
+
+  it("a listener that throws stops neither the store, the per-session subscribers nor the others", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const perSession = vi.fn();
+    const other = vi.fn();
+    subscribeSessionEvents("a", perSession);
+    subscribeAllSessionEvents(() => {
+      throw new Error("bad listener");
+    });
+    subscribeAllSessionEvents(other);
+    expect(() => dispatchSessionEvent("a", status("working"))).not.toThrow();
+    expect(getSessionEventSnapshot("a").status.kind).toBe("working");
+    expect(perSession).toHaveBeenCalledTimes(1);
+    expect(other).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+});
+
+describe("tapSessionEvents (additive, F27)", () => {
+  beforeEach(() => _resetSessionEventStoreForTest());
+
+  it("sees every session's accepted events after the snapshot moved, until unsubscribed", () => {
+    const seen: string[] = [];
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const bad = tapSessionEvents(() => {
+      throw new Error("a broken tap");
+    });
+    const off = tapSessionEvents((sessionId, event, snap) => {
+      seen.push(`${sessionId}:${event.type}:${snap.version}`);
+    });
+    dispatchSessionEvent("a", { type: "turn_start", at: 1, n: 1 });
+    dispatchSessionEvent("b", { type: "turn_end", at: 2, n: 4 });
+    off();
+    bad();
+    dispatchSessionEvent("a", { type: "turn_end", at: 3, n: 1 });
+    expect(seen).toEqual(["a:turn_start:1", "b:turn_end:1"]);
+    expect(warn).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
+  });
+});

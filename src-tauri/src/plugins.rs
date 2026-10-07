@@ -2,16 +2,14 @@ use serde::Serialize;
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
-use tauri::{Manager, State};
+use tauri::State;
 
+use crate::plugin_identity::PluginIdentityState;
 use crate::AppState;
 
 /// Returns the plugins directory path inside the app data directory.
 fn plugins_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let data_dir = crate::instance::app_data_dir(app)?;
     Ok(data_dir.join("plugins"))
 }
 
@@ -24,8 +22,14 @@ pub struct InstalledPlugin {
 
 /// List all installed plugins by scanning the plugins directory.
 /// Each plugin is a subdirectory containing a `hermes-plugin.json` manifest.
+/// Host only: a plugin has no business enumerating its neighbours.
 #[tauri::command]
-pub fn list_installed_plugins(app: tauri::AppHandle) -> Result<Vec<InstalledPlugin>, String> {
+pub fn list_installed_plugins(
+    app: tauri::AppHandle,
+    host_key: String,
+    identity: State<'_, PluginIdentityState>,
+) -> Result<Vec<InstalledPlugin>, String> {
+    identity.require_host(&host_key)?;
     let dir = plugins_dir(&app)?;
     if !dir.exists() {
         return Ok(vec![]);
@@ -83,9 +87,15 @@ pub fn list_installed_plugins(app: tauri::AppHandle) -> Result<Vec<InstalledPlug
     Ok(plugins)
 }
 
-/// Read the JavaScript bundle for a plugin.
+/// Read the JavaScript bundle for a plugin. Host only.
 #[tauri::command]
-pub fn read_plugin_bundle(app: tauri::AppHandle, plugin_dir: String) -> Result<String, String> {
+pub fn read_plugin_bundle(
+    app: tauri::AppHandle,
+    plugin_dir: String,
+    host_key: String,
+    identity: State<'_, PluginIdentityState>,
+) -> Result<String, String> {
+    identity.require_host(&host_key)?;
     let dir = plugins_dir(&app)?;
     let plugin_path = dir.join(&plugin_dir);
 
@@ -126,9 +136,14 @@ pub fn read_plugin_bundle(app: tauri::AppHandle, plugin_dir: String) -> Result<S
         .map_err(|e| format!("Failed to read plugin bundle: {}", e))
 }
 
-/// Get the plugins directory path.
+/// Get the plugins directory path. Host only.
 #[tauri::command]
-pub fn get_plugins_dir(app: tauri::AppHandle) -> Result<String, String> {
+pub fn get_plugins_dir(
+    app: tauri::AppHandle,
+    host_key: String,
+    identity: State<'_, PluginIdentityState>,
+) -> Result<String, String> {
+    identity.require_host(&host_key)?;
     let dir = plugins_dir(&app)?;
 
     // Create the directory if it doesn't exist
@@ -139,9 +154,15 @@ pub fn get_plugins_dir(app: tauri::AppHandle) -> Result<String, String> {
     Ok(dir.to_string_lossy().to_string())
 }
 
-/// Uninstall a plugin by removing its directory.
+/// Uninstall a plugin by removing its directory. Host only.
 #[tauri::command]
-pub fn uninstall_plugin(app: tauri::AppHandle, plugin_dir: String) -> Result<(), String> {
+pub fn uninstall_plugin(
+    app: tauri::AppHandle,
+    plugin_dir: String,
+    host_key: String,
+    identity: State<'_, PluginIdentityState>,
+) -> Result<(), String> {
+    identity.require_host(&host_key)?;
     let dir = plugins_dir(&app)?;
     let plugin_path = dir.join(&plugin_dir);
 
@@ -161,10 +182,20 @@ pub fn uninstall_plugin(app: tauri::AppHandle, plugin_dir: String) -> Result<(),
 }
 
 /// Install a plugin from a .tgz archive (raw bytes from frontend fetch).
-/// Extracts to plugins directory under the plugin's ID.
+/// Extracts to plugins directory under the plugin's ID. Host only.
 #[tauri::command]
-pub fn install_plugin(app: tauri::AppHandle, data: Vec<u8>) -> Result<String, String> {
-    let dir = plugins_dir(&app)?;
+pub fn install_plugin(
+    app: tauri::AppHandle,
+    data: Vec<u8>,
+    host_key: String,
+    identity: State<'_, PluginIdentityState>,
+) -> Result<String, String> {
+    identity.require_host(&host_key)?;
+    install_plugin_bytes(&app, data)
+}
+
+fn install_plugin_bytes(app: &tauri::AppHandle, data: Vec<u8>) -> Result<String, String> {
+    let dir = plugins_dir(app)?;
     if !dir.exists() {
         fs::create_dir_all(&dir).map_err(|e| format!("Failed to create plugins dir: {}", e))?;
     }
@@ -239,9 +270,15 @@ pub fn install_plugin(app: tauri::AppHandle, data: Vec<u8>) -> Result<String, St
 }
 
 /// Fetch the plugin registry JSON from a URL.
-/// Done in Rust to bypass WebView CSP restrictions.
+/// Done in Rust to bypass WebView CSP restrictions. Host only: without the
+/// key this would be a free GET for any plugin, granted "network" or not.
 #[tauri::command]
-pub async fn fetch_plugin_registry(url: String) -> Result<String, String> {
+pub async fn fetch_plugin_registry(
+    url: String,
+    host_key: String,
+    identity: State<'_, PluginIdentityState>,
+) -> Result<String, String> {
+    identity.require_host(&host_key)?;
     let response = reqwest::get(&url)
         .await
         .map_err(|e| format!("Registry fetch failed: {}", e))?;
@@ -256,13 +293,16 @@ pub async fn fetch_plugin_registry(url: String) -> Result<String, String> {
         .map_err(|e| format!("Failed to read registry: {}", e))
 }
 
-/// Download a plugin .tgz from a URL and install it.
+/// Download a plugin .tgz from a URL and install it. Host only.
 /// The download happens in Rust to bypass WebView CSP restrictions.
 #[tauri::command]
 pub async fn download_and_install_plugin(
     app: tauri::AppHandle,
     url: String,
+    host_key: String,
+    identity: State<'_, PluginIdentityState>,
 ) -> Result<String, String> {
+    identity.require_host(&host_key)?;
     let response = reqwest::get(&url)
         .await
         .map_err(|e| format!("Download failed: {}", e))?;
@@ -276,7 +316,7 @@ pub async fn download_and_install_plugin(
         .await
         .map_err(|e| format!("Failed to read response: {}", e))?;
 
-    install_plugin(app, bytes.to_vec())
+    install_plugin_bytes(&app, bytes.to_vec())
 }
 
 fn find_manifest_in_dir(dir: &std::path::Path) -> Result<(PathBuf, String), String> {
@@ -309,14 +349,17 @@ fn find_manifest_in_dir(dir: &std::path::Path) -> Result<(PathBuf, String), Stri
 }
 
 /// Fetch a URL and return the response body as a string.
-/// Used by plugins with the "network" permission.
+/// Used by plugins with the "network" permission. The caller is identified
+/// by its plugin token, never by a name it supplies.
 #[tauri::command]
 pub async fn plugin_fetch_url(
     url: String,
     headers: Option<std::collections::HashMap<String, String>>,
-    plugin_id: String,
+    plugin_token: String,
     state: State<'_, AppState>,
+    identity: State<'_, PluginIdentityState>,
 ) -> Result<String, String> {
+    let plugin_id = identity.plugin_for(&plugin_token)?;
     {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         if !db.has_plugin_permission(&plugin_id, "network")? {
@@ -351,15 +394,17 @@ pub async fn plugin_fetch_url(
 }
 
 /// POST JSON to a URL and return the response body as a string.
-/// Used by plugins with the "network" permission.
+/// Used by plugins with the "network" permission. Token-bound.
 #[tauri::command]
 pub async fn plugin_post_json(
     url: String,
     body: String,
     headers: Option<std::collections::HashMap<String, String>>,
-    plugin_id: String,
+    plugin_token: String,
     state: State<'_, AppState>,
+    identity: State<'_, PluginIdentityState>,
 ) -> Result<String, String> {
+    let plugin_id = identity.plugin_for(&plugin_token)?;
     {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         if !db.has_plugin_permission(&plugin_id, "network")? {
@@ -396,14 +441,16 @@ pub async fn plugin_post_json(
 }
 
 /// Execute a shell command and return its output.
-/// Used by plugins with the "shell.exec" permission.
+/// Used by plugins with the "shell.exec" permission. Token-bound.
 #[tauri::command]
 pub async fn plugin_exec_command(
     command: String,
     args: Vec<String>,
-    plugin_id: String,
+    plugin_token: String,
     state: State<'_, AppState>,
+    identity: State<'_, PluginIdentityState>,
 ) -> Result<PluginExecResult, String> {
+    let plugin_id = identity.plugin_for(&plugin_token)?;
     {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         if !db.has_plugin_permission(&plugin_id, "shell.exec")? {

@@ -4,6 +4,7 @@ import { ensureListener, registerMenuBarHandler } from "./nativeMenuBridge";
 import { PLATFORM, OS_VERSION } from "../utils/platform";
 import { trackFeatureUsed } from "../utils/analytics";
 import { clearTerminal } from "../terminal/TerminalPool";
+import { closeTopOverlay, topOverlay } from "../state/overlays";
 
 const TRACKED_ACTIONS: Record<string, string> = {
   "view.git-panel": "git_panel",
@@ -19,11 +20,21 @@ const TRACKED_ACTIONS: Record<string, string> = {
   "file.file-explorer": "file_explorer",
 };
 
+/** Window keys that do nothing while an overlay is open (they act on panes and sessions behind it). */
+const OVERLAY_BLOCKED_ACTIONS = new Set([
+  "file.new-session-tab",
+  "view.split-horizontal",
+  "view.split-vertical",
+  "session.close-session",
+]);
+
 // ─── Menu Bar Action → React Dispatch Bridge ────────────────────────
 
 interface MenuEventHandlers {
   dispatch: (action: any) => void;
   createSession: () => void;
+  /** The full creator (SSH, tmux, an existing branch); ⌘⇧N. */
+  createSessionAdvanced: () => void;
   createSessionDirect: () => void;
   requestCloseSession: (id: string) => void;
   activeSessionId: string | null;
@@ -36,12 +47,15 @@ interface MenuEventHandlers {
   pendingSplit: React.MutableRefObject<{ paneId: string; direction: string } | null>;
   onCheckForUpdates: () => void;
   commandPaletteShortcut: string;
+  /** F21: with the reviewDesk flag on, ⌘G opens the Review Desk instead of the git panel. */
+  toggleReviewDesk?: () => void;
 }
 
 export function useNativeMenuEvents(handlers: MenuEventHandlers): void {
   const {
     dispatch,
     createSession,
+    createSessionAdvanced,
     createSessionDirect,
     activeSessionId,
     focusedPaneId,
@@ -54,6 +68,7 @@ export function useNativeMenuEvents(handlers: MenuEventHandlers): void {
     requestCloseSession,
     onCheckForUpdates,
     commandPaletteShortcut,
+    toggleReviewDesk,
   } = handlers;
 
   const onMenuAction = useCallback(
@@ -61,10 +76,25 @@ export function useNativeMenuEvents(handlers: MenuEventHandlers): void {
       const trackedFeature = TRACKED_ACTIONS[actionId];
       if (trackedFeature) trackFeatureUsed(trackedFeature);
 
+      // An overlay (the launcher, the palette, Settings…) is in front: the
+      // window keys act on it, never on the workspace hidden behind it.
+      // ⌘W closes it (the launcher keeps its draft); the keys that would
+      // add, split or end a pane or a session do nothing.
+      if (topOverlay()) {
+        if (actionId === "file.close-pane") {
+          closeTopOverlay();
+          return;
+        }
+        if (OVERLAY_BLOCKED_ACTIONS.has(actionId)) return;
+      }
+
       switch (actionId) {
         // ── File menu ──
         case "file.new-session":
           createSession();
+          break;
+        case "file.new-session-advanced":
+          createSessionAdvanced();
           break;
         case "file.new-session-tab":
           createSessionDirect();
@@ -75,6 +105,9 @@ export function useNativeMenuEvents(handlers: MenuEventHandlers): void {
           } else if (activeSessionId) {
             requestCloseSession(activeSessionId);
           }
+          break;
+        case "session.close-session":
+          if (activeSessionId) requestCloseSession(activeSessionId);
           break;
         case "file.file-explorer":
           dispatch({ type: "TOGGLE_FILE_EXPLORER" });
@@ -98,14 +131,20 @@ export function useNativeMenuEvents(handlers: MenuEventHandlers): void {
           }
           break;
         case "view.prompt-composer":
-          dispatch({ type: "CLOSE_PALETTE" });
-          dispatch({ type: "OPEN_COMPOSER" });
+          // ⌘J: Prompts. In the launcher it opens the launcher's own; pressed again it closes.
+          if (topOverlay() === "launcher") window.dispatchEvent(new CustomEvent("hermes:launcher-prompts"));
+          else if (topOverlay() === "prompts") closeTopOverlay();
+          else {
+            dispatch({ type: "CLOSE_PALETTE" });
+            dispatch({ type: "OPEN_COMPOSER" });
+          }
           break;
         case "view.process-panel":
           dispatch({ type: "TOGGLE_PROCESS_PANEL" });
           break;
         case "view.git-panel":
-          dispatch({ type: "TOGGLE_GIT_PANEL" });
+          if (toggleReviewDesk) toggleReviewDesk();
+          else dispatch({ type: "TOGGLE_GIT_PANEL" });
           break;
         case "view.context-panel":
           dispatch({ type: "TOGGLE_CONTEXT" });
@@ -180,6 +219,7 @@ export function useNativeMenuEvents(handlers: MenuEventHandlers): void {
     [
       dispatch,
       createSession,
+      createSessionAdvanced,
       createSessionDirect,
       activeSessionId,
       focusedPaneId,
@@ -192,6 +232,7 @@ export function useNativeMenuEvents(handlers: MenuEventHandlers): void {
       requestCloseSession,
       onCheckForUpdates,
       commandPaletteShortcut,
+      toggleReviewDesk,
     ],
   );
 

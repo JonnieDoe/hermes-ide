@@ -1,0 +1,131 @@
+/* ─── First-launch setup: agents, repo, first task (F16) ───────────────
+ * Layout only: the buttons, fields, radios and checkbox are controls from
+ * src/components/ui (docs/design-system/06-components.md · Controls).
+ * ──────────────────────────────────────────────────────────────────── */
+
+.setup-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--shadow-tint) 62%, transparent);
+}
+
+.setup-dialog {
+  width: min(94vw, calc(var(--space-1) * 180));
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-1);
+  border: var(--control-border-width) solid var(--border-light);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-4);
+  overflow: hidden;
+  color: var(--text-1);
+  font-size: var(--text-sm);
+}
+
+.setup-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-3) var(--space-2);
+  border-bottom: var(--control-border-width) solid var(--border);
+}
+.setup-title { font-size: var(--text-lg); font-weight: var(--weight-semibold); color: var(--text-0); }
+.setup-step { color: var(--text-3); font-size: var(--text-xs); }
+
+.setup-body {
+  padding: var(--space-3);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.setup-intro { margin: 0; color: var(--text-1); line-height: var(--leading-normal); }
+
+.setup-section-label {
+  color: var(--text-3);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-widest);
+  margin-bottom: var(--space-1);
+}
+
+.setup-recent { display: flex; flex-direction: column; }
+.setup-repo-path { font-family: var(--font-code); font-size: var(--text-xs); }
+
+.setup-repo-row { display: flex; gap: var(--space-2); }
+.setup-repo-input { flex: 1; }
+
+.setup-repo-state { font-size: var(--text-xs); overflow-wrap: anywhere; }
+.setup-repo-state.ok { color: var(--success-ink); }
+.setup-repo-state.bad { color: var(--warning-ink); }
+.setup-repo-resolved { color: var(--text-2); font-family: var(--font-code); }
+
+/* "Finish setup first": a menu key pressed behind the unfinished welcome. */
+.setup-nudge { color: var(--warning-ink); font-size: var(--text-xs); }
+.setup-dialog--nudge { border-color: var(--warning-ink); }
+
+/* Finish with a task typed: start it, keep it for ⌘N, or drop it. */
+.setup-ask {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  border: var(--control-border-width) solid var(--chip-selected-border);
+  background: var(--chip-selected-bg);
+  color: var(--text-0);
+}
+.setup-ask-actions { display: flex; gap: var(--space-2); }
+
+.setup-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-top: var(--control-border-width) solid var(--border);
+}
+.setup-footer-note { display: flex; flex-direction: column; gap: var(--space-0-5); font-size: var(--text-xs); }
+.setup-usage { color: var(--text-1); }
+.setup-muted { color: var(--text-3); }
+.setup-actions { display: flex; gap: var(--space-2); }
+
+.setup-pill {
+  position: fixed;
+  right: var(--space-4);
+  bottom: calc(var(--space-1) * 9);
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: min(90vw, calc(var(--space-1) * 120));
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-1);
+  border: var(--control-border-width) solid var(--primary-bg);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-3);
+  color: var(--text-0);
+  font-size: var(--text-sm);
+}
+
+/* The Privacy Policy acceptance (step 1), as in the classic welcome. */
+.setup-policy {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 var(--space-2);
+  margin-top: var(--space-3);
+}
+.setup-policy-link { color: var(--link-fg); }
+.setup-policy-hint {
+  flex-basis: 100%;
+  font-size: var(--text-xs);
+  color: var(--text-3);
+}

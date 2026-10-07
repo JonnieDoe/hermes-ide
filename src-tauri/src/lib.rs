@@ -1,18 +1,52 @@
 mod agent;
+pub mod agent_caps;
+mod agent_catalog;
+mod agent_doctor;
+mod agent_setup;
+mod analytics;
+mod attention;
 mod claude_config;
 mod clipboard;
+mod context_usage;
+pub mod contract;
 mod db;
+pub mod done_when;
+#[cfg(feature = "e2e")]
+mod e2e_bridge;
+#[cfg(any(test, feature = "e2e"))]
+#[cfg_attr(not(feature = "e2e"), allow(dead_code))]
+mod e2e_evidence;
+#[cfg(any(test, feature = "e2e"))]
+#[cfg_attr(not(feature = "e2e"), allow(dead_code))]
+mod e2e_protocol;
+mod fleet;
+mod fleet_perf;
 mod git;
 mod inline_pty;
+mod instance;
+mod land;
+mod library;
+mod limits;
 mod menu;
 mod platform;
+mod plugin_features;
+mod plugin_identity;
 mod plugins;
 mod process;
 mod project;
 /// Exposed for benchmarks — not part of the public API.
 #[doc(hidden)]
 pub mod pty;
+mod quit_flush;
+mod review;
+mod saved_workspace;
+mod self_test;
+mod session_host;
+mod task_launcher;
+mod track;
 mod transcript;
+mod turn_ledger;
+mod updater;
 mod workspace;
 
 use std::collections::HashSet;
@@ -67,18 +101,57 @@ fn install_crash_handler() {
 
 static WORKSPACE_SAVED: AtomicBool = AtomicBool::new(false);
 
+/// Whether a `session_worktrees` link whose folder is missing (and whose
+/// session still exists) is kept for `create_session` to put the worktree
+/// back: only a worktree Hermes made, on a branch that still exists, for a
+/// session the next launch restores (`restored`: it is in the saved
+/// workspace). A link kept for a session nobody restores would linger, and
+/// be reported at every startup, for ever.
+fn keep_missing_worktree_link(
+    restored: bool,
+    is_main_worktree: bool,
+    worktree_path: &str,
+    project_path: Option<&str>,
+    branch: Option<&str>,
+) -> bool {
+    if !restored
+        || !git::worktree::isolation_fixes_enabled()
+        || !git::worktree::is_owned_checkout(is_main_worktree, worktree_path)
+    {
+        return false;
+    }
+    match (project_path, branch) {
+        (Some(repo), Some(branch)) => git::worktree::local_branch_exists(repo, branch),
+        _ => false,
+    }
+}
+
+/// The ids of the sessions the saved workspace (the `saved_workspace`
+/// setting the frontend writes) restores at the next launch. Empty when
+/// there is no saved workspace or it cannot be read: then nothing is
+/// restored.
+pub(crate) fn saved_workspace_session_ids(saved_workspace: Option<&str>) -> HashSet<String> {
+    saved_workspace
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|v| v.get("sessions")?.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|s| s.get("id")?.as_str().map(str::to_string))
+        .collect()
+}
+
 /// Clean up worktrees whose sessions no longer exist, remove orphaned
 /// directories, and replay incomplete journal operations.
 ///
 /// Called once during app startup. For each `session_worktrees` record whose
 /// session is missing from the `sessions` table, we remove the git worktree
 /// from disk (if it is a linked worktree) and delete the DB record. We also
-/// scan both default and custom worktree directories for orphans that have
+/// scan `{app_data_dir}/hermes-worktrees/` directories for orphans that have
 /// no DB record, and replay any incomplete journal operations from prior
 /// crashes. Finally, we run `git worktree prune` on every repo that had
 /// stale entries and emit a cleanup summary event to the frontend.
 fn cleanup_stale_worktrees(app: &tauri::AppHandle, database: &db::Database) {
-    let app_data_dir = match app.path().app_data_dir() {
+    let app_data_dir = match instance::app_data_dir(app) {
         Ok(dir) => dir,
         Err(e) => {
             log::warn!(
@@ -88,13 +161,6 @@ fn cleanup_stale_worktrees(app: &tauri::AppHandle, database: &db::Database) {
             return;
         }
     };
-
-    let custom_base = database
-        .get_setting("worktree_base_path")
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from);
 
     let all_worktrees = match database.get_all_session_worktrees() {
         Ok(wts) => wts,
@@ -120,15 +186,19 @@ fn cleanup_stale_worktrees(app: &tauri::AppHandle, database: &db::Database) {
             wt.worktree_path, wt.session_id
         );
 
-        // Only remove linked worktrees from disk, not main worktrees
-        if !wt.is_main_worktree {
+        // Only remove worktrees Hermes made from disk: not the project
+        // folder, not a checkout made outside Hermes that the session
+        // reused, and never a checkout another session still points at.
+        let shared = database
+            .count_sessions_for_worktree_path(&wt.worktree_path)
+            .map(|n| n > 1)
+            .unwrap_or(true);
+        if git::worktree::is_owned_checkout(wt.is_main_worktree, &wt.worktree_path) && !shared {
             if let Ok(Some(project_entry)) = database.get_project(&wt.project_id) {
-                let wt_base = git::resolve_worktree_base(database, Some(&wt.session_id), Some(&wt.project_id));
                 if let Err(e) = git::worktree::remove_worktree(
                     &project_entry.path,
                     &wt.session_id,
                     &wt.worktree_path,
-                    wt_base.as_deref(),
                 ) {
                     log::warn!(
                         "Startup worktree cleanup: failed to remove worktree '{}': {}",
@@ -156,6 +226,13 @@ fn cleanup_stale_worktrees(app: &tauri::AppHandle, database: &db::Database) {
     // Re-fetch from DB since some records may have been deleted above.
     let remaining_worktrees = database.get_all_session_worktrees().unwrap_or_default();
     let mut missing_paths: Vec<serde_json::Value> = Vec::new();
+    let restored_sessions = saved_workspace_session_ids(
+        database
+            .get_setting("saved_workspace")
+            .ok()
+            .flatten()
+            .as_deref(),
+    );
 
     for wt in &remaining_worktrees {
         if wt.is_main_worktree {
@@ -169,6 +246,29 @@ fn cleanup_stale_worktrees(app: &tauri::AppHandle, database: &db::Database) {
                 wt.session_id,
                 wt.branch_name.as_deref().unwrap_or("unknown")
             );
+
+            // A worktree Hermes made whose branch still exists is put back
+            // when its session is restored (create_session), so its link
+            // must survive: dropping it here left the restored session with
+            // a folder that did not exist, stuck at "starting".
+            let project_path = database
+                .get_project(&wt.project_id)
+                .ok()
+                .flatten()
+                .map(|p| p.path);
+            if keep_missing_worktree_link(
+                restored_sessions.contains(&wt.session_id),
+                wt.is_main_worktree,
+                &wt.worktree_path,
+                project_path.as_deref(),
+                wt.branch_name.as_deref(),
+            ) {
+                log::info!(
+                    "Startup worktree cleanup: keeping the link; the worktree is recreated when session '{}' is restored",
+                    wt.session_id
+                );
+                continue;
+            }
 
             // Delete only the session_worktrees DB record — never touch the project or session
             if let Err(e) = database.delete_session_worktree(&wt.id) {
@@ -215,62 +315,39 @@ fn cleanup_stale_worktrees(app: &tauri::AppHandle, database: &db::Database) {
             .collect();
 
         for proj in &projects {
-            let mut bases: Vec<Option<&Path>> = vec![None]; // None represents default base
-            if let Some(ref gb) = custom_base {
-                bases.push(Some(gb.as_path()));
+            let wt_dir = git::worktree::worktree_dir(&app_data_dir, &proj.path);
+            if !wt_dir.is_dir() {
+                continue;
             }
-            if let Some(ref pb) = proj.worktree_base_path {
-                if !pb.trim().is_empty() {
-                    bases.push(Some(Path::new(pb)));
-                }
-            }
-            bases.dedup();
 
-            for base in bases {
-                let wt_dir = git::worktree::worktree_dir(&app_data_dir, &proj.path, base);
-                if !wt_dir.is_dir() {
-                    continue;
-                }
+            if let Ok(entries) = std::fs::read_dir(&wt_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    // Skip non-directories and marker files (repo_path.txt)
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let path_str = path.to_string_lossy().to_string();
 
-                if let Ok(entries) = std::fs::read_dir(&wt_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        // Skip non-directories and marker files (repo_path.txt)
-                        if !path.is_dir() {
-                            continue;
-                        }
-                        let path_str = path.to_string_lossy().to_string();
-
-                        // Check if this directory has a DB record
-                        if !known_paths.contains(&path_str) {
-                            log::info!("Removing orphaned worktree directory: {}", path_str);
-                            // Try git worktree prune first, then remove directory
-                            let _ = std::process::Command::new("git")
-                                .arg("-C")
-                                .arg(&proj.path)
-                                .arg("worktree")
-                                .arg("prune")
-                                .output();
-                            match std::fs::remove_dir_all(&path) {
-                                Ok(_) => {
-                                    cleanup_count += 1;
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "[worktree-cleanup] Failed to remove orphan {}: {}",
-                                        path_str,
-                                        e
-                                    );
-                                }
-                            }
-                        }
+                    // Check if this directory has a DB record. Only a folder
+                    // git vouches has nothing to lose goes now; anything else
+                    // stays for Settings > Storage (backup first, the
+                    // person decides).
+                    if !known_paths.contains(&path_str)
+                        && git::hygiene::remove_orphan_if_nothing_to_lose(
+                            &app_data_dir,
+                            Path::new(&proj.path),
+                            &path,
+                        )
+                    {
+                        log::info!("Removed orphaned worktree directory: {}", path_str);
+                        cleanup_count += 1;
                     }
                 }
             }
 
             // Replay incomplete journal operations for this project
-            let incomplete =
-                git::journal::get_incomplete_operations(&app_data_dir, &proj.path, custom_base.as_deref());
+            let incomplete = git::journal::get_incomplete_operations(&app_data_dir, &proj.path);
             for entry in &incomplete {
                 match entry.action.as_str() {
                     "CREATE" => {
@@ -296,24 +373,22 @@ fn cleanup_stale_worktrees(app: &tauri::AppHandle, database: &db::Database) {
                             }
                         }
                     }
-                    "REMOVE" => {
-                        // Incomplete removal — worktree may still exist on disk
-                        if Path::new(&entry.worktree_path).is_dir() {
-                            log::info!(
-                                "Replaying incomplete REMOVE: cleaning up {}",
-                                entry.worktree_path
-                            );
-                            match std::fs::remove_dir_all(&entry.worktree_path) {
-                                Ok(_) => {
-                                    cleanup_count += 1;
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "[worktree-cleanup] Failed to remove {}: {}",
-                                        entry.worktree_path,
-                                        e
-                                    );
-                                }
+                    // Incomplete removal — worktree may still exist on disk
+                    "REMOVE" if Path::new(&entry.worktree_path).is_dir() => {
+                        log::info!(
+                            "Replaying incomplete REMOVE: cleaning up {}",
+                            entry.worktree_path
+                        );
+                        match std::fs::remove_dir_all(&entry.worktree_path) {
+                            Ok(_) => {
+                                cleanup_count += 1;
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "[worktree-cleanup] Failed to remove {}: {}",
+                                    entry.worktree_path,
+                                    e
+                                );
                             }
                         }
                     }
@@ -338,7 +413,7 @@ fn cleanup_stale_worktrees(app: &tauri::AppHandle, database: &db::Database) {
             }
             if all_cleaned {
                 // Only clear the journal once we've verified all orphans are gone
-                git::journal::clear_journal(&app_data_dir, &proj.path, custom_base.as_deref());
+                git::journal::clear_journal(&app_data_dir, &proj.path);
             } else {
                 log::warn!(
                     "[worktree-cleanup] Keeping journal for '{}' — some orphans were not cleaned",
@@ -359,7 +434,7 @@ fn cleanup_stale_worktrees(app: &tauri::AppHandle, database: &db::Database) {
                     proj.path
                 );
                 // Prune git worktree metadata first
-                let _ = std::process::Command::new("git")
+                let _ = crate::git::cli::git_command()
                     .arg("-C")
                     .arg(&proj.path)
                     .arg("worktree")
@@ -403,15 +478,20 @@ pub struct AppState {
     pub sys: Mutex<sysinfo::System>,
     pub startup_marker_path: std::path::PathBuf,
     pub worktree_watcher: Mutex<Option<git::watcher::WorktreeWatcher>>,
+    /// Sessions closed in this run; kept out of the saved workspace.
+    pub closed_sessions: saved_workspace::ClosedSessions,
 }
 
 /// Save scrollback snapshots and session metadata to DB on close.
-/// The frontend auto-save handles `saved_workspace` (with layout data).
+/// The frontend auto-save handles `saved_workspace` (with layout data); here
+/// it only loses the sessions closed in this run, which a quit shortly after
+/// the close would otherwise bring back on the next launch.
 fn do_save_workspace(app: &tauri::AppHandle) {
     let state = match app.try_state::<AppState>() {
         Some(s) => s,
         None => return,
     };
+    let closed = state.closed_sessions.snapshot();
     let mgr = match state.pty_manager.lock() {
         Ok(m) => m,
         Err(poisoned) => {
@@ -423,6 +503,13 @@ fn do_save_workspace(app: &tauri::AppHandle) {
         Ok(d) => d,
         Err(_) => return,
     };
+
+    if let Err(e) = saved_workspace::prune_stored(&db, &closed) {
+        log::error!(
+            "Failed to drop closed sessions from the saved workspace: {}",
+            e
+        );
+    }
 
     for (session_id, pty_session) in &mgr.sessions {
         // Save session metadata first (INSERT OR REPLACE resets the row)
@@ -466,22 +553,70 @@ fn do_save_workspace(app: &tauri::AppHandle) {
 }
 
 /// Save workspace on close — full save with snapshots, runs once.
-fn save_workspace_state(app: &tauri::AppHandle) {
+pub(crate) fn save_workspace_state(app: &tauri::AppHandle) {
     if WORKSPACE_SAVED.swap(true, Ordering::SeqCst) {
         return;
     }
     do_save_workspace(app);
 
-    // Remove the startup marker to signal a clean shutdown
+    fold_database_log(app);
     if let Some(state) = app.try_state::<AppState>() {
+        // Remove the startup marker to signal a clean shutdown
         let _ = std::fs::remove_file(&state.startup_marker_path);
     }
 }
 
+/// Everything saved goes into the database file itself (CHAOS-14). Runs on
+/// the first save at quit and again at the very end: a quit answered in the
+/// keep-or-stop dialog saves first, and the frontend's own save and the
+/// stopped sessions write after that.
+fn fold_database_log(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(db) = state.db.lock() {
+            if let Err(e) = db.checkpoint_wal() {
+                log::warn!("[hermes] could not fold the database log on quit: {e}");
+            }
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Windows: `hermes-ide --hermes-interrupt-console <pid>` is the short-lived
+/// helper that raises a console's Ctrl+C event for a spend cap (see
+/// `fleet::interrupt_session_agent`). Returns its exit code; `None` means
+/// start the app. `main` asks before anything else starts.
+pub fn run_console_interrupt_helper() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    fleet::console_interrupt_helper(&args)
+}
+
 pub fn run() {
     env_logger::init();
+    // Before any terminal starts: shells and agents inherit this limit, and
+    // an app opened from the Dock gets only 256 open files.
+    #[cfg(unix)]
+    if let Some((old, new)) = hermes_pty_host::fdlimit::raise_open_files_limit() {
+        log::info!("[startup] open-files limit raised from {old} to {new}");
+    }
     install_crash_handler();
+    fleet::let_terminals_receive_ctrl_c();
+
+    // Decide which instance this is before anything touches app data: a dev,
+    // beta or test build must never open the installed app's data folder.
+    let context = tauri::generate_context!();
+    match instance::init(&context.config().identifier) {
+        Ok(i) => log::info!(
+            "[instance] {} — data folder {:?}, shell temp folder {:?}",
+            i.identifier,
+            i.data_dir,
+            i.shell_temp_root
+        ),
+        Err(e) => {
+            log::error!("[instance] {}", e);
+            eprintln!("Hermes: {}", e);
+            std::process::exit(78);
+        }
+    }
 
     // Create a Tokio runtime context for plugins that spawn async tasks during
     // initialization (tauri-plugin-aptabase calls tokio::task::spawn in its init
@@ -489,20 +624,30 @@ pub fn run() {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
     let _guard = rt.enter();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Test runs must not take keyboard focus away from whoever is working.
+    #[cfg(feature = "e2e")]
+    let builder = e2e_bridge::configure(builder);
+
+    builder
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_aptabase::Builder::new("A-EU-1922161061").build())
+        // Plugin identity is per page: a reload forgets the old keys.
+        .on_page_load(plugin_identity::on_page_load)
         .setup(|app| {
-            let app_dir = app
-                .path()
-                .app_data_dir()
-                .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+            // Before anything else: the frontend claims its host key from
+            // this state before it runs any plugin bundle.
+            app.manage(plugin_identity::PluginIdentityState::default());
+
+            let app_dir = instance::app_data_dir(app.handle())?;
             std::fs::create_dir_all(&app_dir)
                 .map_err(|e| format!("Failed to create app data dir: {}", e))?;
+            // Only worktrees under this folder are ours to remove, ask
+            // about or recreate; another instance's are somebody else's.
+            git::worktree::set_instance_worktrees_base(&app_dir);
             std::fs::create_dir_all(app_dir.join("context"))
                 .map_err(|e| format!("Failed to create context dir: {}", e))?;
 
@@ -523,39 +668,52 @@ pub fn run() {
             if old_db_path.exists() && !db_path.exists() {
                 let _ = std::fs::copy(&old_db_path, &db_path);
             }
-            let database = db::Database::new(&db_path)
-                .map_err(|e| format!("Failed to initialize database: {}", e))?;
+            let database = match db::Database::open(&db_path) {
+                Ok(database) => database,
+                Err(e) => {
+                    // Show the reason in the window and initialise nothing
+                    // else, so nothing can touch the data.
+                    log::error!("Database not opened: {}", e);
+                    // Nothing runs this time, so there is nothing to shut down.
+                    let _ = std::fs::remove_file(&startup_marker);
+                    app.manage(db::startup::StartupProblemState(Some(
+                        db::startup::StartupProblem::from_open_error(&e, &db_path),
+                    )));
+                    #[cfg(feature = "e2e")]
+                    e2e_bridge::start(app.handle());
+                    return Ok(());
+                }
+            };
+            app.manage(db::startup::StartupProblemState(None));
 
             // Clean up stale worktrees from previous sessions that no longer exist
             cleanup_stale_worktrees(app.handle(), &database);
 
+            // Sessions the session host kept running (N20): their shells
+            // are still configured with the previous run's shell-integration
+            // files, and their agents still write launch signals.
+            let kept = session_host::live_hosted_session_ids(app.handle());
+            if !kept.is_empty() {
+                log::info!(
+                    "[session-host] {} session(s) still running in the host",
+                    kept.len()
+                );
+            }
+
             // Clean up stale shell integration temp files from previous sessions
-            pty::shell_integration::cleanup_stale();
+            pty::shell_integration::cleanup_stale(&kept);
+
+            // Launch files belong to sessions of the previous run (restored
+            // sessions get new ids), so the folder starts empty — except for
+            // the kept sessions'.
+            pty::launch::clear_launch_dir(app.handle(), &kept);
 
             let mut sys = sysinfo::System::new();
             sys.refresh_all(); // baseline for CPU delta computation
 
             // Start worktree file watcher (notification only — never
             // deletes projects or closes sessions)
-            let mut custom_bases: Vec<std::path::PathBuf> = Vec::new();
-            if let Ok(Some(gb)) = database.get_setting("worktree_base_path") {
-                if !gb.trim().is_empty() {
-                    custom_bases.push(std::path::PathBuf::from(gb));
-                }
-            }
-            if let Ok(projects) = database.get_all_projects() {
-                for proj in projects {
-                    if let Some(pb) = proj.worktree_base_path {
-                        if !pb.trim().is_empty() {
-                            custom_bases.push(std::path::PathBuf::from(pb));
-                        }
-                    }
-                }
-            }
-            custom_bases.dedup();
-
-            let watcher =
-                git::watcher::start_watching(app.handle().clone(), app_dir.clone(), custom_bases);
+            let watcher = git::watcher::start_watching(app.handle().clone(), app_dir.clone());
 
             let state = AppState {
                 db: Mutex::new(database),
@@ -563,23 +721,58 @@ pub fn run() {
                 sys: Mutex::new(sys),
                 startup_marker_path: startup_marker.clone(),
                 worktree_watcher: Mutex::new(watcher),
+                closed_sessions: saved_workspace::ClosedSessions::default(),
             };
 
             app.manage(state);
+            // Feature Tracks (F28): one thread polls the worktrees sessions
+            // are attached to and reports changes under .hermes/features.
+            let track_state = std::sync::Arc::new(track::TrackWatchState::default());
+            app.manage(std::sync::Arc::clone(&track_state));
+            track::start(app.handle().clone(), track_state);
+            app.manage(session_host::SessionHostState::default());
             app.manage(Mutex::new(transcript::TranscriptWatcherState::default()));
             app.manage(agent::AgentState::default());
+            app.manage(quit_flush::QuitFlush::default());
+            app.manage(done_when::DoneWhenState::default());
             app.manage(inline_pty::InlinePtyManager::new());
+            // Turn ledger (F20): off until the frontend says the flag is on.
+            app.manage(turn_ledger::TurnLedger::default());
+            // Prompt library: opened on first use; a background task checks
+            // for a signed catalog update every 12 hours.
+            app.manage(library::LibraryState::default());
+            library::start_updates(app.handle());
+            // Worktree hygiene: keeps old worktrees from filling the disk.
+            git::hygiene_app::start(app.handle().clone());
 
-            // Best-effort bridge runtime prewarm — populates OS file cache
-            // so the user's first Agent session spawns noticeably faster.
-            // Detached, capped at 10s, silent on failure (see prewarm.rs).
-            agent::prewarm_bridge_runtime(app.handle());
+            // The agent bridge is NOT warmed at startup: the frontend asks
+            // for it (warm_agent_bridge) once an Agent-view session exists,
+            // so terminal-only use never starts a Node process at launch.
+            log::info!(
+                "[prewarm] agent bridge warm-up deferred until an Agent-view session exists"
+            );
 
-            // Save workspace when the main window is about to close
+            // Save workspace when the main window is about to close. The
+            // close waits until the frontend has written its workspace.
             let save_handle = app.handle().clone();
             if let Some(window) = app.get_webview_window("main") {
                 window.on_window_event(move |event| match event {
-                    tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed => {
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        // Hosted sessions with an agent at work (N20): ask
+                        // "keep running or stop?" first; the answer quits.
+                        if session_host::on_exit_requested(&save_handle) {
+                            api.prevent_close();
+                            return;
+                        }
+                        let after = quit_flush::After::CloseWindow("main".into());
+                        if quit_flush::hold_for_flush(&save_handle, after) {
+                            api.prevent_close();
+                        } else {
+                            save_workspace_state(&save_handle);
+                            session_host::stop_hosted_unless_kept(&save_handle);
+                        }
+                    }
+                    tauri::WindowEvent::Destroyed => {
                         save_workspace_state(&save_handle);
                     }
                     _ => {}
@@ -604,11 +797,46 @@ pub fn run() {
                 }
             }
 
+            // Test-only automation bridge; compiled out unless `--features e2e`.
+            #[cfg(feature = "e2e")]
+            e2e_bridge::start(app.handle());
+
+            // `--self-test=<report.json>`: prove the essentials, write the
+            // report, exit 0/1. Used by the release train on every installer.
+            if let Some(report) = self_test::requested() {
+                self_test::start(app.handle(), report.to_path_buf(), db_path.clone());
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // Update channel (stable/beta) and the update check itself
+            updater::get_update_channel_info,
+            updater::check_for_update,
             // AI provider detection
             pty::check_ai_providers,
+            // Agent doctor (F16) and the task launcher's repo facts (F15)
+            agent_doctor::agent_doctor,
+            // 2.0 launch contract: models, effort, accounts, presets
+            agent_caps::commands::get_agent_capabilities,
+            agent_caps::commands::list_agent_capabilities,
+            agent_caps::commands::validate_launch,
+            agent_caps::commands::preview_launch,
+            agent_caps::commands::remember_launch_choice,
+            agent_caps::commands::get_remembered_launch_choice,
+            agent_caps::commands::dismiss_preset_suggestion,
+            agent_caps::commands::get_usual_launch_choice,
+            agent_caps::commands::list_launch_presets,
+            agent_caps::commands::save_launch_preset,
+            agent_caps::commands::rename_launch_preset,
+            agent_caps::commands::delete_launch_preset,
+            agent_caps::commands::add_agent_account,
+            agent_caps::commands::remove_agent_account,
+            agent_caps::commands::relaunch_agent,
+            task_launcher::task_repo_probe,
+            task_launcher::task_write_feature_file,
+            task_launcher::task_track_prompt,
+            task_launcher::task_write_done_when,
             // Session management
             pty::create_session,
             pty::ssh_list_directory,
@@ -657,6 +885,7 @@ pub fn run() {
             db::get_all_memory,
             db::delete_memory,
             db::get_settings,
+            db::startup::get_startup_problem,
             db::set_setting,
             db::log_execution,
             db::get_execution_log,
@@ -699,7 +928,6 @@ pub fn run() {
             project::get_registered_projects,
             project::get_projects_ordered,
             project::get_project,
-            project::set_project_worktree_path,
             project::delete_project,
             project::attach_session_project,
             project::detach_session_project,
@@ -709,6 +937,8 @@ pub fn run() {
             project::attunement::apply_context,
             project::attunement::fork_session_context,
             project::attunement::load_hermes_project_config,
+            project::attunement::delete_session_data,
+            analytics::enable_analytics,
             // Process management
             process::list_processes,
             process::kill_process,
@@ -757,6 +987,10 @@ pub fn run() {
             git::search_project,
             // Git worktree management
             git::git_create_worktree,
+            // Worktree recipes (.hermes/worktree.toml)
+            git::recipe::worktree_recipe_read,
+            git::recipe::worktree_recipe_run,
+            git::recipe::worktree_recipe_stop,
             git::git_remove_worktree,
             git::git_list_worktrees,
             git::git_check_branch_available,
@@ -766,14 +1000,36 @@ pub fn run() {
             git::git_is_git_repo,
             git::git_worktree_has_changes,
             git::git_stash_worktree,
+            git::git_attach_worktree,
+            git::git_detach_worktree,
+            git::git_commit_worktree,
+            git::git_commit_kept_worktree,
+            git::git_save_kept_detached_head,
+            git::git_keep_worktree,
+            git::git_remove_leftover_worktree,
             // Worktree overview & cleanup
             git::git_list_all_worktrees,
             git::git_detect_orphan_worktrees,
             git::git_worktree_disk_usage,
             git::git_cleanup_orphan_worktrees,
+            // Disk guard & worktree hygiene
+            git::git_disk_status,
+            git::git_worktree_usage,
+            git::git_reclaim_build_output,
+            git::git_list_orphan_folders,
+            git::git_sweep_orphan_folders,
+            // Worktree hygiene (Settings > Storage)
+            git::hygiene_app::worktree_storage_report,
+            git::hygiene_app::worktree_storage_clean_up,
+            git::hygiene_app::worktree_storage_remove,
+            git::hygiene_app::worktree_storage_remove_build_output,
+            git::hygiene_app::worktree_storage_backups,
+            // Fast worktrees
+            git::git_prepare_worktree,
             // Menu
             menu::show_context_menu,
             menu::update_menu_state,
+            menu::menu_item_enabled_for_test,
             // Plugins
             plugins::list_installed_plugins,
             plugins::read_plugin_bundle,
@@ -785,19 +1041,89 @@ pub fn run() {
             plugins::plugin_fetch_url,
             plugins::plugin_post_json,
             plugins::plugin_exec_command,
+            plugin_features::plugin_read_feature_tracks,
+            // Plugin identity (host key + per-plugin tokens)
+            plugin_identity::claim_plugin_host_key,
+            plugin_identity::issue_plugin_token,
+            plugin_identity::revoke_plugin_token,
             // Clipboard
             clipboard::copy_image_to_clipboard,
+            platform::read_clipboard_text,
             // Transcript watching
+            agent::history::agent_history,
             transcript::start_transcript_watcher,
             transcript::stop_transcript_watcher,
             // Agent mode (Claude SDK bridge — see agent/mod.rs)
             agent::spawn_agent_session,
+            agent::restart_agent_session,
             agent::send_agent_input,
             agent::interrupt_agent,
+            agent::force_stop_agent,
             agent::close_agent_session,
             agent::check_claude_cli,
             agent::read_image_for_attachment,
             agent::update_hermes_state,
+            agent::prewarm::warm_agent_bridge,
+            // 2.0 contracts (docs/adr/004-2.0-contracts.md): turn ledger seam
+            // and the test-build-only session-event injector.
+            contract::turns::list_turns,
+            contract::turns::get_turn_diff,
+            contract::emit_session_event_for_test,
+            quit_flush::workspace_flush_ready,
+            quit_flush::workspace_flush_done,
+            // Attention inbox (F12) and away notifications (N16): the OS side.
+            attention::set_attention_badge,
+            attention::set_keep_awake,
+            attention::send_away_notification,
+            attention::attention_state_for_test,
+            // Turn ledger (F20)
+            turn_ledger::set_turn_ledger_enabled,
+            turn_ledger::turn_ledger_turn_started,
+            turn_ledger::turn_ledger_turn_ended,
+            turn_ledger::preview_restore_turn,
+            turn_ledger::restore_turn,
+            turn_ledger::undo_restore_turn,
+            turn_ledger::turn_ledger_between,
+            // Review Desk (F21): merge-base diff, revert a turn, review file.
+            review::review_diff,
+            review::review_revert_preview,
+            review::review_revert_patch,
+            review::review_write_file,
+            land::land_preview,
+            land::land_gh_status,
+            land::land_execute,
+            land::land_archive,
+            land::land_undo,
+            land::land_pr_checks,
+            land::land_ci_log,
+            // Done-When checks (F27).
+            done_when::done_when_run,
+            done_when::done_when_history,
+            // Feature Tracks (F28)
+            track::track_watch,
+            track::track_unwatch,
+            track::track_snapshot,
+            track::track_approve,
+            track::track_skip,
+            track::track_revert_gate,
+            track::track_promote,
+            track::track_promote_plan,
+            track::track_undo_promote,
+            track::track_read_file,
+            track::track_file_path,
+            track::track_write_review,
+            track::track_hi_path,
+            // Session host (N20): status for the UI and the test rig, and
+            // the answer to "keep running or stop?" on quit.
+            session_host::session_host_status,
+            session_host::session_host_quit,
+            session_host::session_host_set_queued,
+            session_host::session_host_stop_all,
+            // Fleet controls (2.0: spend caps, task queue) — see fleet.rs.
+            fleet::fleet_agent_load,
+            fleet::interrupt_session_agent,
+            // Fleet performance (F24): memory per session and for Hermes.
+            fleet_perf::fleet_memory,
             // Claude config (~/.claude.json + ~/.claude/settings.json)
             // — see claude_config/mod.rs for the v1.0 TUI parity surface.
             claude_config::write_mcp_server,
@@ -812,30 +1138,71 @@ pub fn run() {
             claude_config::read_static_mcp_servers,
             claude_config::read_static_slash_commands,
             claude_config::read_static_memory_paths,
+            // What each agent loads, and how it was started (F30, F35).
+            agent_setup::agent_setup_overview,
+            agent_setup::link_instructions_to_agents_md,
+            agent_setup::session_process_argv,
             // Inline PTY for embedded slash-command terminals
             // (see src/inline_pty/mod.rs).
             inline_pty::spawn_inline_pty,
             inline_pty::write_inline_pty,
             inline_pty::resize_inline_pty,
             inline_pty::kill_inline_pty,
+            // Prompt library (src/library): search, shelves, entries,
+            // updates and installs into projects.
+            library::library_status,
+            library::library_search,
+            library::library_shelves,
+            library::library_get,
+            library::library_hits,
+            library::library_resolve,
+            library::library_vocab,
+            library::library_detect,
+            library::library_record_use,
+            library::library_set_item,
+            library::library_item_states,
+            library::library_get_profile,
+            library::library_set_profile,
+            library::library_reset_personalisation,
+            library::library_check_update,
+            library::library_rollback,
+            library::library_install_preview,
+            library::library_install_apply,
+            library::library_installs,
+            library::library_uninstall,
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building HERMES-IDE")
         .run(|app, event| match &event {
-            tauri::RunEvent::ExitRequested { .. } => {
+            tauri::RunEvent::ExitRequested { code, api, .. } => {
+                // Hosted sessions with an agent at work (N20): the exit
+                // waits for the user's answer, keep running or stop.
+                if session_host::on_exit_requested(app) {
+                    api.prevent_exit();
+                    return;
+                }
+                // An exit with a code (AppHandle::exit, the Quit menu item)
+                // waits for the frontend to write its workspace. A restart
+                // cannot be held, and without a code the last window is
+                // already gone.
+                let holdable = matches!(code, Some(c) if *c != tauri::RESTART_EXIT_CODE);
+                if holdable
+                    && quit_flush::hold_for_flush(app, quit_flush::After::Exit(code.unwrap_or(0)))
+                {
+                    log::info!("[hermes] ExitRequested — held while the workspace is saved");
+                    api.prevent_exit();
+                    return;
+                }
                 log::info!("[hermes] ExitRequested — saving workspace");
                 save_workspace_state(app);
+                session_host::stop_hosted_unless_kept(app);
             }
             tauri::RunEvent::Exit => {
                 log::info!("[hermes] Exit — saving workspace");
                 save_workspace_state(app);
-            }
-            tauri::RunEvent::WindowEvent {
-                event: tauri::WindowEvent::CloseRequested { .. },
-                ..
-            } => {
-                log::info!("[hermes] WindowCloseRequested — saving workspace");
-                save_workspace_state(app);
+                fold_database_log(app);
+                // Let the machine sleep again (F12 keep-awake).
+                attention::shutdown();
             }
             tauri::RunEvent::WindowEvent {
                 event: tauri::WindowEvent::Destroyed,
@@ -923,12 +1290,11 @@ mod tests {
             "proj1",
             "feat",
             orphan_path,
-            None,
         )
         .unwrap();
 
         // Verify journal has incomplete operations
-        let incomplete = git::journal::get_incomplete_operations(app_data_dir.path(), repo_path, None);
+        let incomplete = git::journal::get_incomplete_operations(app_data_dir.path(), repo_path);
         assert_eq!(incomplete.len(), 1);
 
         // Remove the orphan (simulating replay)
@@ -938,10 +1304,10 @@ mod tests {
         assert!(!orphan_dir.exists());
 
         // Clear journal (this is what the production code does after verification passes)
-        git::journal::clear_journal(app_data_dir.path(), repo_path, None);
+        git::journal::clear_journal(app_data_dir.path(), repo_path);
 
         // Journal should now be empty
-        let remaining = git::journal::get_incomplete_operations(app_data_dir.path(), repo_path, None);
+        let remaining = git::journal::get_incomplete_operations(app_data_dir.path(), repo_path);
         assert!(remaining.is_empty());
     }
 
@@ -1011,11 +1377,19 @@ mod tests {
             permission_mode: "default".to_string(),
             custom_prefix: String::new(),
             custom_suffix: String::new(),
+            agent_name: String::new(),
+            agent_command: String::new(),
             channels: vec![],
             context_injected: false,
             has_initial_context: false,
             last_nudged_version: 0,
             ssh_info: None,
+            vendor_session_id: None,
+            agent_startup: None,
+            hosted: false,
+            reattached: false,
+            parent_session_id: None,
+            agent_launch: Default::default(),
         };
         database.create_session_v2(&update).unwrap();
 
@@ -1060,6 +1434,98 @@ mod tests {
         );
     }
 
+    /// F09 edge case: a link whose folder is missing survives the startup
+    /// cleanup only when Hermes made the worktree and its branch still
+    /// exists (then `create_session` puts it back on restore).
+    #[test]
+    fn missing_worktree_link_is_kept_only_for_a_hermes_worktree_on_a_live_branch() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_path = repo_dir.path().to_str().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(repo_path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {:?}", args);
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Hermes Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo_dir.path().join("a.txt"), "a").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "initial"]);
+        git(&["branch", "hermes/task"]);
+
+        let own = "/data/hermes-worktrees/abc/s1_hermes-task";
+        assert!(keep_missing_worktree_link(
+            true,
+            false,
+            own,
+            Some(repo_path),
+            Some("hermes/task")
+        ));
+        // A session the saved workspace does not restore: nobody would put
+        // the worktree back, so the link would linger for ever. Drop it.
+        assert!(!keep_missing_worktree_link(
+            false,
+            false,
+            own,
+            Some(repo_path),
+            Some("hermes/task")
+        ));
+        // Branch gone, unknown, or no project to look in: drop the link.
+        assert!(!keep_missing_worktree_link(
+            true,
+            false,
+            own,
+            Some(repo_path),
+            Some("hermes/gone")
+        ));
+        assert!(!keep_missing_worktree_link(
+            true,
+            false,
+            own,
+            Some(repo_path),
+            None
+        ));
+        assert!(!keep_missing_worktree_link(
+            true,
+            false,
+            own,
+            None,
+            Some("hermes/task")
+        ));
+        // Not ours: the project folder, or a worktree made outside Hermes.
+        assert!(!keep_missing_worktree_link(
+            true,
+            true,
+            repo_path,
+            Some(repo_path),
+            Some("main")
+        ));
+        assert!(!keep_missing_worktree_link(
+            true,
+            false,
+            "/work/external-wt",
+            Some(repo_path),
+            Some("hermes/task")
+        ));
+    }
+
+    #[test]
+    fn saved_workspace_session_ids_reads_the_frontend_format_and_tolerates_junk() {
+        let ws = r#"{"version":3,"sessions":[{"id":"s1","label":"a"},{"id":"s2"},{"label":"no id"}],"layout":null}"#;
+        let ids = saved_workspace_session_ids(Some(ws));
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("s1") && ids.contains("s2"));
+        assert!(saved_workspace_session_ids(None).is_empty());
+        assert!(saved_workspace_session_ids(Some("")).is_empty());
+        assert!(saved_workspace_session_ids(Some("not json")).is_empty());
+        assert!(saved_workspace_session_ids(Some(r#"{"sessions":"x"}"#)).is_empty());
+    }
+
     /// Journal should NOT be cleared if orphans still exist after replay.
     #[test]
     fn journal_kept_when_orphans_remain() {
@@ -1080,7 +1546,6 @@ mod tests {
             "proj1",
             "",
             orphan_path,
-            None,
         )
         .unwrap();
 
@@ -1088,7 +1553,7 @@ mod tests {
         assert!(orphan_dir.exists());
 
         // Verification check: orphan is still there, should NOT clear
-        let incomplete = git::journal::get_incomplete_operations(app_data_dir.path(), repo_path, None);
+        let incomplete = git::journal::get_incomplete_operations(app_data_dir.path(), repo_path);
         let mut all_cleaned = true;
         for entry in &incomplete {
             if entry.worktree_path != "pending" && Path::new(&entry.worktree_path).is_dir() {
@@ -1098,7 +1563,7 @@ mod tests {
         assert!(!all_cleaned, "verification should detect remaining orphan");
 
         // Journal should still have entries
-        let remaining = git::journal::get_incomplete_operations(app_data_dir.path(), repo_path, None);
+        let remaining = git::journal::get_incomplete_operations(app_data_dir.path(), repo_path);
         assert_eq!(remaining.len(), 1);
     }
 }

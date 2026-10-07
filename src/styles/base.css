@@ -2,25 +2,21 @@
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
-/* Global focus ring — tokenized per theme.
- * Components MAY override their own :focus-visible if they need a
- * scoped style, but they MUST use --focus-ring-shadow as the box-shadow
- * value so theme overrides flow through (see docs/design-system/07-accessibility.md). */
+/* Form controls take the UI font and ink of where they sit, instead of the
+ * browser's system font and black. */
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+}
+
+/* One focus ring for everything: a solid 2px outline, 2px away from the
+ * control, in the theme's --focus-ring (≥ 3:1 on every surface, checked by
+ * scripts/contrast-audit.mjs). Never remove it without drawing the same
+ * ring another way (see docs/design-system/07-accessibility.md). */
 :focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring-shadow);
-}
-
-input:focus-visible,
-select:focus-visible,
-textarea:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring-shadow);
-}
-
-button:active:not(:disabled) {
-  transform: scale(0.97);
-  transition: transform 0s;
+  outline: var(--focus-ring-width) solid var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
 }
 
 html, body, #root {
@@ -134,57 +130,12 @@ kbd {
   100% { background-position:  200% 0; }
 }
 
-/* ─── Error Boundary ─────────────────────────────────────── */
-
-.error-boundary {
-  padding: 40px;
-  color: var(--text-0);
-  background: var(--bg-0);
-  height: 100vh;
-  font-family: var(--font-code);
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-4);
-}
-.error-boundary-title { font-size: var(--text-2xl); color: var(--danger); }
-.error-boundary-stack {
-  font-size: var(--text-md);
-  color: var(--text-2);
-  max-width: 600px;
-  overflow: auto;
-  white-space: pre-wrap;
-}
-.error-boundary-retry {
-  padding: var(--space-2) 20px;
-  background: var(--success);
-  color: var(--bg-0);
-  border: none;
-  border-radius: var(--radius);
-  cursor: pointer;
-  font-weight: var(--weight-semibold);
-  font-family: var(--font-code);
-}
-
 /* ─── Scrollbar ──────────────────────────────────────────────── */
 
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: var(--radius-sm); }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
-
-/* ─── Input Focus Suppression ────────────────────────────── */
-
-.command-palette-input:focus-visible,
-.workspace-scan-input:focus-visible,
-.session-context-menu-input:focus-visible,
-.role-selector-search:focus-visible,
-.style-selector-search:focus-visible,
-.prompt-composer-save-input:focus-visible {
-  outline: none;
-  box-shadow: none;
-}
 
 /* ─── Accessibility: Min Touch Targets ───────────────────── */
 

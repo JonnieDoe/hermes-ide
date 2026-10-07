@@ -3,6 +3,10 @@ import type { GitBranch } from "../types/git";
 import { gitListBranches, gitBranchesAheadBehind, gitCreateBranch, gitCheckoutBranch, gitDeleteBranch } from "../api/git";
 import type { GitToast } from "./GitPanel";
 import { useContextMenu, buildBranchMenuItems } from "../hooks/useContextMenu";
+import { branchClashMessage, findBranchClash, gitErrorMessage } from "../utils/branchClash";
+import { parseUnmergedBranch, type UnmergedBranch } from "../utils/gitErrors";
+import { translate } from "../i18n/registry";
+import { Button } from "./ui";
 
 interface GitBranchSelectorProps {
   sessionId: string;
@@ -13,6 +17,14 @@ interface GitBranchSelectorProps {
   onClose: () => void;
   /** Ref to the element that triggered the dropdown, used for fixed positioning */
   triggerRef?: React.RefObject<HTMLElement | null>;
+  /**
+   * Ask before switching: "task-worktree" (a task's isolated worktree:
+   * its agent's next commits and Land follow the branch), "agent-folder"
+   * (an agent works in the project folder). Null: switch on one click.
+   */
+  confirmSwitch?: "task-worktree" | "agent-folder" | null;
+  /** The agent's name, for the "agent-folder" question. */
+  agentName?: string | null;
 }
 
 // ─── Pure helpers (exported for testing) ──────────────────────────────
@@ -60,7 +72,30 @@ export function validateBranchName(name: string): string | null {
   return null;
 }
 
-export function GitBranchSelector({ sessionId, projectId, currentBranch, onRefresh, onToast, onClose, triggerRef }: GitBranchSelectorProps) {
+/**
+ * Where a position:fixed box's (0, 0) is: the window, or the nearest
+ * ancestor that is its containing block (a transform, filter or backdrop
+ * filter makes one).
+ */
+function fixedOrigin(el: HTMLElement): { top: number; left: number } {
+  for (let p = el.parentElement; p; p = p.parentElement) {
+    const cs = getComputedStyle(p) as CSSStyleDeclaration & { webkitBackdropFilter?: string };
+    const makesBlock = [cs.transform, cs.filter, cs.backdropFilter, cs.webkitBackdropFilter, cs.perspective].some((v) => !!v && v !== "none");
+    if (makesBlock) {
+      const r = p.getBoundingClientRect();
+      return { top: r.top, left: r.left };
+    }
+  }
+  return { top: 0, left: 0 };
+}
+
+export function GitBranchSelector({ sessionId, projectId, currentBranch, onRefresh, onToast, onClose, triggerRef, confirmSwitch = null, agentName = null }: GitBranchSelectorProps) {
+  // translate, not useI18n: also rendered outside the I18n provider (panel tests).
+  const t = translate;
+  /** A branch about to be checked out, waiting for "Switch". */
+  const [pendingSwitch, setPendingSwitch] = useState<string | null>(null);
+  /** A delete git refused because the branch has commits no other branch has. */
+  const [unmerged, setUnmerged] = useState<UnmergedBranch | null>(null);
   const [branches, setBranches] = useState<GitBranch[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
@@ -83,9 +118,12 @@ export function GitBranchSelector({ sessionId, projectId, currentBranch, onRefre
     const maxH = 320;
     const spaceBelow = window.innerHeight - rect.bottom - 8;
     const top = spaceBelow >= maxH ? rect.bottom + 2 : Math.max(8, rect.top - maxH - 2);
+    // Inside a dialog whose backdrop is blurred (the Review Desk), "fixed"
+    // is relative to that backdrop, not to the window.
+    const origin = fixedOrigin(anchor);
     setFixedStyle({
-      top: `${top}px`,
-      left: `${rect.left + 8}px`,
+      top: `${top - origin.top}px`,
+      left: `${rect.left + 8 - origin.left}px`,
       width: `${rect.width - 16}px`,
     });
   }, [triggerRef]);
@@ -97,6 +135,10 @@ export function GitBranchSelector({ sessionId, projectId, currentBranch, onRefre
     if (!branch) return;
     switch (actionId) {
       case "branch.checkout":
+        if (confirmSwitch) {
+          setPendingSwitch(branch.name);
+          break;
+        }
         gitCheckoutBranch(sessionId, projectId, branch.name)
           .then(() => { onRefresh(); onToast(`Checked out ${branch.name}`, "success"); })
           .catch((e) => onToast(String(e), "error"));
@@ -107,10 +149,14 @@ export function GitBranchSelector({ sessionId, projectId, currentBranch, onRefre
       case "branch.delete":
         gitDeleteBranch(sessionId, projectId, branch.name, false)
           .then(() => { onRefresh(); onToast(`Deleted ${branch.name}`, "success"); })
-          .catch((e) => onToast(String(e), "error"));
+          .catch((e) => {
+            const u = parseUnmergedBranch(e);
+            if (u) setUnmerged(u);
+            else onToast(gitErrorMessage(e), "error");
+          });
         break;
     }
-  }, [sessionId, projectId, onRefresh, onToast]);
+  }, [sessionId, projectId, onRefresh, onToast, confirmSwitch]);
 
   const { showMenu: showBranchMenu } = useContextMenu(handleBranchAction);
 
@@ -182,22 +228,39 @@ export function GitBranchSelector({ sessionId, projectId, currentBranch, onRefre
     return () => clearTimeout(timer);
   }, [error]);
 
-  const handleCheckout = useCallback(async (name: string) => {
+  const doCheckout = useCallback(async (name: string) => {
     try {
       setError(null);
+      setPendingSwitch(null);
       const result = await gitCheckoutBranch(sessionId, projectId, name);
       onToast(result.message);
       onRefresh();
       onClose();
     } catch (e) {
-      setError(String(e));
+      setError(gitErrorMessage(e));
     }
   }, [sessionId, projectId, onRefresh, onToast, onClose]);
+
+  /** One click switches, unless a task's worktree or an agent's folder would move: then ask. */
+  const handleCheckout = useCallback((name: string) => {
+    if (confirmSwitch) {
+      setPendingSwitch(name);
+      return;
+    }
+    void doCheckout(name);
+  }, [confirmSwitch, doCheckout]);
 
   const handleCreate = useCallback(async () => {
     const validationError = validateBranchName(newName);
     if (validationError) {
       setError(validationError);
+      return;
+    }
+    // An existing branch, also when only the letter case differs (on macOS
+    // and Windows `Develop` IS `develop`): said here, before git is asked.
+    const clash = findBranchClash(newName.trim(), branches.filter((b) => !b.is_remote).map((b) => b.name));
+    if (clash) {
+      setError(branchClashMessage(clash));
       return;
     }
     try {
@@ -209,9 +272,9 @@ export function GitBranchSelector({ sessionId, projectId, currentBranch, onRefre
       onRefresh();
       onClose();
     } catch (e) {
-      setError(String(e));
+      setError(gitErrorMessage(e));
     }
-  }, [sessionId, projectId, newName, onRefresh, onToast, onClose]);
+  }, [sessionId, projectId, newName, branches, onRefresh, onToast, onClose]);
 
   const handleDelete = useCallback(async (name: string, force: boolean) => {
     try {
@@ -219,10 +282,16 @@ export function GitBranchSelector({ sessionId, projectId, currentBranch, onRefre
       const result = await gitDeleteBranch(sessionId, projectId, name, force);
       onToast(result.message);
       setConfirmDelete(null);
+      setUnmerged(null);
       loadBranches();
       onRefresh();
     } catch (e) {
-      setError(String(e));
+      // Commits only this branch has: ask (Keep / Delete anyway), never a
+      // message about an option the switcher does not have.
+      const u = parseUnmergedBranch(e);
+      setConfirmDelete(null);
+      if (u) setUnmerged(u);
+      else setError(gitErrorMessage(e));
     }
   }, [sessionId, projectId, onRefresh, onToast, loadBranches]);
 
@@ -301,6 +370,44 @@ export function GitBranchSelector({ sessionId, projectId, currentBranch, onRefre
       )}
 
       {error && <div className="git-error" style={{ margin: "4px 8px" }}>{error}</div>}
+
+      {pendingSwitch && (
+        <div className="git-branch-ask git-branch-switch-confirm" role="alertdialog" aria-labelledby="git-branch-switch-text">
+          <div className="git-branch-ask-text" id="git-branch-switch-text">
+            {confirmSwitch === "agent-folder"
+              ? t("branchSwitch.agentFolder", { from: currentBranch ?? "", to: pendingSwitch, agent: agentName || t("branchSwitch.theAgent") })
+              : t("branchSwitch.taskWorktree", { from: currentBranch ?? "", to: pendingSwitch })}
+          </div>
+          <div className="git-branch-ask-actions">
+            <Button size="sm" className="git-branch-switch-cancel" onClick={() => setPendingSwitch(null)}>
+              {t("common.cancel")}
+            </Button>
+            <Button size="sm" variant="primary" className="git-branch-switch-yes" onClick={() => void doCheckout(pendingSwitch)}>
+              {t("branchSwitch.switch")}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {unmerged && (
+        <div className="git-branch-ask git-branch-unmerged" role="alert">
+          <div className="git-branch-ask-text">
+            {t(unmerged.commits === 1 ? "branchDelete.unmergedOne" : "branchDelete.unmergedMany", {
+              branch: unmerged.branch,
+              count: unmerged.commits,
+              base: unmerged.base,
+            })}
+          </div>
+          <div className="git-branch-ask-actions">
+            <Button size="sm" className="git-branch-unmerged-keep" onClick={() => setUnmerged(null)}>
+              {t("branchDelete.keep")}
+            </Button>
+            <Button size="sm" variant="danger" className="git-branch-unmerged-delete" onClick={() => void handleDelete(unmerged.branch, true)}>
+              {t("branchDelete.deleteAnyway")}
+            </Button>
+          </div>
+        </div>
+      )}
 
       <div className="git-branch-create-area">
         {creating ? (

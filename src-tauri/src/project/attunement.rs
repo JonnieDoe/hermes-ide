@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::AppState;
 
@@ -115,6 +115,52 @@ pub struct ProjectContext {
     pub architecture_layers: Vec<String>,
     pub conventions: Vec<String>,
     pub scan_status: String,
+    /// Set when the folder is not in a git repository: Hermes made no
+    /// worktree and no branch for it, and the agent works in it directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_git: Option<NotGitFolder>,
+}
+
+/// A project folder that is not a git repository (a plain folder, or one
+/// holding several repositories).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct NotGitFolder {
+    /// Git repositories directly inside the folder (names, at most
+    /// `NESTED_REPO_CAP`, sorted).
+    pub nested_repos: Vec<String>,
+    /// How many more there are past the cap.
+    pub more_nested: usize,
+}
+
+/// Nested repositories named in the context, at most.
+const NESTED_REPO_CAP: usize = 20;
+
+/// What the agent's first prompt adds when it starts in a folder that is
+/// not a single git repository. Vendor-neutral: the agent decides, Hermes
+/// never makes worktrees in the repositories inside it.
+pub const NOT_GIT_GUIDANCE: &str = "This folder is not a single git repository. If you need to change code inside a git repository in it, you may create a worktree or branch there yourself when it makes sense.";
+
+/// None when `path` is in a git repository (or is not a folder at all);
+/// otherwise the git repositories directly inside it.
+pub fn not_git_folder(path: &Path) -> Option<NotGitFolder> {
+    if !path.is_dir() || git2::Repository::discover(path).is_ok() {
+        return None;
+    }
+    let mut names: Vec<String> = std::fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir() && e.path().join(".git").exists())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect();
+    names.sort_by_key(|n| n.to_lowercase());
+    let more_nested = names.len().saturating_sub(NESTED_REPO_CAP);
+    names.truncate(NESTED_REPO_CAP);
+    Some(NotGitFolder {
+        nested_repos: names,
+        more_nested,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,6 +312,7 @@ pub fn assemble_context(
             architecture_layers: arch_layers,
             conventions: conv_rules,
             scan_status: project.scan_status.clone(),
+            not_git: not_git_folder(Path::new(&project.path)),
         });
     }
 
@@ -392,25 +439,17 @@ pub fn assemble_context(
 
 /// Compute the deterministic path for a session's context file (no I/O).
 pub fn session_context_path(app: &AppHandle, session_id: &str) -> Result<PathBuf, String> {
-    let app_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let app_dir = crate::instance::app_data_dir(app)?;
     Ok(app_dir.join("context").join(format!("{}.md", session_id)))
 }
 
 /// Format a SessionContext as a markdown string for AI agents to read.
-fn format_context_markdown(context: &SessionContext, execution_mode: Option<&str>) -> String {
+fn format_context_markdown(context: &SessionContext) -> String {
     let mut md = String::new();
     md.push_str(&format!(
         "# Session Context (v{})\n\n",
         context.context_version
     ));
-
-    // Execution Mode
-    if let Some(mode) = execution_mode {
-        md.push_str(&format!("- Mode: {}\n", mode));
-    }
 
     // Token budget info
     md.push_str(&format!(
@@ -446,6 +485,49 @@ fn format_context_markdown(context: &SessionContext, execution_mode: Option<&str
             }
             md.push('\n');
         }
+    }
+
+    // Folders that are not git repositories: no worktree was made, and the
+    // agent decides whether to make one in a repository inside them.
+    let plain: Vec<&ProjectContext> = context
+        .projects
+        .iter()
+        .filter(|p| p.not_git.is_some())
+        .collect();
+    if !plain.is_empty() {
+        md.push_str(
+            "## Git
+
+",
+        );
+        for project in &plain {
+            md.push_str(&format!(
+                "- {} ({}): not a git repository. Hermes made no worktree and no branch for it; you work directly in this folder.\n",
+                project.project_name, project.path
+            ));
+            if let Some(nested) = project
+                .not_git
+                .as_ref()
+                .filter(|n| !n.nested_repos.is_empty())
+            {
+                let more = if nested.more_nested > 0 {
+                    format!(", and {} more", nested.more_nested)
+                } else {
+                    String::new()
+                };
+                md.push_str(&format!(
+                    "  - Git repositories inside it: {}{}\n",
+                    nested.nested_repos.join(", "),
+                    more
+                ));
+            }
+        }
+        if plain.len() < context.projects.len() {
+            md.push_str("- The other projects are git repositories and keep their usual setup.\n");
+        }
+        md.push_str(
+            "\nIf you need to change code inside a git repository in such a folder, you may create a worktree or branch there yourself when it makes sense.\n\n",
+        );
     }
 
     // Pinned Context (with file content)
@@ -527,7 +609,7 @@ pub fn write_session_context_file(
             .map_err(|e| format!("Failed to create context dir: {}", e))?;
     }
 
-    let markdown = format_context_markdown(&context, None);
+    let markdown = format_context_markdown(&context);
 
     let tmp_path = path.with_extension("md.tmp");
     std::fs::write(&tmp_path, markdown.as_bytes())
@@ -566,7 +648,6 @@ pub fn apply_context(
     state: State<'_, AppState>,
     app: AppHandle,
     session_id: String,
-    execution_mode: Option<String>,
 ) -> Result<ApplyContextResult, String> {
     // 1. Assemble context from DB
     let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -577,8 +658,8 @@ pub fn apply_context(
     let new_version = snapshots.first().map(|s| s.version).unwrap_or(0) + 1;
     context.context_version = new_version;
 
-    // 3. Format markdown with execution mode
-    let markdown = format_context_markdown(&context, execution_mode.as_deref());
+    // 3. Format markdown
+    let markdown = format_context_markdown(&context);
     let estimated_tokens = context.estimated_tokens;
     let budget = context.token_budget;
 
@@ -685,6 +766,74 @@ pub fn load_hermes_project_config(
     Ok(Some(config))
 }
 
+/// Session ids are UUIDs; anything that could step outside a folder when
+/// joined into a path is refused before the filesystem is touched.
+fn is_safe_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= 128
+        && session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Removes the session's on-disk Hermes caches: its context file
+/// (`<context_dir>/<id>.md`) and its agent-mode state folder
+/// (`<agent_state_root>/<id>/`). Missing files are fine.
+fn remove_session_cache_files(
+    context_dir: &Path,
+    agent_state_root: Option<&Path>,
+    session_id: &str,
+) -> Result<(), String> {
+    let ignore_missing = |r: std::io::Result<()>| match r {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+        _ => Ok(()),
+    };
+    ignore_missing(std::fs::remove_file(
+        context_dir.join(format!("{}.md", session_id)),
+    ))?;
+    if let Some(root) = agent_state_root {
+        ignore_missing(std::fs::remove_dir_all(root.join(session_id)))?;
+    }
+    Ok(())
+}
+
+/// Deletes Hermes-side cached data for one session: execution history,
+/// token usage, context pins/snapshots, session-scoped memory, realm
+/// attachments, recorded error occurrences, the on-disk context file
+/// (`<app data dir>/context/<session_id>.md`) and the agent-mode state
+/// folder (`~/.hermes-ide/sessions/<session_id>/`).
+///
+/// Leaves the session itself and the repo it works in untouched — this is a
+/// cache clear, not a session delete or a git operation.
+#[tauri::command]
+pub fn delete_session_data(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    session_id: String,
+) -> Result<(), String> {
+    if !is_safe_session_id(&session_id) {
+        return Err(format!("invalid session id: {:?}", session_id));
+    }
+    {
+        // Lock order as in save_all_snapshots (PTY manager, then DB), so a
+        // workspace save cannot run between the two steps and write the
+        // live session's output back as its saved scrollback.
+        let mgr = state.pty_manager.lock().map_err(|e| e.to_string())?;
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        mgr.clear_snapshot_output(&session_id);
+        db.delete_session_cache_data(&session_id)?;
+    }
+    // Let an open context panel drop the pins it is showing.
+    let _ = app.emit(&format!("context-pins-changed-{}", session_id), ());
+
+    let context_path = session_context_path(&app, &session_id)?;
+    let context_dir = context_path
+        .parent()
+        .ok_or_else(|| "context dir has no parent".to_string())?;
+    let agent_state_root = crate::agent::hermes_state_root().ok();
+    remove_session_cache_files(context_dir, agent_state_root.as_deref(), &session_id)
+}
+
 /// FNV-1a hash for config change detection
 fn fnv1a_hash(input: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -693,4 +842,215 @@ fn fnv1a_hash(input: &str) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── folders that are not git repositories ───────────────────────────
+
+    /// The context file a session on `folders` gets, as the launch writes it.
+    fn context_md(folders: &[&Path]) -> String {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Database::new(db_file.path()).unwrap();
+        for (i, folder) in folders.iter().enumerate() {
+            let id = format!("p{i}");
+            let name = folder.file_name().unwrap().to_string_lossy().to_string();
+            db.insert_project(&id, &folder.to_string_lossy(), &name, "[]", "[]")
+                .unwrap();
+            db.attach_session_project(SID, &id, "primary").unwrap();
+        }
+        format_context_markdown(&assemble_context(&db, SID, DEFAULT_TOKEN_BUDGET).unwrap())
+    }
+
+    fn git_init(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        git2::Repository::init(dir).unwrap();
+    }
+
+    #[test]
+    fn a_plain_folder_is_worked_in_directly_and_the_agent_decides_about_git() {
+        let root = tempfile::tempdir().unwrap();
+        let plain = root.path().join("notes");
+        std::fs::create_dir_all(&plain).unwrap();
+        let md = context_md(&[&plain]);
+        assert!(md.contains("## Git"), "{md}");
+        assert!(
+            md.contains(&format!(
+                "- notes ({}): not a git repository. Hermes made no worktree and no branch for it; you work directly in this folder.",
+                plain.display()
+            )),
+            "{md}"
+        );
+        assert!(
+            md.contains("you may create a worktree or branch there yourself when it makes sense"),
+            "{md}"
+        );
+        assert!(!md.contains("Git repositories inside it"), "{md}");
+        // No vendor is named: the same words for every agent.
+        for vendor in ["Claude", "Codex", "OpenCode", "Gemini"] {
+            assert!(!md.contains(vendor), "{vendor} in {md}");
+        }
+        assert!(!plain.join(".git").exists(), "nothing is made a repository");
+    }
+
+    #[test]
+    fn a_parent_folder_names_the_repositories_inside_it_and_none_gets_a_worktree() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("code");
+        for name in ["web", "Api", "worker"] {
+            git_init(&parent.join(name));
+        }
+        std::fs::create_dir_all(parent.join("docs")).unwrap();
+        let md = context_md(&[&parent]);
+        assert!(
+            md.contains("  - Git repositories inside it: Api, web, worker\n"),
+            "{md}"
+        );
+        let nested = not_git_folder(&parent).unwrap();
+        assert_eq!(nested.more_nested, 0);
+        // Hermes made no worktree in any of them.
+        for name in ["web", "Api", "worker"] {
+            let repo = git2::Repository::open(parent.join(name)).unwrap();
+            assert_eq!(repo.worktrees().unwrap().len(), 0, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_long_list_of_nested_repositories_is_cut_with_a_count() {
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..(NESTED_REPO_CAP + 3) {
+            git_init(&root.path().join(format!("r{i:02}")));
+        }
+        let nested = not_git_folder(root.path()).unwrap();
+        assert_eq!(nested.nested_repos.len(), NESTED_REPO_CAP);
+        assert_eq!(nested.more_nested, 3);
+        let md = context_md(&[root.path()]);
+        assert!(md.contains(", and 3 more\n"), "{md}");
+    }
+
+    #[test]
+    fn a_mixed_session_names_only_the_plain_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("app");
+        git_init(&repo);
+        let plain = root.path().join("designs");
+        std::fs::create_dir_all(&plain).unwrap();
+        let md = context_md(&[&repo, &plain]);
+        assert!(md.contains("- designs ("), "{md}");
+        assert!(!md.contains("- app ("), "{md}");
+        assert!(
+            md.contains("The other projects are git repositories and keep their usual setup."),
+            "{md}"
+        );
+        assert!(not_git_folder(&repo).is_none());
+        // A subfolder of a repository is in that repository.
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        assert!(not_git_folder(&repo.join("src")).is_none());
+    }
+
+    #[test]
+    fn a_git_project_alone_reads_as_before() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("app");
+        git_init(&repo);
+        let md = context_md(&[&repo]);
+        assert!(!md.contains("## Git"), "{md}");
+        assert!(!md.contains("worktree"), "{md}");
+        // A folder that is gone is not judged.
+        assert!(not_git_folder(&root.path().join("gone")).is_none());
+    }
+
+    #[test]
+    fn the_context_of_a_plain_folder_survives_a_round_trip() {
+        // What the Context panel receives (and a stored snapshot) keeps the field;
+        // an older one without it reads as a git project.
+        let ctx = ProjectContext {
+            project_id: "p".into(),
+            project_name: "n".into(),
+            path: "/x".into(),
+            languages: vec![],
+            frameworks: vec![],
+            architecture_pattern: None,
+            architecture_layers: vec![],
+            conventions: vec![],
+            scan_status: "surface".into(),
+            not_git: Some(NotGitFolder {
+                nested_repos: vec!["a".into()],
+                more_nested: 0,
+            }),
+        };
+        let json = serde_json::to_string(&ctx).unwrap();
+        let back: ProjectContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.not_git, ctx.not_git);
+        let old = json.replace(r#","not_git":{"nested_repos":["a"],"more_nested":0}"#, "");
+        assert!(!old.contains("not_git"), "{old}");
+        assert_eq!(
+            serde_json::from_str::<ProjectContext>(&old)
+                .unwrap()
+                .not_git,
+            None
+        );
+    }
+
+    const SID: &str = "3f2b8c1e-0000-4000-8000-000000000001";
+    const OTHER: &str = "3f2b8c1e-0000-4000-8000-000000000002";
+
+    fn seed(root: &Path, sid: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let context_dir = root.join("context");
+        let state_root = root.join(".hermes-ide").join("sessions");
+        std::fs::create_dir_all(&context_dir).unwrap();
+        std::fs::create_dir_all(state_root.join(sid)).unwrap();
+        std::fs::write(context_dir.join(format!("{}.md", sid)), "# ctx").unwrap();
+        std::fs::write(state_root.join(sid).join("state.json"), "{}").unwrap();
+        (context_dir, state_root)
+    }
+
+    #[test]
+    fn removes_context_file_and_agent_state_for_the_session_only() {
+        let root = tempfile::tempdir().unwrap();
+        let (context_dir, state_root) = seed(root.path(), SID);
+        seed(root.path(), OTHER);
+        // A repo-like folder next to the caches must survive.
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("main.rs"), "fn main() {}").unwrap();
+
+        remove_session_cache_files(&context_dir, Some(&state_root), SID).unwrap();
+
+        assert!(!context_dir.join(format!("{}.md", SID)).exists());
+        assert!(!state_root.join(SID).exists());
+        assert!(context_dir.join(format!("{}.md", OTHER)).exists());
+        assert!(state_root.join(OTHER).join("state.json").exists());
+        assert!(repo.join("main.rs").exists());
+        assert!(repo.join(".git").exists());
+    }
+
+    #[test]
+    fn missing_caches_are_not_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let context_dir = root.path().join("context");
+        let state_root = root.path().join("sessions");
+        assert!(remove_session_cache_files(&context_dir, Some(&state_root), SID).is_ok());
+        assert!(remove_session_cache_files(&context_dir, None, SID).is_ok());
+    }
+
+    #[test]
+    fn only_plain_session_ids_are_accepted() {
+        assert!(is_safe_session_id(SID));
+        assert!(is_safe_session_id("session_1"));
+        for bad in [
+            "",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            "x.md",
+            "/etc",
+            &"a".repeat(129),
+        ] {
+            assert!(!is_safe_session_id(bad), "{:?} must be refused", bad);
+        }
+    }
 }

@@ -1,0 +1,125 @@
+# README claims ledger: which real-app scenario proves which README claim.
+#
+# `node scripts/check-readme-claims.mjs` reads this file, README.md and
+# e2e/acceptance.yml, and fails when:
+#   - a bullet under README.md's "## Features" heading has no
+#     `<!-- claim:<id> -->` tag (or that heading is gone)
+#   - a line in README.md is tagged `<!-- claim:<id> -->` but has no entry here
+#   - a claim here has no matching tagged line in README.md, or its `text` is
+#     not found in that line (the map has drifted from what README.md says)
+#   - a claim names no scenario and is not listed as `unproven`, or names a
+#     scenario that e2e/acceptance.yml does not reference from any feature's
+#     criteria, or that does not exist under e2e/app/scenarios/
+#   - an `unproven` claim's `planned` scenario has landed (on disk and in the
+#     ledger) but the claim still says `unproven`
+#   - in CI (--baseline): a claim is `unproven` here but was not in the target
+#     branch, i.e. a new README claim arrived without a scenario
+#   - with --strict (a visible, non-blocking CI job): any claim is `unproven`
+#
+# A claim names the scenario that proves it:
+#     scenario: terminal-echo.mjs          (or scenarios: [a.mjs, b.mjs])
+#
+# The claims already in the README when this gate arrived, with no scenario
+# yet, are a backlog that can only shrink. Each says so, and names the
+# scenario planned to prove it:
+#     unproven: "No real-app scenario proves this yet"
+#     planned: git-panel.mjs
+# When that scenario lands, replace both lines with `scenario:`.
+#
+# To add a feature bullet: end it with `<!-- claim:<id> -->`, then add an
+# entry below with the same id, a distinctive substring of the line as
+# `text`, and the scenario that proves it. A new claim cannot be `unproven`.
+
+claims:
+  agent-chat:
+    text: "Structured conversation"
+    scenario: agent-chat.mjs
+  agent-images:
+    text: "Real images"
+    scenario: agent-images.mjs
+  agent-persistent-conversations:
+    text: "Persistent conversations"
+    # With the real claude: REAL-agent-view-resume.mjs (local only).
+    scenario: N13-resume-agents.mjs
+  agent-own-auth:
+    text: "Bring your own auth"
+    # CAP-agents-settings shows each agent's own sign-in state and plan and
+    # adds an account by running the CLI's own login; F07 signs a signed-out
+    # agent in by running the agent's own sign-in in a terminal.
+    scenarios: [CAP-agents-settings.mjs, F07-agent-view-respawn.mjs]
+  multi-session:
+    text: "Multi-session management"
+    # terminal-echo creates a terminal session, finds it in the session list and
+    # closes it again. Switching between parallel sessions is not covered yet.
+    scenario: terminal-echo.mjs
+  split-panes:
+    text: "Split panes"
+    scenario: split-panes.mjs
+  webgl-rendering:
+    text: "Fast terminal rendering"
+    # Where the webview has no WebGL (a Linux CI runner under xvfb), the
+    # scenario checks the fallback instead, as the README's wording says.
+    scenario: webgl-rendering.mjs
+  every-agent-terminal:
+    text: "Every agent in its own terminal"
+    # N09 opens Claude (a stand-in CLI) from the New Session wizard in its own
+    # terminal; other agents use the same path but are not launched there.
+    scenario: N09-terminal-first.mjs
+  remember-agent-choice:
+    text: "Remembers your choice per agent"
+    scenario: N09-terminal-first.mjs
+  agent-view-opt-in:
+    text: "Opt in per session"
+    scenario: N09-terminal-first.mjs
+  git-panel:
+    text: "Built-in git view"
+    scenario: git-panel.mjs
+  git-actions:
+    text: "Stage / unstage / commit / discard / push / pull"
+    # git-panel stages and unstages; F21-review-changes commits, discards,
+    # pushes to and pulls from a bare remote.
+    scenarios: [git-panel.mjs, F21-review-changes.mjs]
+  git-diff:
+    text: "Inline diff viewer"
+    scenario: git-panel.mjs
+  git-auth:
+    text: "Push with your own credentials"
+    # macOS and Linux: on Windows the test app uses the real home folder, so
+    # it cannot be given its own git config. SSH is not claimed.
+    scenario: git-auth.mjs
+  ghost-text:
+    text: "Ghost-text suggestions"
+    # macOS and Linux: Windows PowerShell has its own predictions, which
+    # Hermes leaves alone (hence "in shells without suggestions of their own").
+    scenario: ghost-text.mjs
+  prompt-composer:
+    text: "Prompts"
+    scenario: HOD-prompts-keyboard.mjs
+  stuck-detection:
+    text: "Stuck detection"
+    scenario: QA-host-stop-hung-agent.mjs
+  project-scanning:
+    text: "Automatic scanning"
+    scenario: project-scanning.mjs
+  context-injection:
+    text: "Context injection"
+    scenario: project-scanning.mjs
+  multi-project:
+    text: "Multi-project support"
+    scenario: project-scanning.mjs
+  command-palette:
+    text: "Command Palette"
+    # Types "close", finds Close Session (with its shortcut) and runs it.
+    scenario: QA-launcher-close-session.mjs
+  session-spend:
+    text: "Spend per session"
+    # F31-estimated-cost: an estimate from the transcript, marked estimated,
+    # with token totals, in the row, header, status bar and Context panel.
+    # QA-status-spend-open-sessions: costs the agents report, added up.
+    scenarios: [F31-estimated-cost.mjs, QA-status-spend-open-sessions.mjs]
+  memory-pins:
+    text: "Memory & context pins"
+    scenario: memory-pins.mjs
+  notifications:
+    text: "System notifications"
+    scenarios: [F12-attention-inbox.mjs, N16-away-notifications.mjs]

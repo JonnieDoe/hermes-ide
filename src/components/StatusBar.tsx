@@ -1,14 +1,104 @@
 import "../styles/components/StatusBar.css";
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { open } from "@tauri-apps/plugin-shell";
-import { setSetting } from "../api/settings";
-import { useActiveSession, useSessionList, useTotalCost, useTotalTokens, useExecutionMode, useSession, ExecutionMode } from "../state/SessionContext";
+import { useActiveSession, useSessionList, useTotalCost, useTotalTokens } from "../state/SessionContext";
 import { PLATFORM, OS_VERSION } from "../utils/platform";
 import { useContextMenu, menuItem } from "../hooks/useContextMenu";
 import { fmt } from "../utils/platform";
+import { useI18n } from "../i18n/I18nProvider";
+import { AgentStatusTag } from "./AgentStatusTag";
+import { isAgentStatusEnabled } from "../agent/status/flag";
+import { useSessionStatus } from "../agent/status/attentionStore";
+import { BLOCKING_STATUS_KINDS } from "../agent/contract/status";
+import { isFeatureFlagEnabled } from "../featureFlags";
+import { spendMember, spendTotalTitle, totalOf, useReportedTotals } from "../fleet/useReportedTotals";
+import { spendTotalText } from "../fleet/spend";
+import { IconButton } from "./ui/Button";
+import { Menu, type MenuAction } from "./ui/Menu";
+
+/**
+ * Below this window width the status bar drops the folder name and the
+ * session's age, and folds Check for updates, Report a Bug and Keyboard
+ * Shortcuts into a "⋯" menu, so every control stays inside the window down
+ * to the smallest size Hermes allows (600 px).
+ */
+export const STATUS_BAR_NARROW_PX = 760;
+
+function useNarrowWindow(maxWidth: number): boolean {
+  const query = `(max-width: ${maxWidth}px)`;
+  const read = () => (typeof window !== "undefined" && typeof window.matchMedia === "function" ? window.matchMedia(query).matches : false);
+  const [narrow, setNarrow] = useState(read);
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    const mq = window.matchMedia(query);
+    const onChange = () => setNarrow(mq.matches);
+    onChange();
+    mq.addEventListener?.("change", onChange);
+    return () => mq.removeEventListener?.("change", onChange);
+  }, [query]);
+  return narrow;
+}
+
+function openBugReport() {
+  const os = PLATFORM === "mac" ? "macOS" : PLATFORM === "win" ? "Windows" : "Linux";
+  const params = new URLSearchParams({
+    template: "bug_report.yml",
+    version: __APP_VERSION__,
+    os,
+    "os-version": OS_VERSION,
+  });
+  open(`https://github.com/hermes-hq/hermes-ide/issues/new?${params}`);
+}
+
+const BUG_ICON = (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M8 2l1.88 1.88" /><path d="M14.12 3.88L16 2" />
+    <path d="M9 7.13v-1a3.003 3.003 0 1 1 6 0v1" />
+    <path d="M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6" />
+    <path d="M12 20v-9" /><path d="M6.53 9C4.6 8.8 3 7.1 3 5" /><path d="M6 13H2" /><path d="M3 21c0-2.1 1.7-3.9 3.8-4" />
+    <path d="M20.97 5c0 2.1-1.6 3.8-3.5 4" /><path d="M22 13h-4" /><path d="M17.2 17c2.1.1 3.8 1.9 3.8 4" />
+  </svg>
+);
+
+const KEYS_ICON = (
+  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <rect x="1.5" y="4" width="13" height="8.5" rx="1.5" />
+    <path d="M4 6.5h.01M6.5 6.5h.01M9 6.5h.01M11.5 6.5h.01M4 9h.01M11.5 9h.01M6 10h4" />
+  </svg>
+);
+
+const UPDATE_ICON = (
+  <svg className="status-version-icon" width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M8 2v9M4.5 7.5L8 11l3.5-3.5" />
+    <path d="M2.5 13.5h11" />
+  </svg>
+);
+
+const MORE_ICON = (
+  <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+    <circle cx="3.5" cy="8" r="1.25" />
+    <circle cx="8" cy="8" r="1.25" />
+    <circle cx="12.5" cy="8" r="1.25" />
+  </svg>
+);
 // Theme switching moved to Settings → Appearance in 1.1.15.  The
 // status bar is for state, not configuration; keeping the picker
 // out of here removes a redundant entry point.
+
+/**
+ * The active session's status in the strip. A status that needs a person
+ * (approval, question, gate, failed check, error, limit) is announced
+ * assertively, like the old needs-input capsule; everything else politely.
+ */
+function AgentStatusStrip({ sessionId }: { sessionId: string }) {
+  const { kind } = useSessionStatus(sessionId);
+  const live = BLOCKING_STATUS_KINDS.includes(kind) ? "assertive" : "polite";
+  return (
+    <span className="status-bar-item status-bar-agent-status" role="status" aria-live={live}>
+      <AgentStatusTag sessionId={sessionId} variant="strip" />
+    </span>
+  );
+}
 
 function formatTokens(n: number): string {
   if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
@@ -16,9 +106,9 @@ function formatTokens(n: number): string {
   return n.toString();
 }
 
-function formatElapsed(createdAt: string): string {
+function formatElapsed(createdAt: string, justNow: string): string {
   const diff = Math.floor((Date.now() - new Date(createdAt).getTime()) / 1000);
-  if (diff < 60) return "just now";
+  if (diff < 60) return justNow;
   if (diff < 3600) return `${Math.floor(diff / 60)}m`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
   return `${Math.floor(diff / 86400)}d`;
@@ -30,18 +120,38 @@ interface StatusBarProps {
   updateVersion?: string;
   updateDownloading?: boolean;
   updateProgress?: number;
+  /** A check the person asked for is running: the chip says "Checking…". */
+  updateChecking?: boolean;
   onShowUpdate?: () => void;
   onCheckForUpdates?: () => void;
 }
 
-export function StatusBar({ onOpenShortcuts, updateAvailable, updateVersion, updateDownloading, updateProgress, onShowUpdate, onCheckForUpdates }: StatusBarProps) {
+export function StatusBar({ onOpenShortcuts, updateAvailable, updateVersion, updateDownloading, updateProgress, updateChecking, onShowUpdate, onCheckForUpdates }: StatusBarProps) {
+  const { t } = useI18n();
+  const narrow = useNarrowWindow(STATUS_BAR_NARROW_PX);
   const active = useActiveSession();
+  // Read once at startup (flags never change while the app runs).
+  const agentStatus = isAgentStatusEnabled();
   const sessions = useSessionList();
-  const totalCost = useTotalCost();
-  const totalTokens = useTotalTokens();
+  const legacyCost = useTotalCost();
+  const legacyTokens = useTotalTokens();
+  // With the 2.0 fleet controls on, the sessions' usage is added up (the
+  // same numbers the rows and the Context panel show): the agents' own
+  // costs, and Hermes's estimates from their transcripts, marked as such.
+  // Tokens read off the screen are never counted.
+  const fleetOn = isFeatureFlagEnabled("fleetControls");
+  // A session whose cost is unknown is counted, never silently left out of
+  // what reads as the total ("≈$0.37 (estimated) · 1 session n/a").
+  const reported = useReportedTotals(sessions.map(spendMember), fleetOn);
+  const totalCost = fleetOn ? reported.costUsd ?? 0 : legacyCost;
+  const fleetCostText = fleetOn ? spendTotalText(totalOf(reported), t) : null;
+  const costText = fleetOn ? fleetCostText ?? "" : `$${totalCost.toFixed(2)}`;
+  const showCost = fleetOn ? fleetCostText !== null && (totalCost > 0 || reported.unknown.length > 0) : totalCost > 0;
+  const totalTokens = useMemo(
+    () => (fleetOn ? { input: reported.inputTokens ?? 0, output: reported.outputTokens ?? 0 } : legacyTokens),
+    [fleetOn, reported.inputTokens, reported.outputTokens, legacyTokens],
+  );
   const hasTokens = totalTokens.input + totalTokens.output > 0;
-  const { dispatch } = useSession();
-  const mode = useExecutionMode(active?.id ?? null);
   const [, setTick] = useState(0);
 
   const handleStatusBarAction = useCallback((actionId: string) => {
@@ -52,7 +162,9 @@ export function StatusBar({ onOpenShortcuts, updateAvailable, updateVersion, upd
         }
         break;
       case "status.copy-cost":
-        navigator.clipboard.writeText(`$${totalCost.toFixed(2)}`).catch(console.error);
+        // What the bar shows: "n/a", or the known part with its ≈ and how
+        // many sessions' cost is unknown, never a bare "$0.00".
+        navigator.clipboard.writeText(costText).catch(console.error);
         break;
       case "status.copy-tokens": {
         const total = totalTokens.input + totalTokens.output;
@@ -60,7 +172,7 @@ export function StatusBar({ onOpenShortcuts, updateAvailable, updateVersion, upd
         break;
       }
     }
-  }, [active, totalCost, totalTokens]);
+  }, [active, costText, totalTokens]);
   const { showMenu: showStatusMenu } = useContextMenu(handleStatusBarAction);
 
   // Update elapsed time every 30s
@@ -70,54 +182,38 @@ export function StatusBar({ onOpenShortcuts, updateAvailable, updateVersion, upd
     return () => clearInterval(interval);
   }, [active?.id]);
 
-  const setMode = (next: ExecutionMode) => {
-    if (!active) return;
-    if (next === mode) return;
-    dispatch({ type: "SET_EXECUTION_MODE", sessionId: active.id, mode: next });
-    dispatch({ type: "SET_DEFAULT_MODE", mode: next });
-    setSetting("execution_mode", next).catch(console.error);
-  };
-  const modeTooltip: Record<ExecutionMode, string> = {
-    manual: "Manual: No automatic suggestions or execution.",
-    assisted: "Assisted: Shows suggestions and lets you manually apply fixes.",
-    autonomous: "Autonomous: Applies frequent commands and repeated fixes after a countdown.",
-  };
   // Version chip state — collapses idle / checking / available / downloading
   // into a single visual element (see docs/design-system/06-components.md).
-  const versionState: "idle" | "available" | "downloading" =
-    updateDownloading ? "downloading" : updateAvailable ? "available" : "idle";
+  const versionState: "idle" | "checking" | "available" | "downloading" =
+    updateDownloading ? "downloading" : updateAvailable ? "available" : updateChecking ? "checking" : "idle";
+  // In a narrow window an idle chip folds into the "⋯" menu; one with news
+  // (checking, an update, a download) stays on the bar.
+  const showChip = !narrow || versionState !== "idle";
+
+  // What the total adds up: the open sessions, said in so many words, since
+  // closing a finished agent takes its spend out of the sum.
+  const [costBefore, costAfter] = t("status.openSessionsSpend", { amount: "\u0000" }).split("\u0000");
+  const costLabelText = t("status.openSessionsSpend", { amount: costText });
+  const costTitle = [t("status.openSessionsOnly"), fleetOn ? spendTotalTitle(costLabelText, reported, t) : costLabelText].join("\n");
+
+  const moreEntries: MenuAction[] = [
+    ...(showChip ? [] : [{ id: "status.check-update", label: t("statusbar.update.check"), icon: UPDATE_ICON, onSelect: () => onCheckForUpdates?.() }]),
+    { id: "status.report-bug", label: t("status.reportBug"), icon: BUG_ICON, onSelect: openBugReport },
+    ...(onOpenShortcuts ? [{ id: "status.shortcuts", label: t("status.keyboardShortcuts", { shortcut: fmt("{mod}/") }), icon: KEYS_ICON, onSelect: onOpenShortcuts }] : []),
+  ];
 
   const cwdBasename = active && active.working_directory ? active.working_directory.replace(/\\/g, "/").split("/").pop() || active.working_directory : "";
   const cwdTooltip = active?.mode === "agent"
-    ? `Project context: ${active.working_directory}`
-    : `Working directory: ${active?.working_directory ?? ""}`;
+    ? t("status.projectContext", { path: active.working_directory })
+    : t("status.workingDirectory", { path: active?.working_directory ?? "" });
 
   return (
     <div className="status-bar">
       <div className="status-bar-left">
         <span className="status-bar-item">
           <span className={`status-dot ${sessions.length > 0 ? "status-dot-on" : ""}`} />
-          {sessions.length} active
+          {t("status.active", { count: sessions.length })}
         </span>
-        {active && active.mode !== "agent" && (
-          <>
-            <span className="status-bar-divider" />
-            <div className="status-mode-segmented" role="radiogroup" aria-label="Execution mode">
-              {(["manual", "assisted", "autonomous"] as const).map((m) => (
-                <button
-                  key={m}
-                  role="radio"
-                  aria-checked={mode === m}
-                  className={`status-mode-seg status-mode-seg-${m}${mode === m ? " is-active" : ""}`}
-                  onClick={() => setMode(m)}
-                  title={modeTooltip[m]}
-                >
-                  {m === "manual" ? "Manual" : m === "assisted" ? "Assisted" : "Auto"}
-                </button>
-              ))}
-            </div>
-          </>
-        )}
         {active?.detected_agent && (
           <>
             <span className="status-bar-divider" />
@@ -126,132 +222,144 @@ export function StatusBar({ onOpenShortcuts, updateAvailable, updateVersion, upd
               {active.detected_agent.model && <span className="status-bar-model"> ({active.detected_agent.model})</span>}
               {active.permission_mode && active.permission_mode !== "default" && (
                 <span className={`status-bar-perm-mode${active.permission_mode === "bypassPermissions" ? " status-bar-perm-mode-danger" : ""}`}>
-                  {active.permission_mode === "acceptEdits" ? "Accept Edits" :
-                   active.permission_mode === "plan" ? "Plan" :
-                   active.permission_mode === "auto" ? "Auto" :
-                   active.permission_mode === "bypassPermissions" ? "Bypass" : ""}
+                  {active.permission_mode === "acceptEdits" ? t("permission.acceptEdits.shortLabel") :
+                   active.permission_mode === "plan" ? t("permission.plan.shortLabel") :
+                   active.permission_mode === "auto" ? t("permission.auto.shortLabel") :
+                   active.permission_mode === "bypassPermissions" ? t("permission.bypassPermissions.shortLabel") : ""}
                 </span>
               )}
-              {active.phase === "busy" && (
+              {!agentStatus && active.phase === "busy" && (
                 <span className="status-capsule status-capsule-busy" role="status" aria-live="polite">
                   <span className="status-capsule-pulse" aria-hidden="true" />
-                  <span className="status-capsule-label">WORKING</span>
+                  <span className="status-capsule-label">{t("status.working")}</span>
                 </span>
               )}
-              {active.phase === "needs_input" && (
+              {/* With the attention inbox on, its title-bar badge says this. */}
+              {!agentStatus && active.phase === "needs_input" && !isFeatureFlagEnabled("attentionInbox") && (
                 <span className="status-capsule status-capsule-needs" role="status" aria-live="assertive">
                   <span className="status-capsule-pulse" aria-hidden="true" />
-                  <span className="status-capsule-label">NEEDS INPUT</span>
+                  <span className="status-capsule-label">{t("status.needsInput")}</span>
                 </span>
               )}
             </span>
+          </>
+        )}
+        {agentStatus && active && active.phase !== "disconnected" && (
+          <>
+            <span className="status-bar-divider" />
+            <AgentStatusStrip sessionId={active.id} />
           </>
         )}
       </div>
       <div className="status-bar-right">
         {hasTokens && (
           <>
-            <span className="status-bar-item status-bar-tokens" title={`Input: ${totalTokens.input.toLocaleString()} · Output: ${totalTokens.output.toLocaleString()}`}>
-              {formatTokens(totalTokens.input + totalTokens.output)} tokens
+            <span className="status-bar-item status-bar-tokens" title={t("statusbar.ioTitle", { input: totalTokens.input.toLocaleString(), output: totalTokens.output.toLocaleString() })}>
+              {t("status.tokens", { count: formatTokens(totalTokens.input + totalTokens.output) })}
             </span>
             <span className="status-bar-divider" />
           </>
         )}
-        {totalCost > 0 && (
+        {showCost && (
           <>
-            <span className="status-bar-item status-bar-cost" onContextMenu={(e) => {
-              showStatusMenu(e, [
-                menuItem("status.copy-cost", "Copy Cost"),
-                menuItem("status.copy-tokens", "Copy Token Count"),
-              ]);
-            }}>${totalCost.toFixed(2)}</span>
+            <span
+              className="status-bar-item status-bar-cost"
+              data-spend={fleetOn ? reported.spend : undefined}
+              data-unknown={fleetOn ? reported.unknown.length : undefined}
+              title={costTitle}
+              onContextMenu={(e) => {
+                showStatusMenu(e, [
+                  menuItem("status.copy-cost", t("status.copyCost")),
+                  menuItem("status.copy-tokens", t("status.copyTokenCount")),
+                ]);
+              }}
+            >
+              {/* The words around the amount give way first (the tooltip has
+                  them); the amount itself is never cut. */}
+              <span className="status-bar-cost-scope status-bar-cost-before">{costBefore}</span>
+              <span className="status-bar-cost-amount">{costText}</span>
+              <span className="status-bar-cost-scope status-bar-cost-after">{costAfter}</span>
+            </span>
             <span className="status-bar-divider" />
           </>
         )}
-        {active && (
+        {/* A narrow window drops these first: the folder and the age. */}
+        {active && !narrow && (
           <>
-            <span className="status-bar-item status-bar-elapsed">{formatElapsed(active.created_at)}</span>
+            <span className="status-bar-item status-bar-elapsed">{formatElapsed(active.created_at, t("time.justNow"))}</span>
             <span className="status-bar-divider" />
-            <span className="status-bar-item mono" title={cwdTooltip} onContextMenu={(e) => {
+            <span className="status-bar-item status-bar-cwd mono" title={cwdTooltip} onContextMenu={(e) => {
               showStatusMenu(e, [
-                menuItem("status.copy-branch", "Copy Working Directory"),
+                menuItem("status.copy-branch", t("status.copyWorkingDirectory")),
               ]);
             }}>{cwdBasename}</span>
             <span className="status-bar-divider" />
           </>
         )}
         {/* Unified version chip — one element, four states:
-            idle / available / downloading. (See docs/design-system/06-components.md.) */}
-        <button
-          className="status-version-chip"
-          data-state={versionState}
-          style={versionState === "downloading"
-            ? { ["--progress" as string]: String(updateProgress ?? 0) }
-            : undefined}
-          title={
-            versionState === "downloading"
-              ? `Downloading v${updateVersion}… ${updateProgress ?? 0}%`
-              : versionState === "available"
-              ? `Update to v${updateVersion}`
-              : "Check for updates"
-          }
-          onClick={
-            versionState === "available" ? onShowUpdate :
-            versionState === "downloading" ? onShowUpdate :
-            onCheckForUpdates
-          }
-        >
-          {versionState === "downloading" && (
-            <span className="status-version-arc" aria-hidden="true" />
-          )}
-          <span className="status-version-label">
-            {versionState === "idle" && `v${__APP_VERSION__}`}
-            {versionState === "available" && `v${updateVersion} ready`}
-            {versionState === "downloading" && `v${__APP_VERSION__} → ${updateVersion}`}
-          </span>
-          {versionState === "downloading" && (
-            <span className="status-version-pct">{updateProgress ?? 0}%</span>
-          )}
-          {versionState === "idle" && (
-            <svg className="status-version-icon" width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-              <path d="M8 2v9M4.5 7.5L8 11l3.5-3.5" />
-              <path d="M2.5 13.5h11" />
-            </svg>
-          )}
-        </button>
+            idle / checking / available / downloading. (See docs/design-system/06-components.md.) */}
+        {showChip && (
+          <button
+            className="status-version-chip"
+            data-state={versionState}
+            aria-busy={versionState === "checking" ? true : undefined}
+            style={versionState === "downloading"
+              ? { ["--progress" as string]: String(updateProgress ?? 0) }
+              : undefined}
+            title={
+              versionState === "downloading"
+                ? `${t("statusbar.update.downloading", { version: updateVersion ?? "" })} ${updateProgress ?? 0}%`
+                : versionState === "available"
+                ? t("statusbar.update.available", { version: updateVersion ?? "" })
+                : versionState === "checking"
+                ? t("statusbar.update.checking")
+                : t("statusbar.update.check")
+            }
+            onClick={
+              versionState === "available" ? onShowUpdate :
+              versionState === "downloading" ? onShowUpdate :
+              versionState === "checking" ? undefined :
+              onCheckForUpdates
+            }
+          >
+            {versionState === "downloading" && (
+              <span className="status-version-arc" aria-hidden="true" />
+            )}
+            <span className="status-version-label">
+              {versionState === "idle" && `v${__APP_VERSION__}`}
+              {versionState === "checking" && t("statusbar.update.checking")}
+              {versionState === "available" && t("statusbar.update.ready", { version: updateVersion ?? "" })}
+              {versionState === "downloading" && t("statusbar.update.downloading", { version: updateVersion ?? "" })}
+            </span>
+            {versionState === "downloading" && (
+              <span className="status-version-pct">{updateProgress ?? 0}%</span>
+            )}
+            {versionState === "idle" && UPDATE_ICON}
+          </button>
+        )}
         {/* ThemePicker removed in 1.1.15 — theme switching now lives
             in Settings → Appearance, the single source of truth.  The
             status bar should communicate state, not configuration. */}
-        <button
-          className="status-bug-btn"
-          onClick={() => {
-            const os = PLATFORM === "mac" ? "macOS" : PLATFORM === "win" ? "Windows" : "Linux";
-            const params = new URLSearchParams({
-              template: "bug_report.yml",
-              version: __APP_VERSION__,
-              os,
-              "os-version": OS_VERSION,
-            });
-            open(`https://github.com/hermes-hq/hermes-ide/issues/new?${params}`);
-          }}
-          title="Report a Bug"
-        >
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M8 2l1.88 1.88" /><path d="M14.12 3.88L16 2" />
-            <path d="M9 7.13v-1a3.003 3.003 0 1 1 6 0v1" />
-            <path d="M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6" />
-            <path d="M12 20v-9" /><path d="M6.53 9C4.6 8.8 3 7.1 3 5" /><path d="M6 13H2" /><path d="M3 21c0-2.1 1.7-3.9 3.8-4" />
-            <path d="M20.97 5c0 2.1-1.6 3.8-3.5 4" /><path d="M22 13h-4" /><path d="M17.2 17c2.1.1 3.8 1.9 3.8 4" />
-          </svg>
-        </button>
-        {onOpenShortcuts && (
-          <button
-            className="status-shortcuts-btn"
-            onClick={onOpenShortcuts}
-            title={`Keyboard Shortcuts (${fmt("{mod}/")})`}
-          >
-            ⌨
-          </button>
+        {narrow ? (
+          <Menu
+            label={t("status.more")}
+            className="status-more-menu"
+            entries={moreEntries}
+            renderTrigger={(p) => <IconButton {...p} size="sm" className="status-more-btn" label={t("status.more")} icon={MORE_ICON} />}
+          />
+        ) : (
+          <>
+            <IconButton size="sm" className="status-bug-btn" label={t("status.reportBug")} onClick={openBugReport} icon={BUG_ICON} />
+            {onOpenShortcuts && (
+              <IconButton
+                size="sm"
+                className="status-shortcuts-btn"
+                label={t("status.keyboardShortcuts", { shortcut: fmt("{mod}/") })}
+                onClick={onOpenShortcuts}
+                icon={KEYS_ICON}
+              />
+            )}
+          </>
         )}
       </div>
     </div>

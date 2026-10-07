@@ -173,6 +173,47 @@ export interface SessionWorktree {
   branchName: string | null;
   isMainWorktree: boolean;
   createdAt: string;
+  /** Another session works in the same checkout (it is not this session's alone). */
+  sharedWithOtherSessions?: boolean;
+  /**
+   * This session owns the checkout alone: a worktree Hermes made for it,
+   * shared with no one. False for the project folder, a checkout made
+   * outside Hermes and a checkout another session also uses.
+   */
+  ownedBySession?: boolean;
+  /** Ports and cloned dependencies, once the worktree was prepared (fast worktrees). */
+  setup?: WorktreeSetup;
+}
+
+// ─── Fast worktrees (N17) ───────────────────────────────────────────
+
+export type DependencyStatus =
+  | "cloned"
+  | "already_there"
+  | "lockfile_changed"
+  | "not_installed_elsewhere"
+  | "copy_on_write_unavailable"
+  | "failed";
+
+export interface DependencySetup {
+  /** "node_modules", "packages/web/node_modules", "src-tauri/target". */
+  folder: string;
+  /** "dependencies" or "build cache". */
+  kind: string;
+  lockfiles: string[];
+  status: DependencyStatus;
+  method?: "clonefile" | "reflink" | "block_clone";
+  /** The checkout it was cloned from. */
+  source?: string;
+  millis: number;
+  detail?: string;
+}
+
+export interface WorktreeSetup {
+  /** This worktree's ports: PORT = base, HERMES_PORT_COUNT = count. */
+  ports?: { base: number; count: number };
+  dependencies: DependencySetup[];
+  millis: number;
 }
 
 export interface WorktreeInfo {
@@ -193,8 +234,16 @@ export interface WorktreeCreateResult {
   worktreePath: string;
   branchName: string;
   isMainWorktree: boolean;
-  /** True when the worktree was reused from another session (branch already checked out). */
-  isShared?: boolean;
+  /** Made, but git reported a problem afterwards (a hook failed), in words. */
+  warning?: string | null;
+}
+
+/** Result of committing a session's uncommitted work on close. */
+export interface CommitOutcome {
+  /** Branch the commit landed on. */
+  branch: string;
+  commit: string;
+  files: number;
 }
 
 // ─── Worktree Changes Types ──────────────────────────────────────────
@@ -204,9 +253,24 @@ export interface WorktreeChangedFile {
   status: string;
 }
 
+/** What a worktree's HEAD is doing (the close dialog's other questions). */
+export interface WorktreeHeadState {
+  /** The branch HEAD is really on; null when detached. */
+  branch: string | null;
+  detached: boolean;
+  head: string | null;
+  /** Commits on a detached HEAD that no branch, tag or remote branch has. */
+  lostCommits: number;
+  /** "rebase" | "merge" | "bisect" | "cherry-pick" | "revert" while one is in progress. */
+  operation: string | null;
+  /** Submodules with uncommitted changes inside them. */
+  dirtySubmodules: string[];
+}
+
 export interface WorktreeChanges {
   has_changes: boolean;
   files: WorktreeChangedFile[];
+  head?: WorktreeHeadState | null;
 }
 
 // ─── Merge Conflict Types ────────────────────────────────────────────
@@ -256,5 +320,44 @@ export interface OrphanWorktree {
 export interface CleanupResult {
   path: string;
   success: boolean;
+  error: string | null;
+}
+
+// ─── Disk guard & worktree hygiene ───────────────────────────────────
+
+export interface DiskStatus {
+  /** Free space on the disk holding the worktrees; null if unreadable. */
+  free_bytes: number | null;
+  /** Below this, new worktrees are refused. */
+  required_bytes: number;
+  below_threshold: boolean;
+}
+
+export interface WorktreeUsage {
+  path: string;
+  total_bytes: number;
+  /** The part of total_bytes that "Remove build output" frees. */
+  build_output_bytes: number;
+}
+
+export interface ReclaimResult {
+  path: string;
+  /** Removed folders, relative to the worktree. */
+  removed: string[];
+  freed_bytes: number;
+  failed: string[];
+}
+
+export interface OrphanFolder {
+  worktree_path: string;
+  repo_path: string | null;
+  repo_exists: boolean;
+  branch_hint: string | null;
+}
+
+export interface SweepResult {
+  path: string;
+  removed: boolean;
+  freed_bytes: number;
   error: string | null;
 }

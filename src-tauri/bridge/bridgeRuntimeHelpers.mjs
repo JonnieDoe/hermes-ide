@@ -129,3 +129,81 @@ export function createControlOpBuffer(handler) {
     pending: () => queue.length,
   };
 }
+
+/**
+ * Normalize a host stdin envelope into the SDKUserMessage shape the SDK
+ * expects.  Old Hermes envelopes lack `parent_tool_use_id`; the SDK wants
+ * null, not absent.  `session_id` falls back to the spawn-time id.
+ *
+ * `origin` (SDK 0.3.x provenance) is passed through only when the host
+ * set it — the composer stamps `{ kind: "human" }` on typed messages.
+ * The bridge never invents one: an envelope without `origin` stays
+ * unattributed, which the SDK treats as not-human (fails closed).
+ */
+export function toSdkUserMessage(next, fallbackSessionId) {
+  const sessionId = next.session_id ?? fallbackSessionId;
+  return {
+    type: "user",
+    message: next.message,
+    parent_tool_use_id: next.parent_tool_use_id ?? null,
+    uuid: next.uuid,
+    ...(sessionId ? { session_id: sessionId } : {}),
+    ...(next.origin && typeof next.origin.kind === "string" ? { origin: next.origin } : {}),
+  };
+}
+
+/**
+ * Build the env for the Claude subprocess the SDK spawns.
+ *
+ * Claude Code only loads CLAUDE.md files from `--add-dir` folders when
+ * `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` is set.  Hermes passes
+ * every attached folder as an additional directory, so we turn it on by
+ * default — unless the user already set it (either way) in their env.
+ *
+ * @param {Record<string, string | undefined>} baseEnv
+ * @param {string} clientApp
+ * @returns {Record<string, string | undefined>}
+ */
+export function buildSdkEnv(baseEnv, clientApp) {
+  return {
+    CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: "1",
+    ...baseEnv,
+    CLAUDE_AGENT_SDK_CLIENT_APP: clientApp,
+  };
+}
+
+/**
+ * Warnings the bridge expects and acts on by design, by code. They went to
+ * stderr, and the Agent view showed them as an STDERR panel under the
+ * conversation as if something were wrong.
+ *
+ *   CLAUDE_SDK_CAN_USE_TOOL_SHADOWED  the SDK notes that the tools in
+ *     `allowedTools` (Hermes's own MCP tools and the task list) are approved
+ *     without asking `canUseTool`. That is exactly why they are listed.
+ */
+export const EXPECTED_WARNING_CODES = new Set(["CLAUDE_SDK_CAN_USE_TOOL_SHADOWED"]);
+
+/**
+ * Wraps `proc.emitWarning` so warnings with a code in `codes` are dropped
+ * and every other warning is emitted as before. Returns a function that
+ * puts the original back.
+ *
+ * @param {{ emitWarning: (...args: unknown[]) => void }} proc
+ * @param {Set<string>} [codes]
+ */
+export function quietExpectedWarnings(proc, codes = EXPECTED_WARNING_CODES) {
+  const original = proc.emitWarning;
+  proc.emitWarning = function emitWarning(warning, ...rest) {
+    // emitWarning(warning, { code }), emitWarning(warning, type, code), or an Error carrying .code.
+    const options = rest[0];
+    const code =
+      (options && typeof options === "object" ? options.code : undefined) ??
+      (typeof rest[1] === "string" ? rest[1] : undefined) ??
+      (warning && typeof warning === "object" ? warning.code : undefined);
+    if (typeof code === "string" && codes.has(code)) return;
+    return original.call(this, warning, ...rest);
+  };
+  return () => {
+    proc.emitWarning = original;
+  };
+}

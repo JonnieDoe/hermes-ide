@@ -190,7 +190,7 @@ describe("createWorktree with fromRemote", () => {
       branchName: "feature",
       createBranch: false,
       fromRemote: null,
-      worktreeBasePath: null,
+      enforceDiskGuard: true,
     });
   });
 
@@ -202,7 +202,7 @@ describe("createWorktree with fromRemote", () => {
       branchName: "feature",
       createBranch: false,
       fromRemote: "origin/feature",
-      worktreeBasePath: null,
+      enforceDiskGuard: true,
     });
   });
 
@@ -214,7 +214,7 @@ describe("createWorktree with fromRemote", () => {
       branchName: "feature",
       createBranch: true,
       fromRemote: null,
-      worktreeBasePath: null,
+      enforceDiskGuard: true,
     });
   });
 });

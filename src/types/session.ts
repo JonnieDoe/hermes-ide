@@ -1,3 +1,5 @@
+import type { AgentLaunchOptions } from "../agent/capabilities/types";
+
 // ─── Session Types (mirror Rust structs) ─────────────────────────────
 
 export interface AgentInfo {
@@ -76,6 +78,7 @@ export interface SshConnectionInfo {
   user: string;
   tmux_session?: string | null;
   identity_file?: string | null;
+  jump_host?: string | null;
   port_forwards: PortForward[];
 }
 
@@ -93,9 +96,11 @@ export interface TmuxWindowEntry {
 
 /**
  * How the session is run and rendered.
- *  - `terminal`: existing PTY/xterm flow.  All non-Claude sessions use this.
- *  - `agent`:    `claude --print` stream-json subprocess driving an
- *                `<AgentSessionView>` chat surface.  Claude-only in 1.0.0.
+ *  - `terminal`: the agent's (or shell's) own interface in a PTY/xterm.  The
+ *                default for every provider, Claude included (ADR 003).
+ *  - `agent`:    the optional Agent view.  A per-session Node bridge running
+ *                the Claude Agent SDK drives an `<AgentSessionView>`.  Claude
+ *                only, and only when the user asks for it.
  */
 export type SessionMode = "terminal" | "agent";
 
@@ -120,12 +125,56 @@ export interface SessionData {
    *  "wsl", "nice -n 10"). Trimmed. Ignored for SSH sessions. */
   custom_prefix: string;
   custom_suffix: string;
+  /** Custom agent only: the name the user gave it ("" otherwise). */
+  agent_name?: string;
+  /** Custom agent only: the command that starts it ("" otherwise). */
+  agent_command?: string;
   channels: string[];
   context_injected: boolean;
   ssh_info: SshConnectionInfo | null;
-  /** "terminal" → existing PTY/xterm flow.  "agent" → `claude --print`
-   *  stream-json subprocess + AgentSessionView render.  Claude-only in 1.0.0. */
+  /** "terminal" (default) → the agent's own interface in a PTY/xterm.
+   *  "agent" → optional Agent view (SDK bridge + AgentSessionView), Claude only. */
   mode: SessionMode;
+  /** The agent's own conversation id (pre-assigned or recorded at launch
+   *  when the `launchHelper` flag is on). Saved with the workspace so a
+   *  restore resumes the same conversation. Absent on older backends. */
+  vendor_session_id?: string | null;
+  /** Startup state of an agent started through the `hi` helper. */
+  agent_startup?: AgentStartup | null;
+  /** The terminal lives in the background session host (N20) and survives
+   *  quit, update and crash. Absent on older backends. */
+  hosted?: boolean;
+  /** This create reattached to a program the host kept running: its output
+   *  was replayed into the terminal, so no saved scrollback is written. */
+  reattached?: boolean;
+  /** N19: the session this one continues or duplicates (a handoff). */
+  parent_session_id?: string | null;
+  /** 2.0 launch contract: what the agent was started with (the model chip
+   *  shows the model as "requested" until the agent reports its own). */
+  agent_launch?: SessionAgentLaunch | null;
+}
+
+/** What a terminal agent was launched with (camelCase, as the backend sends it). */
+export interface SessionAgentLaunch {
+  /** null: the default model (no flag). */
+  modelId?: string | null;
+  effort?: string | null;
+  /** null: the default profile. */
+  accountId?: string | null;
+  profileEnv?: { name: string; value: string } | null;
+  /** The session runs the CLI's sign-in (Add account), not the agent. */
+  login?: boolean;
+}
+
+export type AgentStartupState = "launching" | "started" | "waiting_at_startup_prompt" | "ended";
+
+export interface AgentStartup {
+  state: AgentStartupState;
+  /** When the state was entered (RFC 3339). */
+  since: string;
+  /** "exact" when the agent signalled it, "guessed" for a timeout. */
+  confidence: "exact" | "guessed" | string;
+  detail?: string | null;
 }
 
 export interface SessionHistoryEntry {
@@ -138,10 +187,6 @@ export interface SessionHistoryEntry {
   closed_at: string | null;
   scrollback_preview: string | null;
 }
-
-// ─── Execution Mode ──────────────────────────────────────────────────
-
-export type ExecutionMode = "manual" | "assisted" | "autonomous";
 
 // ─── Permission Mode ────────────────────────────────────────────────
 
@@ -162,21 +207,41 @@ export interface CreateSessionOpts {
   permissionMode?: string;
   customPrefix?: string;
   customSuffix?: string;
+  /** Custom agent only: the name shown for the session. */
+  agentName?: string;
+  /** Custom agent only: the command typed to start it. */
+  agentCommand?: string;
   projectIds?: string[];
   branchName?: string;
   createNewBranch?: boolean;
   /** Per-project branch selections: projectId -> { branch, createNew, fromRemote? } */
-  branchSelections?: Record<string, { branch: string; createNew: boolean; fromRemote?: string }>;
+  branchSelections?: Record<string, { branch: string; createNew: boolean; fromRemote?: string; baseBranch?: string }>;
   channels?: string[];
   sshHost?: string;
   sshPort?: number;
   sshUser?: string;
   tmuxSession?: string;
   sshIdentityFile?: string;
-  /** Custom base path for git worktrees for this session. */
-  worktreeBasePath?: string;
+  sshJumpHost?: string;
   /** Frontend-chosen session mode.  Defaults to `agent` for Claude, `terminal` otherwise. */
   mode?: SessionMode;
+  /** Task launcher (F15): the task, handed to the agent as its first prompt.
+   *  A terminal agent gets it on its launch line through the `hi` helper
+   *  (so the helper is used for this session whatever the launchHelper
+   *  flag says); the Agent view gets it as the first message. */
+  initialPrompt?: string;
+  /** A library persona added to the agent's system prompt through its catalog's
+   *  `system_prompt` flag (terminal agents with a proven flag only; the launcher
+   *  puts the persona in the first prompt for every other agent). */
+  systemPrompt?: string;
+  /** N19 handoff: the new agent's first prompt (the task and the work so
+   *  far). Passed only as a launch argument through the `hi` helper. */
+  seedPrompt?: string;
+  /** N19 handoff: the session this one continues or duplicates. */
+  parentSessionId?: string;
+  /** 2.0 launch contract (src/agent/capabilities): the model, effort and
+   *  account to start the agent with (helper launch only). */
+  agentLaunch?: AgentLaunchOptions;
 }
 
 // ─── Workspace Restore ──────────────────────────────────────────────
@@ -193,6 +258,9 @@ export interface SavedSessionInfo {
   permission_mode: string;
   custom_prefix: string;
   custom_suffix: string;
+  /** Custom agent only. Optional: older saves predate it. */
+  agent_name?: string;
+  agent_command?: string;
   project_ids: string[];
   ssh_info?: SshConnectionInfo | null;
   /** Optional for backward compat with 0.6.16 saved workspaces.
@@ -213,6 +281,18 @@ export interface SavedSessionInfo {
   agent_effort?: string;
   /** Currently-attached additional directories (Hermes' projects). */
   agent_add_dirs?: string[];
+  // ─── Terminal-agent resume (launchHelper flag) ───────────────────
+  /** The agent's own conversation id for a terminal session (Claude or
+   *  Gemini session id, Codex thread id). On restore the agent is resumed
+   *  with it; agents without resume start fresh. Optional: older saves and
+   *  sessions started without the helper have none. */
+  vendor_session_id?: string;
+  /** N19: the session this one was handed off from, so it is shown under
+   *  that session again after a restart. */
+  parent_session_id?: string;
+  /** 2.0: the model, effort and account the terminal agent was started with,
+   *  so a restore resumes it in the same profile with the same choice. */
+  agent_launch?: { modelId?: string | null; effort?: string | null; accountId?: string | null };
 }
 
 export interface SavedWorkspace {
@@ -262,6 +342,8 @@ export function validateSavedWorkspace(raw: unknown): SavedWorkspace | null {
     }
     if (typeof si.custom_prefix !== "string") si.custom_prefix = "";
     if (typeof si.custom_suffix !== "string") si.custom_suffix = "";
+    if (si.agent_name !== undefined && typeof si.agent_name !== "string") delete si.agent_name;
+    if (si.agent_command !== undefined && typeof si.agent_command !== "string") delete si.agent_command;
     if (!Array.isArray(si.project_ids)) si.project_ids = [];
     // Default missing `mode` to "terminal" so existing 0.6.16 workspaces
     // never silently auto-convert sessions to agent mode on restore.
@@ -282,6 +364,25 @@ export function validateSavedWorkspace(raw: unknown): SavedWorkspace | null {
     if (si.agent_add_dirs !== undefined && !Array.isArray(si.agent_add_dirs)) {
       delete si.agent_add_dirs;
     }
+    // A conversation id is a non-empty string or nothing at all.
+    if (si.vendor_session_id !== undefined && (typeof si.vendor_session_id !== "string" || !si.vendor_session_id)) {
+      delete si.vendor_session_id;
+    }
+    if (si.parent_session_id !== undefined && (typeof si.parent_session_id !== "string" || !si.parent_session_id)) {
+      delete si.parent_session_id;
+    }
+    // The launch choice: an object of optional strings, else dropped.
+    if (si.agent_launch !== undefined) {
+      const l = si.agent_launch as unknown;
+      const okField = (v: unknown) => v === undefined || v === null || typeof v === "string";
+      if (!l || typeof l !== "object" || Array.isArray(l)) {
+        delete si.agent_launch;
+      } else {
+        const o = l as Record<string, unknown>;
+        if (!okField(o.modelId) || !okField(o.effort) || !okField(o.accountId)) delete si.agent_launch;
+        else si.agent_launch = { modelId: (o.modelId as string | null | undefined) ?? null, effort: (o.effort as string | null | undefined) ?? null, accountId: (o.accountId as string | null | undefined) ?? null };
+      }
+    }
   }
 
   return {
@@ -290,6 +391,13 @@ export function validateSavedWorkspace(raw: unknown): SavedWorkspace | null {
     layout: obj.layout ?? null,
     focused_pane_id: typeof obj.focused_pane_id === "string" ? obj.focused_pane_id : null,
     active_session_id: typeof obj.active_session_id === "string" ? obj.active_session_id : null,
+    // Passed through; the restore path checks each field with
+    // loadWorkbenchLayout / loadNotesMap.
+    workbench: obj.workbench,
+    notes:
+      obj.notes !== null && typeof obj.notes === "object" && !Array.isArray(obj.notes)
+        ? (obj.notes as Record<string, string>)
+        : undefined,
   };
 }
 
@@ -304,20 +412,16 @@ export type SessionAction =
   | { type: "SET_RECENT"; entries: SessionHistoryEntry[] }
   | { type: "TOGGLE_CONTEXT" }
   | { type: "TOGGLE_USAGE" }
+  | { type: "TOGGLE_TRACK" }
   | { type: "TOGGLE_SIDEBAR" }
   | { type: "TOGGLE_PALETTE" }
   | { type: "CLOSE_PALETTE" }
-  | { type: "SET_EXECUTION_MODE"; sessionId: string; mode: ExecutionMode }
-  | { type: "SET_DEFAULT_MODE"; mode: ExecutionMode }
   /** Convert an existing session to a different runtime mode (terminal ↔ agent).
    *  The caller is responsible for tearing down the previous-mode subprocess
    *  and spawning the new one before/after dispatching this action. */
   | { type: "SET_SESSION_MODE"; sessionId: string; mode: SessionMode }
   | { type: "TOGGLE_FLOW_MODE" }
-  | { type: "SHOW_AUTO_TOAST"; command: string; reason: string; sessionId: string }
-  | { type: "DISMISS_AUTO_TOAST" }
   | { type: "TOGGLE_AUTO_APPLY" }
-  | { type: "SET_AUTONOMOUS_SETTINGS"; settings: Partial<{ commandMinFrequency: number; cancelDelayMs: number }> }
   // Injection lock actions
   | { type: "ACQUIRE_INJECTION_LOCK"; sessionId: string }
   | { type: "RELEASE_INJECTION_LOCK"; sessionId: string }
@@ -328,6 +432,8 @@ export type SessionAction =
   | { type: "FOCUS_PANE"; paneId: string }
   | { type: "RESIZE_SPLIT"; splitId: string; ratio: number }
   | { type: "SET_PANE_SESSION"; paneId: string; sessionId: string }
+  /** F24: replace the layout with a grid of these sessions (see state/tileLayout.ts). */
+  | { type: "TILE_SESSIONS"; sessionIds: string[] }
   // Close confirmation actions
   | { type: "REQUEST_CLOSE_SESSION"; id: string }
   | { type: "CANCEL_CLOSE_SESSION" }

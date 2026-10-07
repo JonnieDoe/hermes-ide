@@ -1,6 +1,7 @@
 import "../styles/components/UpdateDialog.css";
 import { open } from "@tauri-apps/plugin-shell";
 import type { UpdateState } from "../hooks/useAutoUpdater";
+import { Button } from "./ui";
 
 interface UpdateDialogProps {
   state: UpdateState;
@@ -8,6 +9,8 @@ interface UpdateDialogProps {
   onDownload: () => void;
   onCancel: () => void;
   onInstall: () => void;
+  /** Force-installs even while sessions are busy ("Relaunch now" override). */
+  onRelaunchNow: () => void;
 }
 
 function formatBytes(bytes: number): string {
@@ -17,11 +20,13 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export function UpdateDialog({ state, onDismiss, onDownload, onCancel, onInstall }: UpdateDialogProps) {
+export function UpdateDialog({ state, onDismiss, onDownload, onCancel, onInstall, onRelaunchNow }: UpdateDialogProps) {
   if (!state.available || state.dismissed) return null;
 
   const showByteProgress = state.downloading && state.totalBytes > 0;
   const isBusy = state.downloading || state.installing;
+  // Sessions are working — the updater waits instead of relaunching (N10).
+  const waitingForAgents = state.ready && state.busySessionCount > 0 && !state.installing;
 
   return (
     <div className="update-dialog-backdrop" onClick={isBusy ? undefined : onDismiss}>
@@ -59,7 +64,14 @@ export function UpdateDialog({ state, onDismiss, onDownload, onCancel, onInstall
           </div>
         )}
 
-        {state.ready && !state.error && (
+        {state.ready && !state.error && waitingForAgents && (
+          <div className="update-dialog-ready update-dialog-waiting">
+            Update ready, waiting for {state.busySessionCount} working agent
+            {state.busySessionCount === 1 ? "" : "s"}
+          </div>
+        )}
+
+        {state.ready && !state.error && !waitingForAgents && (
           <div className="update-dialog-ready">
             Download complete. Click below to install and restart.
           </div>
@@ -72,47 +84,49 @@ export function UpdateDialog({ state, onDismiss, onDownload, onCancel, onInstall
         )}
 
         <div className="update-dialog-actions">
-          <button
-            className="update-dialog-btn"
+          <Button
+            variant="quiet"
+            className="update-dialog-btn-changelog"
             onClick={() => open("https://hermes-ide.com/changelog")}
           >
             Changelog
-          </button>
+          </Button>
+          <span className="update-dialog-spacer" />
 
           {state.downloading ? (
-            <button className="update-dialog-btn update-dialog-btn-cancel" onClick={onCancel}>
+            <Button className="update-dialog-btn-cancel" onClick={onCancel}>
               Cancel
-            </button>
+            </Button>
           ) : state.installing ? null : (
-            <button className="update-dialog-btn" onClick={onDismiss}>
+            <Button className="update-dialog-btn-later" onClick={onDismiss}>
               Later
-            </button>
+            </Button>
           )}
 
-          {state.ready ? (
-            <button
-              className="update-dialog-btn update-dialog-btn-primary"
+          {state.ready && waitingForAgents ? (
+            <Button variant="primary" className="update-dialog-btn-primary" onClick={onRelaunchNow}>
+              Relaunch now
+            </Button>
+          ) : state.ready ? (
+            <Button
+              variant="primary"
+              className="update-dialog-btn-primary"
               onClick={onInstall}
               disabled={state.installing}
-              aria-busy={state.installing || undefined}
+              loading={state.installing}
             >
-              {state.installing ? (
-                <>
-                  <span className="update-dialog-spinner" aria-hidden="true" />
-                  Installing&hellip;
-                </>
-              ) : (
-                <>Install &amp; Relaunch</>
-              )}
-            </button>
+              {state.installing ? <>Installing&hellip;</> : <>Install &amp; Relaunch</>}
+            </Button>
           ) : (
-            <button
-              className="update-dialog-btn update-dialog-btn-primary"
+            <Button
+              variant="primary"
+              className="update-dialog-btn-primary"
               onClick={onDownload}
               disabled={state.downloading}
+              loading={state.downloading}
             >
               {state.downloading ? `Downloading ${state.progress}%` : state.error ? "Retry" : "Update Now"}
-            </button>
+            </Button>
           )}
         </div>
       </div>

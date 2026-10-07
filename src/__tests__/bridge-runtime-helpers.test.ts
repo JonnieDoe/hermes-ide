@@ -16,7 +16,14 @@ import { describe, it, expect, vi } from "vitest";
 import {
   createIdempotentLatch,
   createControlOpBuffer,
+  toSdkUserMessage,
+  buildSdkEnv,
+  quietExpectedWarnings,
 } from "../../src-tauri/bridge/bridgeRuntimeHelpers.mjs";
+import { buildUserEnvelope } from "../utils/submitToAgent";
+
+vi.mock("@tauri-apps/api/event", () => ({ emit: vi.fn() }));
+vi.mock("../api/agent", () => ({ sendAgentInput: vi.fn() }));
 
 describe("createIdempotentLatch", () => {
   it("resolves the promise on first call", async () => {
@@ -132,5 +139,64 @@ describe("createControlOpBuffer", () => {
     expect(buf.isReady()).toBe(false);
     await buf.markReady();
     expect(buf.isReady()).toBe(true);
+  });
+});
+
+describe("toSdkUserMessage — SDK `origin` provenance", () => {
+  it("composer path: a typed message reaches the SDK stamped as human", () => {
+    const env = buildUserEnvelope("hello", [])!;
+    const msg = toSdkUserMessage(JSON.parse(JSON.stringify(env)), "sid-1");
+    expect(msg.origin).toEqual({ kind: "human" });
+    expect(msg.message).toEqual(env.message);
+    expect(msg.session_id).toBe("sid-1");
+    expect(msg.parent_tool_use_id).toBeNull();
+  });
+
+  it("injected path: an envelope without origin stays unattributed (never defaulted to human)", () => {
+    const injected = {
+      type: "user",
+      uuid: "u-1",
+      message: { role: "user", content: [{ type: "text", text: "injected" }] },
+    };
+    const msg = toSdkUserMessage(injected, "sid-1");
+    expect("origin" in msg).toBe(false);
+  });
+
+  it("passes a non-human origin through unchanged", () => {
+    const origin = { kind: "peer", from: "other-session" };
+    const msg = toSdkUserMessage({ type: "user", message: {}, origin }, undefined);
+    expect(msg.origin).toEqual(origin);
+    expect("session_id" in msg).toBe(false);
+  });
+});
+
+describe("buildSdkEnv", () => {
+  it("enables CLAUDE.md loading from --add-dir folders by default", () => {
+    const env = buildSdkEnv({ PATH: "/usr/bin" }, "hermes-ide/v1");
+    expect(env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD).toBe("1");
+    expect(env.CLAUDE_AGENT_SDK_CLIENT_APP).toBe("hermes-ide/v1");
+    expect(env.PATH).toBe("/usr/bin");
+  });
+
+  it("respects an explicit user value, including opting out", () => {
+    const env = buildSdkEnv({ CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: "0" }, "x");
+    expect(env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD).toBe("0");
+  });
+});
+
+describe("quietExpectedWarnings", () => {
+  it("drops the SDK's note about tools the bridge approves on purpose, and nothing else", () => {
+    const seen: unknown[][] = [];
+    const proc = { emitWarning: (...args: unknown[]) => { seen.push(args); } };
+    const restore = quietExpectedWarnings(proc);
+    proc.emitWarning("canUseTool will not be invoked for: mcp__hermes__*", { code: "CLAUDE_SDK_CAN_USE_TOOL_SHADOWED" });
+    proc.emitWarning("same, older signature", "Warning", "CLAUDE_SDK_CAN_USE_TOOL_SHADOWED");
+    proc.emitWarning(Object.assign(new Error("as an Error"), { code: "CLAUDE_SDK_CAN_USE_TOOL_SHADOWED" }));
+    proc.emitWarning("something else", { code: "SOME_OTHER_WARNING" });
+    proc.emitWarning("no code at all");
+    expect(seen.map((a) => (a[0] instanceof Error ? a[0].message : a[0]))).toEqual(["something else", "no code at all"]);
+    restore();
+    proc.emitWarning("back to normal", { code: "CLAUDE_SDK_CAN_USE_TOOL_SHADOWED" });
+    expect(seen).toHaveLength(3);
   });
 });

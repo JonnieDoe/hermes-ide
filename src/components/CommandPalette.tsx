@@ -3,10 +3,21 @@ import { useState, useEffect, useRef, useMemo } from "react";
 import { SessionData } from "../state/SessionContext";
 import { useTextContextMenu } from "../hooks/useTextContextMenu";
 import { fmt } from "../utils/platform";
+import { shortcutLabel } from "../utils/keymap";
+import { useI18n } from "../i18n/I18nProvider";
+import { overlayOpened } from "../state/overlays";
+import { ListRow } from "./ui/ListRow";
 
 interface CommandPaletteProps {
   onClose: () => void;
+  /** In the sidebar's order, which is the order ⌘1–⌘9 switch to (their labels here follow it). */
   sessions: SessionData[];
+  /** Ends the session in view, through the usual close checks. */
+  onCloseSession?: () => void;
+  /** The same, said for a session that has its own worktree (the close asks what to do with its changes). */
+  onCloseSessionRemoveWorktree?: () => void;
+  /** The session in view: its row is marked as the current one. */
+  activeSessionId?: string | null;
   onSelectSession: (id: string) => void;
   onNewSession: () => void;
   onToggleContext: () => void;
@@ -15,12 +26,22 @@ interface CommandPaletteProps {
   onOpenWorkspace: () => void;
   onOpenCostDashboard?: () => void;
   onToggleFlowMode?: () => void;
+  /** F24: tile the sessions whose agent is working (fleetPerf flag). */
+  onTileWorkingAgents?: () => void;
   onAttachProject?: () => void;
   onScanCwd?: () => void;
   onOpenComposer?: () => void;
+  /** The prompt library. */
+  onOpenLibrary?: () => void;
   onOpenShortcuts?: () => void;
   onToggleGit?: () => void;
+  /** F21: label the git entry "Review Desk" when the flag routes ⌘G there. */
+  reviewDesk?: boolean;
   onToggleSearch?: () => void;
+  /** Feature Tracks (F28), only while the flag is on. */
+  onToggleTrack?: () => void;
+  onApproveGate?: () => void;
+  onMakeFeature?: () => void;
   pluginCommands?: { command: string; title: string; category?: string; pluginId: string; pluginName: string }[];
   pluginsWithSettings?: { pluginId: string; pluginName: string }[];
   onPluginCommand?: (commandId: string) => void;
@@ -37,57 +58,67 @@ interface Command {
 }
 
 export function CommandPalette({
-  onClose, sessions, onSelectSession, onNewSession, onToggleContext, onToggleSessions, onOpenSettings, onOpenWorkspace, onOpenCostDashboard, onToggleFlowMode, onAttachProject, onScanCwd, onOpenComposer, onOpenShortcuts, onToggleGit, onToggleSearch, pluginCommands, pluginsWithSettings, onPluginCommand, onCheckPluginUpdates,
+  onClose, sessions, onCloseSession, onCloseSessionRemoveWorktree, activeSessionId, onSelectSession, onNewSession, onToggleContext, onToggleSessions, onOpenSettings, onOpenWorkspace, onOpenCostDashboard, onToggleFlowMode, onTileWorkingAgents, onAttachProject, onScanCwd, onOpenComposer, onOpenLibrary, onOpenShortcuts, onToggleGit, reviewDesk, onToggleSearch, onToggleTrack, onApproveGate, onMakeFeature, pluginCommands, pluginsWithSettings, onPluginCommand, onCheckPluginUpdates,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const { onContextMenu: textContextMenu } = useTextContextMenu();
+  const { t, currentLanguage } = useI18n();
 
   const commands: Command[] = useMemo(() => [
-    { id: "new", label: "New Session", category: "Session", shortcut: fmt("{mod}N"), action: () => { onNewSession(); onClose(); } },
-    { id: "ctx", label: "Toggle Context Panel", category: "View", shortcut: fmt("{mod}E"), action: () => { onToggleContext(); onClose(); } },
-    { id: "sidebar", label: "Toggle Sidebar", category: "View", shortcut: fmt("{mod}B"), action: () => { onToggleSessions(); onClose(); } },
-    { id: "settings", label: "Settings", category: "App", shortcut: fmt("{mod},"), action: () => { onOpenSettings(); onClose(); } },
-    { id: "settings-general", label: "Settings / General", category: "Settings", hidden: true, action: () => { onOpenSettings("general"); onClose(); } },
-    { id: "settings-appearance", label: "Settings / Appearance", category: "Settings", hidden: true, action: () => { onOpenSettings("appearance"); onClose(); } },
-    { id: "settings-theme", label: "Settings / Theme", category: "Settings", hidden: true, action: () => { onOpenSettings("appearance"); onClose(); } },
-    { id: "settings-autonomous", label: "Settings / Autonomous", category: "Settings", hidden: true, action: () => { onOpenSettings("autonomous"); onClose(); } },
-    { id: "settings-git", label: "Settings / Git", category: "Settings", hidden: true, action: () => { onOpenSettings("git"); onClose(); } },
-    { id: "settings-privacy", label: "Settings / Privacy", category: "Settings", hidden: true, action: () => { onOpenSettings("privacy"); onClose(); } },
-        { id: "settings-shortcuts", label: "Settings / Shortcuts", category: "Settings", hidden: true, action: () => { onOpenSettings("shortcuts"); onClose(); } },
-    { id: "settings-plugins", label: "Settings / Plugins", category: "Settings", hidden: true, action: () => { onOpenSettings("plugins"); onClose(); } },
+    { id: "new", label: t("palette.newSession"), category: t("app.session"), shortcut: shortcutLabel("file.new-session"), action: () => { onNewSession(); onClose(); } },
+    ...(onCloseSession ? [{ id: "close-session", label: t("palette.closeSession"), category: t("app.session"), shortcut: shortcutLabel("session.close-session"), action: () => { onClose(); onCloseSession(); } }] : []),
+    ...(onCloseSessionRemoveWorktree ? [{ id: "close-session-worktree", label: t("palette.closeSessionRemoveWorktree"), category: t("app.session"), action: () => { onClose(); onCloseSessionRemoveWorktree(); } }] : []),
+    { id: "ctx", label: t("palette.toggleContext"), category: t("app.view"), shortcut: shortcutLabel("view.context-panel"), action: () => { onToggleContext(); onClose(); } },
+    { id: "sidebar", label: t("palette.toggleSidebar"), category: t("app.view"), shortcut: shortcutLabel("view.toggle-sidebar"), action: () => { onToggleSessions(); onClose(); } },
+    { id: "settings", label: t("app.settings"), category: t("app.app"), shortcut: fmt("{mod},"), action: () => { onOpenSettings(); onClose(); } },
+    { id: "settings-general", label: t("palette.settingsGeneral"), category: t("app.settings"), hidden: true, action: () => { onOpenSettings("general"); onClose(); } },
+    { id: "settings-appearance", label: t("palette.settingsAppearance"), category: t("app.settings"), hidden: true, action: () => { onOpenSettings("appearance"); onClose(); } },
+    { id: "settings-theme", label: t("palette.settingsTheme"), category: t("app.settings"), hidden: true, action: () => { onOpenSettings("appearance"); onClose(); } },
+    { id: "settings-git", label: t("palette.settingsGit"), category: t("app.settings"), hidden: true, action: () => { onOpenSettings("git"); onClose(); } },
+    { id: "settings-privacy", label: t("palette.settingsPrivacy"), category: t("app.settings"), hidden: true, action: () => { onOpenSettings("privacy"); onClose(); } },
+    { id: "settings-shortcuts", label: t("palette.settingsShortcuts"), category: t("app.settings"), hidden: true, action: () => { onOpenSettings("shortcuts"); onClose(); } },
+    { id: "settings-plugins", label: t("palette.settingsPlugins"), category: t("app.settings"), hidden: true, action: () => { onOpenSettings("plugins"); onClose(); } },
     ...(pluginsWithSettings ?? []).map(p => ({
       id: `settings-plugin-${p.pluginId}`,
-      label: `Settings / ${p.pluginName}`,
-      category: "Plugin Settings",
+      label: t("palette.pluginSettings", { name: p.pluginName }),
+      category: t("app.plugins"),
       hidden: true,
       action: () => { onOpenSettings("plugins"); onClose(); },
     })),
-    { id: "workspace", label: "Folders", category: "App", action: () => { onOpenWorkspace(); onClose(); } },
-    ...(onOpenCostDashboard ? [{ id: "cost-dashboard", label: "Cost Dashboard", category: "App", shortcut: fmt("{mod}$"), action: () => { onOpenCostDashboard(); onClose(); } }] : []),
-    ...(onToggleFlowMode ? [{ id: "flow-mode", label: "Toggle Flow Mode", category: "View", shortcut: fmt("{mod}{shift}Z"), action: () => { onToggleFlowMode(); onClose(); } }] : []),
-    ...(onAttachProject ? [{ id: "attach-project", label: "Add Folder...", category: "Folders", action: () => { onAttachProject(); onClose(); } }] : []),
-    ...(onScanCwd ? [{ id: "scan-cwd", label: "Scan Current Directory", category: "Folders", action: () => { onScanCwd(); onClose(); } }] : []),
-    ...(onOpenComposer ? [{ id: "composer", label: "Prompt Composer", category: "Tools", shortcut: fmt("{mod}J"), action: () => { onOpenComposer(); onClose(); } }] : []),
-    ...(onOpenShortcuts ? [{ id: "shortcuts", label: "Keyboard Shortcuts", category: "Help", shortcut: fmt("{mod}/"), action: () => { onOpenShortcuts(); onClose(); } }] : []),
-    ...(onToggleGit ? [{ id: "git", label: "Toggle Git Panel", category: "View", shortcut: fmt("{mod}G"), action: () => { onToggleGit(); onClose(); } }] : []),
-    ...(onToggleSearch ? [{ id: "search", label: "Search in Folder", category: "View", shortcut: fmt("{mod}{shift}F"), action: () => { onToggleSearch(); onClose(); } }] : []),
+    { id: "workspace", label: t("app.folders"), category: t("app.app"), action: () => { onOpenWorkspace(); onClose(); } },
+    ...(onOpenCostDashboard ? [{ id: "cost-dashboard", label: t("palette.costDashboard"), category: t("app.app"), shortcut: fmt("{mod}$"), action: () => { onOpenCostDashboard(); onClose(); } }] : []),
+    ...(onToggleFlowMode ? [{ id: "flow-mode", label: t("palette.toggleFlowMode"), category: t("app.view"), shortcut: shortcutLabel("view.flow-mode"), action: () => { onToggleFlowMode(); onClose(); } }] : []),
+    ...(onTileWorkingAgents ? [{ id: "tile-working-agents", label: t("fleet.tileWorkingAgents"), category: t("app.view"), action: () => { onTileWorkingAgents(); onClose(); } }] : []),
+    ...(onAttachProject ? [{ id: "attach-project", label: t("palette.addFolder"), category: t("app.folders"), action: () => { onAttachProject(); onClose(); } }] : []),
+    ...(onScanCwd ? [{ id: "scan-cwd", label: t("palette.scanCurrentDirectory"), category: t("app.folders"), action: () => { onScanCwd(); onClose(); } }] : []),
+    ...(onOpenComposer ? [{ id: "composer", label: t("palette.promptComposer"), category: t("app.tools"), shortcut: shortcutLabel("view.prompt-composer"), action: () => { onOpenComposer(); onClose(); } }] : []),
+    ...(onOpenLibrary ? [{ id: "library", label: t("palette.openLibrary"), category: t("app.tools"), action: () => { onOpenLibrary(); onClose(); } }] : []),
+    ...(onOpenShortcuts ? [{ id: "shortcuts", label: t("palette.keyboardShortcuts"), category: t("app.help"), shortcut: fmt("{mod}/"), action: () => { onOpenShortcuts(); onClose(); } }] : []),
+    ...(onToggleGit ? [{ id: "git", label: reviewDesk ? t("palette.reviewDesk") : t("palette.toggleGitPanel"), category: t("app.view"), shortcut: shortcutLabel("view.git-panel"), action: () => { onToggleGit(); onClose(); } }] : []),
+    ...(onToggleSearch ? [{ id: "search", label: t("palette.searchInFolder"), category: t("app.view"), shortcut: fmt("{mod}{shift}F"), action: () => { onToggleSearch(); onClose(); } }] : []),
+    ...(onToggleTrack ? [{ id: "track", label: t("palette.toggleTrackPanel"), category: t("app.view"), action: () => { onToggleTrack(); onClose(); } }] : []),
+    ...(onApproveGate ? [{ id: "track-approve", label: t("palette.approveGate"), category: t("app.track"), shortcut: fmt("{mod}⏎"), action: () => { onApproveGate(); onClose(); } }] : []),
+    ...(onMakeFeature ? [{ id: "track-make-feature", label: t("palette.makeFeature"), category: t("app.track"), action: () => { onMakeFeature(); onClose(); } }] : []),
     ...sessions.map((s, i) => ({
       id: `session-${s.id}`,
       label: s.label,
-      category: s.detected_agent?.name || "Session",
+      category: s.detected_agent?.name || t("app.session"),
       shortcut: i < 9 ? fmt(`{mod}${i + 1}`) : undefined,
       action: () => { onSelectSession(s.id); onClose(); },
     })),
-    ...(onCheckPluginUpdates ? [{ id: "check-plugin-updates", label: "Check for Plugin Updates", category: "Plugins", action: () => { onCheckPluginUpdates(); onClose(); } }] : []),
+    ...(onCheckPluginUpdates ? [{ id: "check-plugin-updates", label: t("palette.checkPluginUpdates"), category: t("app.plugins"), action: () => { onCheckPluginUpdates(); onClose(); } }] : []),
     ...(pluginCommands ?? []).map(pc => ({
       id: `plugin-${pc.command}`,
       label: pc.title,
-      category: pc.category || pc.pluginName || "Plugin",
+      category: pc.category || pc.pluginName || t("app.plugins"),
       action: () => { onPluginCommand?.(pc.command); onClose(); },
     })),
-  ], [sessions, onNewSession, onClose, onToggleContext, onToggleSessions, onSelectSession, onOpenSettings, onOpenWorkspace, onOpenCostDashboard, onToggleFlowMode, onAttachProject, onScanCwd, onOpenComposer, onOpenShortcuts, onToggleGit, onToggleSearch, pluginCommands, pluginsWithSettings, onPluginCommand, onCheckPluginUpdates]);
+  // currentLanguage is intentionally in the deps: t() is referentially stable,
+  // so without it the memoized labels would never update on a language switch.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  ], [sessions, onCloseSession, onCloseSessionRemoveWorktree, onNewSession, onClose, onToggleContext, onToggleSessions, onSelectSession, onOpenSettings, onOpenWorkspace, onOpenCostDashboard, onToggleFlowMode, onTileWorkingAgents, onAttachProject, onScanCwd, onOpenComposer, onOpenLibrary, onOpenShortcuts, onToggleGit, onToggleSearch, onToggleTrack, onApproveGate, onMakeFeature, pluginCommands, pluginsWithSettings, onPluginCommand, onCheckPluginUpdates, t, currentLanguage]);
 
   const filtered = useMemo(() => {
     if (!query) return commands.filter((c) => !c.hidden);
@@ -96,7 +127,16 @@ export function CommandPalette({
   }, [query, commands]);
 
   useEffect(() => { inputRef.current?.focus(); }, []);
+  // One overlay at a time: opening the palette closes the inbox or the
+  // launcher, and it closes when one of them opens (src/state/overlays.ts).
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  useEffect(() => overlayOpened("palette", () => onCloseRef.current()), []);
   useEffect(() => { setSelectedIndex(0); }, [query]);
+  // Keep the highlighted row in sight while the arrows move it.
+  useEffect(() => {
+    document.getElementById(`command-palette-option-${selectedIndex}`)?.scrollIntoView?.({ block: "nearest" });
+  }, [selectedIndex]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Escape") { onClose(); return; }
@@ -115,7 +155,12 @@ export function CommandPalette({
         <input
           ref={inputRef}
           className="command-palette-input"
-          placeholder="Type a command or session name..."
+          role="combobox"
+          aria-expanded="true"
+          aria-controls="command-palette-results"
+          aria-autocomplete="list"
+          aria-activedescendant={filtered.length > 0 ? `command-palette-option-${Math.min(selectedIndex, filtered.length - 1)}` : undefined}
+          placeholder={t("palette.placeholder")}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={handleKeyDown}
@@ -125,23 +170,28 @@ export function CommandPalette({
           autoCapitalize="off"
           spellCheck={false}
         />
-        <div className="command-palette-results" role="listbox">
+        <div className="command-palette-results" role="listbox" id="command-palette-results" aria-label={t("palette.resultsLabel")}>
           {filtered.map((cmd, i) => (
-            <div
+            <ListRow
               key={cmd.id}
-              className={`command-palette-item ${i === selectedIndex ? "command-palette-item-selected" : ""}`}
+              id={`command-palette-option-${i}`}
+              size="sm"
+              className="command-palette-item"
               role="option"
               aria-selected={i === selectedIndex}
+              highlighted={i === selectedIndex}
+              current={!!activeSessionId && cmd.id === `session-${activeSessionId}`}
+              aria-current={activeSessionId && cmd.id === `session-${activeSessionId}` ? "true" : undefined}
               onClick={cmd.action}
               onMouseEnter={() => setSelectedIndex(i)}
             >
-              <span className="command-palette-label">{cmd.label}</span>
-              <span className="command-palette-category">{cmd.category}</span>
-              {cmd.shortcut && <span className="command-palette-shortcut">{cmd.shortcut}</span>}
-            </div>
+              <span className="h-row-label command-palette-label">{cmd.label}</span>
+              <span className="h-row-detail command-palette-category">{cmd.category}</span>
+              {cmd.shortcut && <kbd className="h-row-shortcut command-palette-shortcut">{cmd.shortcut}</kbd>}
+            </ListRow>
           ))}
           {filtered.length === 0 && (
-            <div className="command-palette-empty">No results for "{query}"</div>
+            <div className="command-palette-empty">{t("palette.noResults", { query })}</div>
           )}
         </div>
       </div>

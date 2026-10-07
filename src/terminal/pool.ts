@@ -4,15 +4,26 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
-import { isMac } from "../utils/platform";
+import { isMac, PLATFORM } from "../utils/platform";
+import { isAppChordInTerminal } from "../utils/keymap";
+import { invoke } from "@tauri-apps/api/core";
+import {
+  ctrlCCopiesSelection,
+  isAppShortcutInTerminal,
+  parseFontSize,
+  terminalClipboardAction,
+} from "./terminalKeys";
 import { isHermesWorktreePath } from "../utils/worktree";
 import { resizeSession, isShellForeground } from "../api/sessions";
+import { noteSessionOutput } from "../agent/status/resumeOnOutput";
 import { createHistoryProvider, type HistoryProvider } from "./intelligence/historyProvider";
 import { type SuggestionState } from "./intelligence/SuggestionOverlay";
 import { clearShellEnvironment } from "./intelligence/shellEnvironment";
 import { invalidateContext } from "./intelligence/contextAnalyzer";
 import { THEMES, FONT_FAMILIES } from "./themes";
 import { clearGhostOverlay } from "./ghostText";
+import { isFeatureFlagEnabled } from "../featureFlags";
+import { dialogHoldsKeyboard } from "./focusGuard";
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -37,11 +48,14 @@ export interface PoolEntry {
   /** Last phase that wasn't "busy" — immune to echo-flicker.
    *  "busy" is transient (shell/agent echo); this tracks the real state. */
   lastStablePhase: string;
-  /** Cached OS-level check: is the shell the foreground process?
-   *  Updated by a periodic poll — checked synchronously in computeSuggestions. */
+  /** Cached OS-level check: is the shell the foreground process (and not a
+   *  program it started, such as an agent CLI)? Updated by a poll while the
+   *  terminal is focused and re-checked right before suggestions are drawn. */
   shellIsForeground: boolean;
   shellFgPollTimer: ReturnType<typeof setInterval> | null;
   cwd: string;
+  /** The WebGL renderer while this terminal holds a graphics context. */
+  webgl: WebglAddon | null;
 }
 
 export type SuggestionCallback = (state: SuggestionState | null) => void;
@@ -52,6 +66,9 @@ export const pool = new Map<string, PoolEntry>();
 export const suggestionSubscribers = new Map<string, Set<SuggestionCallback>>();
 /** Guard set: sessionIds currently being created (between pool.has check and pool.set) */
 export const creating = new Set<string>();
+/** Output that arrived while a terminal was held (`holdOutput`), in order,
+ *  until releaseOutput writes it. */
+const heldOutput = new Map<string, Uint8Array[]>();
 
 // Track which session is focused (set by attach, cleared by detach/destroy).
 // Used by the native SIGINT handler to send \x03 to the right PTY.
@@ -72,7 +89,7 @@ export function setCurrentSettings(settings: Record<string, string>): void {
  * race where the shell misses the initial resize.
  */
 export function estimateInitialDimensions(): { rows: number; cols: number } {
-  const fontSize = parseInt(currentSettings.font_size || "14", 10);
+  const fontSize = parseFontSize(currentSettings.font_size);
   const lineHeight = 1.2;
   // Approximate cell dimensions (monospace font)
   const cellWidth = fontSize * 0.6;
@@ -87,7 +104,9 @@ export function estimateInitialDimensions(): { rows: number; cols: number } {
   const cols = Math.max(10, Math.floor(availableWidth / cellWidth));
   const rows = Math.max(2, Math.floor(availableHeight / cellHeight));
 
-  return { rows, cols };
+  // A size the terminal can be made at (never Infinity or NaN).
+  if (!Number.isFinite(cols) || !Number.isFinite(rows)) return { rows: 24, cols: 80 };
+  return { rows: Math.min(rows, 500), cols: Math.min(cols, 1000) };
 }
 
 // ─── Terminal Lifecycle ──────────────────────────────────────────────
@@ -96,16 +115,20 @@ export async function createTerminal(
   sessionId: string,
   color: string,
   handleTerminalInput: (sessionId: string, data: string) => void,
+  opts: { holdOutput?: boolean } = {},
 ): Promise<void> {
   if (pool.has(sessionId) || creating.has(sessionId)) {
     console.warn(`[TerminalPool] duplicate create for session=${sessionId}`);
     return;
   }
   creating.add(sessionId);
+  // A restored session: what its new shell prints waits until the restored
+  // scrollback is in (releaseOutput), so the history comes first.
+  if (opts.holdOutput) heldOutput.set(sessionId, []);
 
   const themeName = currentSettings.theme || "frosted-dark";
   const theme = THEMES[themeName] || THEMES["frosted-dark"];
-  const fontSize = parseInt(currentSettings.font_size || "14", 10);
+  const fontSize = parseFontSize(currentSettings.font_size);
   const fontFamily = FONT_FAMILIES[currentSettings.font_family || "default"] || FONT_FAMILIES.default;
   const scrollback = parseInt(currentSettings.scrollback || "10000", 10);
 
@@ -240,6 +263,22 @@ export async function createTerminal(
       return false;
     }
 
+    // Windows/Linux copy and paste (Ctrl+Shift+C / Ctrl+Shift+V, and on
+    // Windows Ctrl+C with text selected): see terminalKeys.ts.
+    const clip = terminalClipboardAction(_event, PLATFORM, terminal.hasSelection(), ctrlCCopiesSelection(currentSettings, PLATFORM));
+    if (clip) {
+      _event.preventDefault();
+      if (clip === "copy") copyTerminalSelection(terminal, _event.shiftKey);
+      else pasteIntoTerminal(terminal);
+      return false;
+    }
+
+    // Windows/Linux: app chords (Ctrl+Shift+letter, see utils/keymap.ts)
+    // and the app's own shortcuts (Ctrl+1..9, Alt+Arrow) are not terminal
+    // input — let them reach the app's key listener. Bare Ctrl+letter is
+    // never one of them, so it always reaches the shell.
+    if (isAppChordInTerminal(_event, PLATFORM) || isAppShortcutInTerminal(_event, PLATFORM)) return false;
+
     // macOS: Cmd+Left/Right → Home/End (beginning/end of line)
     // xterm.js doesn't map these like native macOS terminals do.
     if (isMac && _event.type === "keydown" && _event.metaKey && !_event.altKey && !_event.ctrlKey) {
@@ -291,6 +330,11 @@ export async function createTerminal(
         (e.key === "c" || e.key === "C" || e.code === "KeyC")) {
       e.preventDefault();
       e.stopPropagation();
+      // Windows: with text selected, Ctrl+C copies it (XP-03).
+      if (terminalClipboardAction(e, PLATFORM, terminal.hasSelection(), ctrlCCopiesSelection(currentSettings, PLATFORM)) === "copy") {
+        copyTerminalSelection(terminal, false);
+        return;
+      }
       handleTerminalInput(sessionId, "\x03");
     }
   }, true); // capture phase
@@ -328,7 +372,10 @@ export async function createTerminal(
         const binary = atob(event.payload);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-        terminal.write(bytes);
+        const held = heldOutput.get(sessionId);
+        if (held) held.push(bytes);
+        else terminal.write(bytes);
+        noteSessionOutput(sessionId, bytes);
       } catch {
         // Corrupted base64 — silently drop to avoid garbled output
         console.warn(`[TerminalPool] Failed to decode base64 PTY output for ${sessionId}, dropping chunk`);
@@ -344,6 +391,7 @@ export async function createTerminal(
   } catch (err) {
     // Clean up partial resources on failure
     creating.delete(sessionId);
+    heldOutput.delete(sessionId);
     unlistenOutput?.();
     unlistenExit?.();
     terminal.dispose();
@@ -370,9 +418,11 @@ export async function createTerminal(
     historyProvider: createHistoryProvider(),
     sessionPhase: "creating",
     lastStablePhase: "creating",
-    shellIsForeground: true,
+    // Closed until the OS answers: attach() asks right away.
+    shellIsForeground: false,
     shellFgPollTimer: null,
     cwd: "",
+    webgl: null,
   };
 
   pool.set(sessionId, entry);
@@ -380,6 +430,81 @@ export async function createTerminal(
 
   // Shell foreground polling is started on-demand when a terminal is focused,
   // not here. See focusShellFgPolling() / blurShellFgPolling().
+}
+
+// ─── Graphics contexts (F24) ─────────────────────────────────────────
+//
+// A web view only lets a page keep a limited number of WebGL contexts alive
+// (WebKit: 16), and every one costs GPU memory. With the fleetPerf flag on,
+// only terminals on screen hold one: detach gives it back (the terminal
+// falls back to the DOM renderer while hidden) and attach takes a new one,
+// so twenty open sessions never run into the limit.
+
+/** Set once WebGL could not be created at all (no GPU, software GL). With
+ *  the flag off every terminal still tries once, as before. */
+let webglUnavailable = false;
+
+/** The WebGL contexts each addon drew with, so giving the addon back can
+ *  free their graphics memory at once instead of whenever the page's
+ *  garbage collector gets to the canvas. */
+const webglContexts = new WeakMap<WebglAddon, WebGL2RenderingContext[]>();
+
+function acquireWebgl(entry: PoolEntry): void {
+  if (entry.webgl || (webglUnavailable && budgetGraphicsContexts())) return;
+  const before = new Set(entry.container.querySelectorAll("canvas"));
+  try {
+    const addon = new WebglAddon();
+    addon.onContextLoss(() => {
+      if (entry.webgl === addon) entry.webgl = null;
+      addon.dispose();
+    });
+    entry.terminal.loadAddon(addon);
+    entry.webgl = addon;
+    // The canvases the addon just added already hold its WebGL2 context, so
+    // asking for it again hands that one back (it never creates a new one).
+    const contexts: WebGL2RenderingContext[] = [];
+    for (const canvas of entry.container.querySelectorAll("canvas")) {
+      if (before.has(canvas)) continue;
+      const gl = canvas.getContext("webgl2");
+      if (gl) contexts.push(gl);
+    }
+    webglContexts.set(addon, contexts);
+  } catch {
+    // The DOM renderer keeps working.
+    webglUnavailable = true;
+  }
+}
+
+function releaseWebgl(entry: PoolEntry): void {
+  const addon = entry.webgl;
+  if (!addon) return;
+  entry.webgl = null;
+  try {
+    addon.dispose();
+  } catch { /* already gone with its context */ }
+  // Free the context's graphics memory now rather than at the next garbage
+  // collection, so switching through many terminals does not pile it up.
+  for (const gl of webglContexts.get(addon) ?? []) {
+    try {
+      gl.getExtension("WEBGL_lose_context")?.loseContext();
+    } catch { /* already lost */ }
+  }
+  webglContexts.delete(addon);
+}
+
+/** Whether only visible terminals may hold a graphics context. */
+function budgetGraphicsContexts(): boolean {
+  return isFeatureFlagEnabled("fleetPerf");
+}
+
+/** Sessions whose terminal holds a WebGL context right now. */
+export function webglSessionIds(): string[] {
+  return [...pool].filter(([, e]) => e.webgl !== null).map(([id]) => id);
+}
+
+/** False once this web view refused to create WebGL. */
+export function isWebglAvailable(): boolean {
+  return !webglUnavailable;
 }
 
 // ─── Attach / Detach / Destroy ───────────────────────────────────────
@@ -413,14 +538,14 @@ export function attach(sessionId: string, viewport: HTMLDivElement, autoFocus = 
       });
     });
 
-    try {
-      const webgl = new WebglAddon();
-      webgl.onContextLoss(() => webgl.dispose());
-      entry.terminal.loadAddon(webgl);
-    } catch { /* canvas fallback */ }
-  } else if (entry.viewport !== viewport) {
-    // Re-parent
-    viewport.appendChild(entry.container);
+    acquireWebgl(entry);
+  } else {
+    if (entry.viewport !== viewport) {
+      // Re-parent
+      viewport.appendChild(entry.container);
+    }
+    // Shown again: take a graphics context back (the redraw below paints it).
+    if (budgetGraphicsContexts()) acquireWebgl(entry);
   }
 
   entry.viewport = viewport;
@@ -436,10 +561,11 @@ export function attach(sessionId: string, viewport: HTMLDivElement, autoFocus = 
   }
   _focusedSessionId = sessionId;
   if (!entry.shellFgPollTimer) {
+    // Check now, not only 300 ms from now: the value may be stale from the
+    // last time this terminal was focused.
+    refreshShellForeground(sessionId).catch(() => { /* keep last known value */ });
     entry.shellFgPollTimer = setInterval(() => {
-      isShellForeground(sessionId)
-        .then((isFg) => { entry.shellIsForeground = isFg; })
-        .catch(() => { /* IPC failure — keep last known value */ });
+      refreshShellForeground(sessionId).catch(() => { /* IPC failure — keep last known value */ });
     }, 300);
   }
 
@@ -465,7 +591,7 @@ export function attach(sessionId: string, viewport: HTMLDivElement, autoFocus = 
         resizeSession(sessionId, entry.terminal.rows, entry.terminal.cols)
           .catch((err) => console.warn("[TerminalPool] Failed to resize session:", err));
       } catch { /* terminal may not be ready */ }
-      if (autoFocus) entry.terminal.focus();
+      if (autoFocus && !dialogHoldsKeyboard(entry.container)) entry.terminal.focus();
     });
   });
 }
@@ -473,6 +599,7 @@ export function attach(sessionId: string, viewport: HTMLDivElement, autoFocus = 
 export function focusTerminal(sessionId: string): void {
   const entry = pool.get(sessionId);
   if (!entry || !entry.attached || !entry.opened) return;
+  if (dialogHoldsKeyboard(entry.container)) return;
   entry.terminal.focus();
   // WKWebView workaround: xterm.focus() may silently fail after a native dialog
   // steals focus. Directly find and focus the hidden textarea as a fallback.
@@ -489,6 +616,7 @@ export function detach(sessionId: string): void {
   clearGhostText(sessionId);
   entry.container.style.display = "none";
   entry.attached = false;
+  if (budgetGraphicsContexts()) releaseWebgl(entry);
   if (_focusedSessionId === sessionId) {
     _focusedSessionId = null;
     // Stop polling shell foreground — no terminal is focused
@@ -501,6 +629,7 @@ export function detach(sessionId: string): void {
 
 export function destroy(sessionId: string): void {
   creating.delete(sessionId); // Clean up in case destroy races with create
+  heldOutput.delete(sessionId);
   if (_focusedSessionId === sessionId) _focusedSessionId = null;
   const entry = pool.get(sessionId);
   if (!entry) return;
@@ -562,6 +691,20 @@ export function writeScrollback(sessionId: string, text: string): void {
   entry.terminal.write("\x1b[90m" + text.replace(/\n/g, "\r\n") + "\x1b[0m\r\n\x1b[90m--- session restored ---\x1b[0m\r\n");
 }
 
+/**
+ * End a hold (createTerminal's `holdOutput`): write the restored scrollback
+ * if there is one, then everything the new shell printed meanwhile, in
+ * order. From then on output goes straight to the terminal.
+ */
+export function releaseOutput(sessionId: string, scrollback: string | null): void {
+  const held = heldOutput.get(sessionId) ?? [];
+  heldOutput.delete(sessionId);
+  const entry = pool.get(sessionId);
+  if (!entry) return;
+  if (scrollback) writeScrollback(sessionId, scrollback);
+  for (const bytes of held) entry.terminal.write(bytes);
+}
+
 // ─── Subscription System ─────────────────────────────────────────────
 
 /** Subscribe to suggestion state changes for a session */
@@ -609,8 +752,9 @@ export function setSessionPhase(sessionId: string, phase: string): void {
   // have installed its SIGWINCH handler yet — the signal is lost and the
   // shell keeps the startup COLUMNS value.  Re-sending the resize once the
   // shell is confirmed ready guarantees it picks up the correct terminal
-  // dimensions.  A delayed follow-up catches edge cases where zle's own
-  // SIGWINCH handler isn't installed until after the first prompt redraw.
+  // dimensions.  A size the terminal already has changes nothing (the
+  // backend sends no SIGWINCH for it), so this only matters when the size
+  // changed meanwhile.
   if (
     phase === "shell_ready" &&
     prevPhase !== "shell_ready" &&
@@ -676,6 +820,47 @@ export function getHistoryProvider(sessionId: string): HistoryProvider | null {
   return pool.get(sessionId)?.historyProvider ?? null;
 }
 
+// ─── Who owns the terminal ───────────────────────────────────────────
+
+/**
+ * Whether the shell itself owns the terminal: no program it started (an
+ * agent CLI, an editor, a pager) is in the foreground and no full-screen
+ * program has the screen. Hermes draws suggestions and ghost text only then.
+ */
+export function shellOwnsTerminal(entry: PoolEntry): boolean {
+  return entry.shellIsForeground && entry.terminal.buffer.active.type !== "alternate";
+}
+
+const foregroundChecks = new Map<string, Promise<boolean>>();
+
+/**
+ * Ask the OS whether the shell is in the foreground, record the answer, and
+ * take down any suggestion or ghost text the moment it is not.
+ */
+export function refreshShellForeground(sessionId: string): Promise<boolean> {
+  // One question per session at a time: the poll and the check before each
+  // suggestion share an answer instead of queueing behind one another.
+  const pending = foregroundChecks.get(sessionId);
+  if (pending) return pending;
+  const check = askShellForeground(sessionId).finally(() => {
+    foregroundChecks.delete(sessionId);
+  });
+  foregroundChecks.set(sessionId, check);
+  return check;
+}
+
+async function askShellForeground(sessionId: string): Promise<boolean> {
+  const isFg = await isShellForeground(sessionId);
+  const entry = pool.get(sessionId);
+  if (!entry) return isFg;
+  entry.shellIsForeground = isFg;
+  if (!isFg && (entry.suggestionState || entry.ghostText)) {
+    dismissSuggestions(sessionId);
+    clearGhostText(sessionId);
+  }
+  return isFg;
+}
+
 // ─── Ghost Text Public API ───────────────────────────────────────────
 
 import { renderGhostText } from "./ghostText";
@@ -684,6 +869,8 @@ export function showGhostText(sessionId: string, text: string): void {
   const entry = pool.get(sessionId);
   if (!entry) return;
   clearGhostOverlay(entry);
+  // Never over a program the shell started (an agent CLI's own input box).
+  if (!shellOwnsTerminal(entry)) return;
   renderGhostText(entry, text);
 }
 
@@ -769,6 +956,37 @@ export function getCursorPosition(sessionId: string): { x: number; y: number } |
  *    continuation lines. We detect these by checking if the previous line
  *    was nearly full-width and the current line starts with small indent.
  */
+/**
+ * Copy the terminal's selection (cleaned like a native copy). `keep` leaves
+ * it selected (Ctrl+Shift+C); Ctrl+C on Windows clears it, as Windows
+ * Terminal does, so the next Ctrl+C interrupts again.
+ */
+export function copyTerminalSelection(terminal: Terminal, keep: boolean): void {
+  const raw = terminal.getSelection();
+  if (!raw) return;
+  const text = cleanSelection(terminal, raw);
+  navigator.clipboard.writeText(text).catch((err) => console.warn("[TerminalPool] copy failed:", err));
+  if (!keep) terminal.clearSelection();
+}
+
+/** The clipboard's text, read by the app (the web view's own paste is
+ *  blocked or hangs in some web views). */
+export function readClipboardText(): Promise<string> {
+  return invoke<string>("read_clipboard_text");
+}
+
+/**
+ * Paste the clipboard into a terminal as a paste (bracketed when the
+ * program asked for it), never as typed keys.
+ */
+export function pasteIntoTerminal(terminal: Terminal): void {
+  readClipboardText()
+    .then((text) => {
+      if (text) terminal.paste(text);
+    })
+    .catch((err) => console.warn("[TerminalPool] paste failed:", err));
+}
+
 export function cleanSelection(terminal: Terminal, raw: string): string {
   const sel = terminal.getSelectionPosition?.();
   // Fallback: if we can't read the selection position, just trim trailing spaces

@@ -1,0 +1,150 @@
+# Real-app scenarios
+
+These scripts drive the **real** Hermes desktop app, hands-free, on macOS,
+Windows and Linux. They are the acceptance criteria of shipped features:
+`e2e/acceptance.yml` maps every criterion to the scenario that proves it, and
+`node e2e/acceptance-check.mjs` fails when a shipped feature has no green
+scenario on every OS.
+
+## How it works
+
+- `src-tauri/src/e2e_bridge.rs` — a test-only automation bridge inside the
+  app, behind the cargo feature `e2e`. It refuses to compile in a release
+  build, only starts when the process has `HERMES_E2E=1`, listens on
+  `127.0.0.1` on a random port, and needs a random token on every request.
+  It evaluates JavaScript in the app's webview and takes window screenshots
+  from inside the app (no focus, no screen-recording permission, works on a
+  virtual display). Screenshots are taken after the page has painted, and a
+  capture that is one flat colour (nothing painted, screen locked) is refused
+  by both the app and the harness, so a picture in the evidence always shows
+  the state the scenario asserted. Before each capture on Linux the app raises
+  the window and has it repaint (xvfb has no window manager, so a second test
+  app covers the first); a flat capture is taken again up to five times and
+  the request fails if every attempt is flat.
+- `src/e2e/hooks.ts` — read-only hooks for the terminal's text, compiled in
+  only when the frontend is built with `VITE_HERMES_E2E=1`.
+- `harness.mjs` — the client: launch the test app with a throwaway home
+  folder, click, type real key events, read the terminal, screenshot, quit.
+- `scenarios/*.mjs` — one script per user journey. Each writes a log,
+  screenshots and a `result.json` to its evidence folder and ends with
+  `RESULT: PASS` or `RESULT: FAIL`. One that cannot run where it is (a
+  platform, CI, a missing CLI) calls `skipScenario` in `harness.mjs`: its
+  `result.json` says `skip`, `run.mjs` reports it as skipped, and the
+  acceptance gate never counts it as a pass.
+- `run.mjs` — runs scenarios in fresh processes, N times each, and records
+  every run in `results.json` for the acceptance gate.
+
+The test app has its own identifier (`com.hermes-ide.terminal.e2e`), so it
+never touches an installed Hermes or its data.
+
+`build.mjs` compiles a stamp into the binary (a hash of the checkout and the
+frontend bundle), checks the binary it stages carries it, and records it in
+`bin/build.json`; the harness refuses to run an app that reports another
+stamp. A cargo target folder shared with other checkouts can therefore never
+hand the rig someone else's build.
+
+Keys are typed as key events inside the app's webview (the terminal sees
+them exactly as it would from the keyboard). Real OS-level key presses are
+not part of this rig; a scenario that needs them (system shortcuts, IME) is
+a follow-up.
+
+## Running locally
+
+```sh
+node e2e/app/build.mjs                          # build the test app (once per change)
+node e2e/app/scenarios/terminal-echo.mjs        # one scenario
+node e2e/app/run.mjs --repeat 20 terminal-echo.mjs
+node e2e/app/run.mjs                            # every scenario, once
+node e2e/app/run.mjs --fresh                    # ...forgetting earlier runs' results
+node e2e/app/run.mjs --ci-set shards --shard 2/3 --keep-going   # what CI shard 2 runs
+node e2e/acceptance-check.mjs                   # the ledger is well-formed
+node e2e/acceptance-check.mjs --results <dir>   # ...and green everywhere
+```
+
+On a machine with little free disk, `HERMES_E2E_LOCAL_FREE_SPACE_BYTES` makes
+the test app's disk guard see that much free space (a scenario that sets its
+own, like N14, keeps it); CI never sets it.
+
+Set `HERMES_E2E_OUT` to choose where the app and the evidence go (default:
+`$TMPDIR/hermes-e2e`). Evidence never belongs in the repository.
+
+`node e2e/app/cli.mjs` talks to a running test app step by step; see the
+header of that file.
+
+`run.mjs` exits 1 exactly when a run of that invocation failed (older runs
+kept in `results.json` do not count) and ends with a summary that names each
+failed scenario.
+
+## In CI
+
+`.github/workflows/ci.yml` builds the test app once per OS and uploads it;
+three shard jobs per OS download that build and each run the scenarios a
+hash of the file name puts on their shard (`ci-plan.mjs`), so a scenario
+always runs on the same shard. `ci-plan.mjs` also lists the few scenarios
+that run elsewhere (the build job, the real key-press step) or not in CI.
+The required `gate` check fails when any shard fails. terminal-echo runs
+once per change and 20 times in a row in the nightly run.
+
+## Adding a scenario
+
+1. Create `scenarios/<feature-id>-<name>.mjs` (copy `terminal-echo.mjs`).
+   Drive the app through the real UI; assert on what a person would see.
+   End with `finishScenario(...)`.
+2. Add the file to the feature's criteria in `e2e/acceptance.yml`. Append
+   `@linux`, `@darwin` or `@win32` only when the scenario genuinely cannot run
+   elsewhere.
+3. Run it locally, then let CI prove it on all three runners. CI picks up
+   every new file under `scenarios/` on its own; list it in `ci-plan.mjs`
+   only when it has to run somewhere other than the shards.
+
+To prove something that only takes effect on the next launch, relaunch the
+app against the same data: pass one `homeDir` to every `launchApp` call on
+macOS and Linux (the scenario owns and deletes that folder), and
+`resetData: false` on every launch after the first on Windows, where the
+data lives under `%APPDATA%` rather than the home folder.
+`scenarios/N07-feature-flags.mjs` does both.
+
+## Real key presses (F05)
+
+Most scenarios type through the DOM. `F05-terminal-keys.mjs` has to prove
+what the OS keyboard path does (native menu accelerators, the webview's own
+key handling), so it can also press real keys:
+
+- `os-keys.mjs` — real OS key presses into the app window: `xdotool` (XTEST)
+  on Linux under Xvfb, `SendInput` on Windows. It refuses to run on macOS and
+  anywhere without `CI=true`, because it presses keys on the machine.
+- `fixtures/keylogger.mjs` — a program the scenario runs inside a Hermes
+  terminal. It puts the terminal in raw mode and records every byte it
+  receives, so the scenario can check that Ctrl+letter reached the program.
+- `HERMES_E2E_OS_KEYS=1` — use real key presses (CI runners only). Linux
+  needs `xdotool` installed and a virtual display (`xvfb-run`).
+- `HERMES_E2E_PLATFORM=linux|win` — run the frontend with that platform's
+  keyboard rules (test builds only), with DOM key events. This lets a Mac
+  check the Windows/Linux path locally; it cannot be combined with
+  `HERMES_E2E_OS_KEYS`.
+
+```sh
+node e2e/app/scenarios/F05-terminal-keys.mjs                             # native rules
+HERMES_E2E_PLATFORM=linux node e2e/app/scenarios/F05-terminal-keys.mjs   # Windows/Linux rules
+```
+
+## CI
+
+The `e2e-app` and `acceptance` jobs in `.github/workflows/ci.yml` build the
+test app and run the scenarios on `ubuntu-24.04` (under `xvfb`),
+`windows-2022` and `macos-15`, upload each runner's evidence, and then run
+the acceptance gate over the results of all three. Both sit under the
+required `gate` check, so a red, cancelled or missing run blocks the merge.
+Every run — pull requests included — runs `terminal-echo` 20 times; a
+manual run can choose another count. `F05-terminal-keys` runs with real key
+presses on Linux and Windows on every run, and every night (the scheduled
+run of `ci.yml`).
+
+The release workflow (`.github/workflows/release.yml`) starts with
+`node e2e/release-gate.mjs`: it re-checks the ledger and requires the CI
+`gate` check to have passed on the commit being released (waiting for one
+that is still running). A commit CI never ran on is not released.
+
+Startup on the Linux runner takes about 30 s (a fixed wait inside
+WebKitGTK/GTK under xvfb, the same on every run); the harness allows 120 s
+there.

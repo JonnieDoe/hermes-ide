@@ -5,9 +5,11 @@ use std::collections::HashMap;
 
 /// How a session is run and rendered on the frontend.
 ///
-/// - `Terminal`: existing PTY/xterm flow.  All non-Claude sessions use this.
-/// - `Agent`: `claude --print` stream-json subprocess driving an
-///   `<AgentSessionView>` chat surface.  Claude-only in 1.0.0.
+/// - `Terminal`: the agent's (or shell's) own interface in a PTY/xterm.  The
+///   default for every provider, Claude included (ADR 003).
+/// - `Agent`: the optional Agent view.  A per-session Node bridge running the
+///   Claude Agent SDK (`src-tauri/bridge/`) drives an `<AgentSessionView>`.
+///   Claude only, and only when the user asks for it.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionMode {
@@ -61,6 +63,13 @@ impl SessionPhase {
                 | SessionPhase::ShellReady
                 | SessionPhase::LaunchingAgent
         )
+    }
+
+    /// Destroyed is terminal: once `close_session` marks a session destroyed,
+    /// late PTY output (e.g. from processes that outlived the shell) must not
+    /// flip it back to a live phase and re-announce it to the frontend.
+    pub fn can_transition_to(&self, new_phase: &SessionPhase) -> bool {
+        self != new_phase && *self != SessionPhase::Destroyed
     }
 }
 
@@ -160,6 +169,9 @@ pub struct SshConnectionInfo {
     pub tmux_session: Option<String>,
     #[serde(default)]
     pub identity_file: Option<String>,
+    /// Optional ProxyJump host (`ssh -J`), e.g. `bastion.example.com`.
+    #[serde(default)]
+    pub jump_host: Option<String>,
     #[serde(default)]
     pub port_forwards: Vec<PortForward>,
 }
@@ -176,6 +188,33 @@ pub struct TmuxWindowEntry {
     pub index: u32,
     pub name: String,
     pub active: bool,
+}
+
+/// Where an agent launched through the `hi` helper stands at startup.
+///
+/// `launching` from the moment the launch line is typed; `started` once the
+/// agent's own start signal arrived (exact); `waiting_at_startup_prompt` when
+/// no start signal came within a few seconds (a guess — vendor folder-trust
+/// dialogs hold every hook back until answered); `ended` after the agent's
+/// end signal. The inbox reads this field; the session list shows the guess.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStartupState {
+    Launching,
+    Started,
+    WaitingAtStartupPrompt,
+    Ended,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentStartup {
+    pub state: AgentStartupState,
+    /// When the state was entered (RFC 3339).
+    pub since: String,
+    /// `exact` when a signal from the agent set it, `guessed` for a timeout.
+    pub confidence: String,
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,22 +241,85 @@ pub struct Session {
     #[serde(default)]
     pub custom_prefix: String,
     pub custom_suffix: String,
+    /// Custom agent only: the name the user gave it, shown for the session.
+    #[serde(default)]
+    pub agent_name: String,
+    /// Custom agent only: the command that starts it (same trust as a
+    /// command typed at the prompt; line breaks are stripped at launch).
+    #[serde(default)]
+    pub agent_command: String,
     pub channels: Vec<String>,
     pub context_injected: bool,
     pub has_initial_context: bool,
     pub last_nudged_version: i64,
     pub ssh_info: Option<SshConnectionInfo>,
-    pub worktree_base_path: Option<String>,
     /// Frontend runtime mode.  `terminal` spawns a PTY; `agent` drives the
     /// Claude subprocess via `crate::agent::spawn_agent_session`.  Defaults
     /// to `terminal` for backward compat with on-disk session rows that
     /// predate the field.
     #[serde(default)]
     pub mode: SessionMode,
+    /// The agent's own conversation id (Claude/Gemini session id, Codex
+    /// thread id): pre-assigned at launch where the vendor allows it,
+    /// otherwise recorded from the agent's first signal. Restoring a session
+    /// resumes this conversation.
+    #[serde(default)]
+    pub vendor_session_id: Option<String>,
+    /// Startup state of an agent launched through the `hi` helper.
+    #[serde(default)]
+    pub agent_startup: Option<AgentStartup>,
+    /// The terminal lives in the session host (feature flag `sessionHost`)
+    /// and survives this app: quit, update, crash.
+    #[serde(default)]
+    pub hosted: bool,
+    /// Start the agent through the bundled `hi` helper (feature flag
+    /// `launchHelper`) instead of typing the vendor command into the shell.
+    #[serde(skip)]
+    pub launch_helper: bool,
+    /// The `launchHelper` flag itself is on (`launch_helper` is also set by
+    /// a launcher task with the flag off). With the flag on, a build that
+    /// cannot launch through the helper refuses the launch and says so;
+    /// with it off, the vendor command is typed as before.
+    #[serde(skip)]
+    pub launch_helper_required: bool,
+    /// The per-launch secret the agent's signals must carry (F11). Set when
+    /// the launch configured the agent's hooks; an in-band terminal marker
+    /// (`OSC 777 ... hermes-signal;v1:<nonce>:<Event>`) is only exact when
+    /// it carries this nonce.
+    #[serde(skip)]
+    pub signal_nonce: Option<String>,
+    /// The last status the agent's own hooks reported (CHAOS-11/XP-12):
+    /// quitting asks about a session whose agent said it is working or
+    /// waiting on the person, whatever its screen looks like.
+    #[serde(skip)]
+    pub reported_status: Option<crate::contract::AgentStatusKind>,
+    /// The task typed into the task launcher (F15): the agent's first prompt
+    /// on its first start. Never saved; a restored session resumes instead.
+    #[serde(skip)]
+    pub task_prompt: Option<String>,
+    /// A library persona for the agent's system prompt, for agents whose
+    /// catalog has a proven `system_prompt` flag. First start only; never saved.
+    #[serde(skip)]
+    pub system_prompt: Option<String>,
+    /// N19: the first prompt of a session started by "Continue in another
+    /// agent" or "Duplicate to another agent". Passed as a launch argument
+    /// through the `hi` helper and never typed; kept out of every saved or
+    /// emitted copy of the session.
+    #[serde(skip)]
+    pub seed_prompt: Option<String>,
+    /// N19: the session this one was handed off from (continued or
+    /// duplicated), so the list can show it under that session.
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
     /// Deferred nudge: stored when context is applied while the agent is busy.
     /// Delivered when the session phase transitions to NeedsInput.
     #[serde(skip)]
     pub pending_nudge: Option<PendingNudge>,
+    /// The model, effort and account the agent was started with (2.0 launch
+    /// contract), and the account's profile environment. Saved with the
+    /// session, so a restore resumes in the same profile.
+    #[serde(default)]
+    pub agent_launch: crate::agent_caps::SessionLaunch,
 }
 
 /// A context nudge that couldn't be delivered immediately (agent was busy).
@@ -248,14 +350,35 @@ pub struct SessionUpdate {
     #[serde(default)]
     pub custom_prefix: String,
     pub custom_suffix: String,
+    #[serde(default)]
+    pub agent_name: String,
+    #[serde(default)]
+    pub agent_command: String,
     pub channels: Vec<String>,
     pub context_injected: bool,
     pub has_initial_context: bool,
     pub last_nudged_version: i64,
     pub ssh_info: Option<SshConnectionInfo>,
-    pub worktree_base_path: Option<String>,
     #[serde(default)]
     pub mode: SessionMode,
+    #[serde(default)]
+    pub vendor_session_id: Option<String>,
+    #[serde(default)]
+    pub agent_startup: Option<AgentStartup>,
+    /// The terminal lives in the session host (N20).
+    #[serde(default)]
+    pub hosted: bool,
+    /// This `create_session` reattached to a program the host kept running
+    /// (its output was replayed), rather than starting a new one.
+    #[serde(default)]
+    pub reattached: bool,
+    /// N19: the session this one was handed off from.
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    /// What the agent was launched with (model, effort, account); the model
+    /// chip shows it as "requested" until the agent reports its own.
+    #[serde(default)]
+    pub agent_launch: crate::agent_caps::SessionLaunch,
 }
 
 impl From<&Session> for SessionUpdate {
@@ -279,13 +402,20 @@ impl From<&Session> for SessionUpdate {
             permission_mode: s.permission_mode.clone(),
             custom_prefix: s.custom_prefix.clone(),
             custom_suffix: s.custom_suffix.clone(),
+            agent_name: s.agent_name.clone(),
+            agent_command: s.agent_command.clone(),
             channels: s.channels.clone(),
             context_injected: s.context_injected,
             has_initial_context: s.has_initial_context,
             last_nudged_version: s.last_nudged_version,
             ssh_info: s.ssh_info.clone(),
-            worktree_base_path: s.worktree_base_path.clone(),
             mode: s.mode,
+            vendor_session_id: s.vendor_session_id.clone(),
+            agent_startup: s.agent_startup.clone(),
+            hosted: s.hosted,
+            reattached: false,
+            parent_session_id: s.parent_session_id.clone(),
+            agent_launch: s.agent_launch.clone(),
         }
     }
 }
@@ -300,7 +430,9 @@ pub struct RemoteGitInfo {
 
 // ─── Terminal Command Intelligence ───────────────────────────────────
 
+/// Serialized camelCase to match the frontend `ShellEnvironment` type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ShellEnvironment {
     pub shell_type: String,
     pub plugins_detected: Vec<String>,
@@ -310,6 +442,8 @@ pub struct ShellEnvironment {
     pub has_starship: bool,
     pub has_powerlevel10k: bool,
     pub shell_integration_active: bool,
+    /// Whether Hermes inline suggestions were on when the session was spawned.
+    pub hermes_suggestions: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

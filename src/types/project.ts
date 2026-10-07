@@ -16,7 +16,6 @@ export interface Project {
   last_scanned_at: string | null;
   created_at: string;
   updated_at: string;
-  worktree_base_path?: string | null;
 }
 
 export interface ProjectOrdered extends Project {

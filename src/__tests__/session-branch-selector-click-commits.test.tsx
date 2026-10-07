@@ -56,6 +56,7 @@ import {
   checkBranchAvailable,
 } from "../api/git";
 import { SessionBranchSelector } from "../components/SessionBranchSelector";
+import { I18nProvider } from "../i18n/I18nProvider";
 import type { GitBranch, WorktreeInfo } from "../types/git";
 
 // ─── Helpers ─────────────────────────────────────────────────────────
@@ -125,6 +126,7 @@ describe("SessionBranchSelector — single-click commits (Existing tab)", () => 
         onBranchSelected={onBranchSelected}
         onSkip={() => {}}
       />,
+      { wrapper: I18nProvider },
     );
 
     // Wait for branches to load + auto-propagation to settle.
@@ -150,6 +152,7 @@ describe("SessionBranchSelector — single-click commits (Existing tab)", () => 
         onBranchSelected={onBranchSelected}
         onSkip={() => {}}
       />,
+      { wrapper: I18nProvider },
     );
 
     const row = await screen.findByText("release-1.0");
@@ -173,6 +176,7 @@ describe("SessionBranchSelector — single-click commits (Existing tab)", () => 
         onBranchSelected={() => {}}
         onSkip={() => {}}
       />,
+      { wrapper: I18nProvider },
     );
 
     // Wait for the list to render
@@ -195,6 +199,7 @@ describe("SessionBranchSelector — single-click commits (Existing tab)", () => 
         onBranchSelected={() => {}}
         onSkip={() => {}}
       />,
+      { wrapper: I18nProvider },
     );
 
     await screen.findByText("main");
@@ -228,6 +233,7 @@ describe("SessionBranchSelector — single-click commits (Existing tab)", () => 
         onBranchSelected={onBranchSelected}
         onSkip={() => {}}
       />,
+      { wrapper: I18nProvider },
     );
 
     const row = await screen.findByText("feature/locked");
@@ -251,6 +257,7 @@ describe("SessionBranchSelector — single-click commits (Existing tab)", () => 
         onBranchSelected={onBranchSelected}
         onSkip={() => {}}
       />,
+      { wrapper: I18nProvider },
     );
 
     // Wait for list to load + auto-propagation to settle.
@@ -283,10 +290,12 @@ describe("SessionBranchSelector — New Branch tab (unchanged)", () => {
         onBranchSelected={() => {}}
         onSkip={() => {}}
       />,
+      { wrapper: I18nProvider },
     );
 
     // Wait for tabs to render, then switch to the New Branch tab.
-    const newTab = await screen.findByRole("button", { name: /New Branch/i });
+    // The two views are a segmented control: one radio per view.
+    const newTab = await screen.findByRole("radio", { name: /New Branch/i });
     fireEvent.click(newTab);
 
     // The submit button must still exist — a click-on-form-field would be
@@ -312,6 +321,7 @@ describe("SessionBranchSelector — remote-only branch affordance", () => {
         onBranchSelected={() => {}}
         onSkip={() => {}}
       />,
+      { wrapper: I18nProvider },
     );
 
     const remoteRow = await screen.findByText("feature-x");
@@ -333,6 +343,7 @@ describe("SessionBranchSelector — remote-only branch affordance", () => {
         onBranchSelected={() => {}}
         onSkip={() => {}}
       />,
+      { wrapper: I18nProvider },
     );
 
     const localRow = await screen.findByText("feature-x");

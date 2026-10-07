@@ -1,12 +1,18 @@
-//! Agent-mode subprocess lifecycle.
+//! Agent-view subprocess lifecycle.
 //!
-//! Owns one `claude --print --output-format stream-json --input-format stream-json`
-//! child process per session and bridges its NDJSON stdout / stderr stream to the
-//! frontend via Tauri events.  See `docs/adr/001-agent-mode.md` for the design
+//! Owns one bridge child process per Agent-view session (a Node process running
+//! the Claude Agent SDK, `src-tauri/bridge/hermes-claude-bridge.mjs`, which
+//! speaks the stream-json wire format) and forwards its NDJSON stdout / stderr
+//! stream to the frontend via Tauri events.  The Agent view is optional; new
+//! sessions run in terminal mode (ADR 003).  See `docs/adr/001-agent-mode.md` for the design
 //! rationale and `wondrous-wishing-quilt` plan for the phase-by-phase build.
 
-mod prewarm;
-pub use prewarm::prewarm_bridge_runtime;
+pub mod history;
+pub mod prewarm;
+mod respawn;
+pub mod runtime;
+pub use respawn::AgentError;
+use respawn::SpawnGate;
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -37,12 +43,15 @@ type SessionMap = Arc<Mutex<HashMap<String, AgentChild>>>;
 /// tasks can clean themselves up without holding a Tauri `State<'_>` borrow.
 pub struct AgentState {
     sessions: SessionMap,
+    /// Per-session lock around start / restart / close (see `respawn.rs`).
+    gate: Arc<SpawnGate>,
 }
 
 impl Default for AgentState {
     fn default() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            gate: Arc::new(SpawnGate::default()),
         }
     }
 }
@@ -50,6 +59,19 @@ impl Default for AgentState {
 impl AgentState {
     fn handle(&self) -> SessionMap {
         Arc::clone(&self.sessions)
+    }
+
+    /// Ids of the sessions whose agent process is running, or None when
+    /// the registry stayed busy for two seconds (callers that delete
+    /// anything must then hold off). Call it from a blocking thread.
+    pub fn live_session_ids(&self) -> Option<Vec<String>> {
+        for _ in 0..100 {
+            if let Ok(m) = self.sessions.try_lock() {
+                return Some(m.keys().cloned().collect());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        None
     }
 }
 
@@ -65,6 +87,9 @@ struct AgentChild {
     /// PID of the subprocess (best-effort).
     #[allow(dead_code)]
     pid: Option<u32>,
+    /// Agent (Claude) session id this process runs, returned to a restart
+    /// that joins this process instead of starting another one.
+    agent_session_id: String,
     /// Handles of the per-session reader / waiter tasks so they can be
     /// aborted on close.  Without these, a child whose pipes never close
     /// (rare, but possible if the subprocess hangs after we kill it)
@@ -146,7 +171,89 @@ fn bridge_path_candidates(
     out
 }
 
-fn resolve_bridge_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+/// Strip the Windows verbatim prefix (`\\?\C:\...` -> `C:\...`) from a path
+/// before handing it to node / claude.  Tauri's `resource_dir()` and
+/// `std::fs::canonicalize` produce verbatim paths on Windows, and Node's
+/// realpath chokes on them (`EISDIR: illegal operation on a directory,
+/// lstat 'C:'`), killing the bridge on launch.  No-op on other platforms.
+fn node_safe_path(p: &std::path::Path) -> std::path::PathBuf {
+    dunce::simplified(p).to_path_buf()
+}
+
+/// Every path the spawn hands to node / claude (bridge script, cwd,
+/// `--add-dir`s), normalized in one place so none can skip [`node_safe_path`].
+#[derive(Debug, PartialEq, Eq)]
+struct NodeSpawnPaths {
+    bridge: std::path::PathBuf,
+    working_dir: String,
+    add_dirs: Vec<String>,
+}
+
+fn node_spawn_paths(
+    bridge: &std::path::Path,
+    working_dir: &str,
+    add_dirs: &[String],
+) -> NodeSpawnPaths {
+    node_spawn_paths_with(bridge, working_dir, add_dirs, node_safe_path)
+}
+
+/// Normalizer is injected so tests can prove every path goes through it on
+/// any OS (`dunce::simplified` is a no-op off Windows).
+fn node_spawn_paths_with(
+    bridge: &std::path::Path,
+    working_dir: &str,
+    add_dirs: &[String],
+    norm: impl Fn(&std::path::Path) -> std::path::PathBuf,
+) -> NodeSpawnPaths {
+    let s = |p: &str| norm(std::path::Path::new(p)).to_string_lossy().into_owned();
+    NodeSpawnPaths {
+        bridge: norm(bridge),
+        working_dir: s(working_dir),
+        add_dirs: add_dirs.iter().map(|d| s(d)).collect(),
+    }
+}
+
+/// Where the bridge comes from: a packed runtime folder to unpack, or a
+/// bridge script already on disk.
+#[derive(Debug, PartialEq, Eq)]
+enum BridgeSource {
+    Packed(std::path::PathBuf),
+    File(std::path::PathBuf),
+}
+
+/// The packed runtime when there is one, else the first candidate script
+/// that exists; with `prefer_source`, an existing candidate wins over the
+/// packed runtime.
+fn pick_bridge_source(
+    prefer_source: bool,
+    packed: Option<std::path::PathBuf>,
+    candidates: &[std::path::PathBuf],
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Option<BridgeSource> {
+    let file = candidates.iter().find(|c| exists(c)).cloned();
+    match (prefer_source, packed, file) {
+        (true, _, Some(file)) => Some(BridgeSource::File(file)),
+        (_, Some(bundle), _) => Some(BridgeSource::Packed(bundle)),
+        (_, None, file) => file.map(BridgeSource::File),
+    }
+}
+
+/// `HERMES_BRIDGE_RUNTIME_DIR`: a folder holding a packed bridge runtime
+/// (`manifest.json` + archive) to use instead of the bundle's. Read by test
+/// and debug builds only, so a stray variable cannot point an installed app
+/// at another archive.
+fn runtime_dir_override() -> Option<String> {
+    if cfg!(any(debug_assertions, feature = "e2e")) {
+        std::env::var("HERMES_BRIDGE_RUNTIME_DIR").ok()
+    } else {
+        None
+    }
+}
+
+/// Where the bridge script is, unpacking the bundled runtime first when
+/// needed (which can take a few seconds once). Blocking: call it from a
+/// blocking context, e.g. [`resolve_bridge_path_blocking`].
+pub(crate) fn resolve_bridge_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     // Honor an explicit override even if it's broken — surface the
     // misconfiguration loudly rather than silently falling through.
     if let Ok(p) = std::env::var("HERMES_BRIDGE_PATH") {
@@ -160,14 +267,26 @@ fn resolve_bridge_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
         ));
     }
 
-    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let resource_dir = app.path().resource_dir().ok();
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let candidates = bridge_path_candidates(None, &manifest, resource_dir.as_deref());
+    let override_dir = runtime_dir_override();
+    let packed = runtime::bundle_dir(resource_dir.as_deref(), override_dir.as_deref());
+    // `tauri dev` runs the bridge straight from the source tree, so edits to
+    // it apply without repacking (a packed runtime left in the resources by
+    // an earlier build would be stale). Installed apps and test builds use
+    // the packed runtime.
+    let prefer_source = cfg!(debug_assertions) && !cfg!(feature = "e2e") && override_dir.is_none();
 
-    for c in &candidates {
-        if c.exists() {
-            return Ok(c.clone());
+    match pick_bridge_source(prefer_source, packed, &candidates, |p| p.exists()) {
+        // An installed app carries the bridge as one packed archive (ADR
+        // 002): unpack it into the data folder on first use, run it there.
+        Some(BridgeSource::Packed(bundle)) => {
+            let root = crate::instance::app_data_dir(app)?.join("runtime");
+            return runtime::ensure_unpacked(&bundle, &root).map(|u| u.bridge);
         }
+        Some(BridgeSource::File(path)) => return Ok(path),
+        None => {}
     }
     Err(format!(
         "could not locate hermes-claude-bridge.mjs (looked at: {})",
@@ -177,6 +296,17 @@ fn resolve_bridge_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
             .collect::<Vec<_>>()
             .join(", ")
     ))
+}
+
+/// [`resolve_bridge_path`] on the blocking pool, so a first-use unpack of
+/// the runtime never stalls an async worker.
+pub(crate) async fn resolve_bridge_path_blocking(
+    app: &AppHandle,
+) -> Result<std::path::PathBuf, String> {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || resolve_bridge_path(&app))
+        .await
+        .map_err(|e| format!("bridge lookup failed: {}", e))?
 }
 
 // ─── Node resolution ──────────────────────────────────────────────
@@ -224,7 +354,7 @@ fn fallback_node_dirs() -> Vec<std::path::PathBuf> {
 
 /// Locate `node` on disk.  Checks PATH first, then well-known fallback
 /// directories.  Returns the first existing executable.
-fn which_node() -> Option<std::path::PathBuf> {
+pub(crate) fn which_node() -> Option<std::path::PathBuf> {
     let exe_name = if cfg!(windows) { "node.exe" } else { "node" };
 
     if let Some(path_var) = std::env::var_os("PATH") {
@@ -264,11 +394,7 @@ pub fn ensure_hermes_state_file(
     add_dirs: &[String],
 ) -> Result<String, String> {
     use std::fs;
-    let home = std::env::var("HOME").map_err(|_| "HOME env var unset".to_string())?;
-    let dir = std::path::PathBuf::from(home)
-        .join(".hermes-ide")
-        .join("sessions")
-        .join(session_id);
+    let dir = hermes_state_root()?.join(session_id);
     fs::create_dir_all(&dir).map_err(|e| format!("create state dir: {}", e))?;
     let path = dir.join("state.json");
 
@@ -288,6 +414,15 @@ pub fn ensure_hermes_state_file(
         .ok_or_else(|| "non-utf8 state path".to_string())
 }
 
+/// Folder holding one `<session_id>/state.json` per agent-mode session:
+/// `~/.hermes-ide/sessions`.
+pub fn hermes_state_root() -> Result<std::path::PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME env var unset".to_string())?;
+    Ok(std::path::PathBuf::from(home)
+        .join(".hermes-ide")
+        .join("sessions"))
+}
+
 /// Update the Hermes IDE state file for an active session.  Called from
 /// `update_hermes_state` IPC when the frontend changes attached projects,
 /// active file, etc.  The file is the single source of truth the bridge's
@@ -295,12 +430,7 @@ pub fn ensure_hermes_state_file(
 /// its next tool call (no respawn required).
 pub fn update_hermes_state_file(session_id: &str, state: &serde_json::Value) -> Result<(), String> {
     use std::fs;
-    let home = std::env::var("HOME").map_err(|_| "HOME env var unset".to_string())?;
-    let path = std::path::PathBuf::from(home)
-        .join(".hermes-ide")
-        .join("sessions")
-        .join(session_id)
-        .join("state.json");
+    let path = hermes_state_root()?.join(session_id).join("state.json");
     if !path.parent().map(|p| p.exists()).unwrap_or(false) {
         return Err(format!(
             "state dir for session {} does not exist; spawn the agent first",
@@ -430,8 +560,58 @@ pub fn build_spawn_args(
 
 // ─── Tauri commands ────────────────────────────────────────────────
 
+/// Everything one agent spawn needs: the arguments of
+/// [`spawn_agent_session`] / [`restart_agent_session`].
+struct SpawnRequest {
+    session_id: String,
+    working_dir: String,
+    prior_uuid: Option<String>,
+    model: Option<String>,
+    permission_mode: Option<String>,
+    effort: Option<String>,
+    add_dirs: Vec<String>,
+    fork: bool,
+}
+
+/// The agent session id of the session's running process, if it has one.
+async fn live_agent_session_id(sessions: &SessionMap, session_id: &str) -> Option<String> {
+    sessions
+        .lock()
+        .await
+        .get(session_id)
+        .map(|entry| entry.agent_session_id.clone())
+}
+
+/// Whether restarts go through the per-session lock. Always true, except in
+/// the test build when a scenario turns it off on purpose (`HERMES_E2E=1` and
+/// `HERMES_E2E_NO_RESPAWN_LOCK=1`) to show that its check catches the double
+/// spawn the lock prevents.
+fn respawn_lock_enabled() -> bool {
+    #[cfg(feature = "e2e")]
+    {
+        let on = |name: &str| std::env::var(name).map(|v| v == "1").unwrap_or(false);
+        if on("HERMES_E2E") && on("HERMES_E2E_NO_RESPAWN_LOCK") {
+            log::warn!("[agent] respawn lock DISABLED for a negative-control test run");
+            return false;
+        }
+    }
+    true
+}
+
+/// A session whose agent starts is live again, even under an id closed
+/// earlier in this run (converting a terminal session to Agent view closes
+/// its terminal first), so the saved workspace keeps it.
+fn mark_session_live(app: &AppHandle, session_id: &str) {
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        state.closed_sessions.mark_created(session_id);
+    }
+}
+
 /// Spawn a Claude agent subprocess for `session_id`.  Returns the Claude session
 /// UUID we passed via `--session-id` so the frontend can track it for resume.
+///
+/// Fails with a `busy` error, without starting anything, when the session
+/// already has a running process.
 ///
 /// The argument list mirrors `build_spawn_args` plus the Tauri `State` and
 /// `AppHandle` — same justification: each is a real Claude flag.
@@ -448,13 +628,109 @@ pub async fn spawn_agent_session(
     effort: Option<String>,
     add_dirs: Option<Vec<String>>,
     fork: Option<bool>,
-) -> Result<String, String> {
+) -> Result<String, AgentError> {
+    mark_session_live(&app, &session_id);
+    let sessions = state.handle();
+    let req = SpawnRequest {
+        session_id: session_id.clone(),
+        working_dir,
+        prior_uuid,
+        model,
+        permission_mode,
+        effort,
+        add_dirs: add_dirs.unwrap_or_default(),
+        fork: fork.unwrap_or(false),
+    };
+    state
+        .gate
+        .spawn(
+            &session_id,
+            || live_agent_session_id(&sessions, &session_id),
+            || spawn_child(&app, &sessions, req),
+        )
+        .await
+}
+
+/// Stop the session's agent process (if any) and start a new one, under the
+/// session's lock. Two restarts that overlap start exactly one process: the
+/// one that waited returns the id of the process the other started. A fork
+/// (new model / permission mode / effort) always really restarts, after any
+/// restart already in progress.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn restart_agent_session(
+    state: State<'_, AgentState>,
+    app: AppHandle,
+    session_id: String,
+    working_dir: String,
+    prior_uuid: Option<String>,
+    model: Option<String>,
+    permission_mode: Option<String>,
+    effort: Option<String>,
+    add_dirs: Option<Vec<String>>,
+    fork: Option<bool>,
+) -> Result<String, AgentError> {
+    mark_session_live(&app, &session_id);
+    let sessions = state.handle();
     let fork = fork.unwrap_or(false);
+    let req = SpawnRequest {
+        session_id: session_id.clone(),
+        working_dir,
+        prior_uuid,
+        model,
+        permission_mode,
+        effort,
+        add_dirs: add_dirs.unwrap_or_default(),
+        fork,
+    };
+    if !respawn_lock_enabled() {
+        let _ = close_child(&sessions, &session_id).await;
+        return spawn_child(&app, &sessions, req).await;
+    }
+    state
+        .gate
+        .restart(
+            &session_id,
+            !fork,
+            || live_agent_session_id(&sessions, &session_id),
+            || async {
+                let _ = close_child(&sessions, &session_id).await;
+            },
+            || spawn_child(&app, &sessions, req),
+        )
+        .await
+}
+
+/// Start the agent process for `req` and register it in `sessions_handle`.
+/// Callers hold the session's [`SpawnGate`] lock.
+async fn spawn_child(
+    app: &AppHandle,
+    sessions_handle: &SessionMap,
+    req: SpawnRequest,
+) -> Result<String, AgentError> {
+    let SpawnRequest {
+        session_id,
+        working_dir,
+        prior_uuid,
+        model,
+        permission_mode,
+        effort,
+        add_dirs,
+        fork,
+    } = req;
+    let NodeSpawnPaths {
+        bridge: bridge_path,
+        working_dir,
+        add_dirs: dirs,
+    } = node_spawn_paths(
+        &resolve_bridge_path_blocking(app).await?,
+        &working_dir,
+        &add_dirs,
+    );
     let claude_session_id = match (prior_uuid.as_deref(), fork) {
         (Some(uuid), false) => uuid.to_string(),
         (Some(_), true) | (None, _) => uuid::Uuid::new_v4().to_string(),
     };
-    let dirs: Vec<String> = add_dirs.unwrap_or_default();
     let plan = build_spawn_args(
         &claude_session_id,
         &working_dir,
@@ -470,7 +746,7 @@ pub async fn spawn_agent_session(
     // We no longer spawn `claude` directly.  Instead we spawn a Node
     // bridge (`hermes-claude-bridge.mjs`) that drives the Claude Agent
     // SDK in-process and pipes the SDK's message stream back out as the
-    // same NDJSON format `claude --print stream-json` produces — so the
+    // same NDJSON event format as Claude's stream-json output — so the
     // existing message-store reducer and IPC plumbing work unchanged.
     //
     // The bridge gives us the SDK's superpowers (interrupt(), setModel(),
@@ -481,7 +757,6 @@ pub async fn spawn_agent_session(
     let use_direct = std::env::var("HERMES_AGENT_DIRECT")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
-    let bridge_path = resolve_bridge_path(&app)?;
     let node_path = if use_direct {
         None
     } else {
@@ -551,6 +826,13 @@ pub async fn spawn_agent_session(
         let enriched = enriched_path_var();
         cmd.env("PATH", &enriched);
     }
+    // Started from inside another agent session, Hermes carries that
+    // session's marks (CLAUDECODE, CLAUDE_CODE_CHILD_SESSION, ...); the
+    // agent must not inherit them or it stops saving its transcript (see
+    // pty/session_markers.rs).
+    for name in crate::pty::session_markers::session_markers_present() {
+        cmd.env_remove(name);
+    }
     cmd.current_dir(&plan.working_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -560,6 +842,8 @@ pub async fn spawn_agent_session(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn agent runtime: {}", e))?;
+    // One line per started process; the Agent view scenarios count these.
+    eprintln!("[agent spawned] sid={} pid={:?}", session_id, child.id());
 
     let stdin = child
         .stdin
@@ -657,11 +941,12 @@ pub async fn spawn_agent_session(
     // input / interrupt / close.  The waiter task is spawned below and its
     // handle is appended to `task_handles` after insertion so all three
     // tasks get aborted together when the entry is dropped.
-    let sessions_handle = state.handle();
     {
         let mut sessions = sessions_handle.lock().await;
         if sessions.contains_key(&session_id) {
-            return Err(format!("Agent session '{}' already exists", session_id));
+            // Unreachable through the gate; if it ever happens, the new
+            // child is dropped (and killed) rather than orphaned.
+            return Err(AgentError::busy(&session_id));
         }
         sessions.insert(
             session_id.clone(),
@@ -669,6 +954,7 @@ pub async fn spawn_agent_session(
                 child: Some(child),
                 stdin: Some(stdin),
                 pid,
+                agent_session_id: claude_session_id.clone(),
                 task_handles: vec![stdout_task, stderr_task],
             },
         );
@@ -680,7 +966,7 @@ pub async fn spawn_agent_session(
     let waiter_task = {
         let app = app.clone();
         let sid = session_id.clone();
-        let waiter_handle = Arc::clone(&sessions_handle);
+        let waiter_handle = Arc::clone(sessions_handle);
         tokio::spawn(async move {
             await_child_exit(waiter_handle, app, sid).await;
         })
@@ -889,6 +1175,63 @@ pub async fn interrupt_agent(
     Ok(())
 }
 
+/// CHAOS-10: stop an agent that does not answer the polite interrupt (a
+/// wedged tool, a stalled network call). Its process gets SIGINT, and
+/// SIGKILL when it is still there two seconds later (Windows: it is ended).
+/// The child waiter then reports the exit like any other, and the next
+/// message resumes the conversation in a new process.
+#[tauri::command]
+pub async fn force_stop_agent(
+    state: State<'_, AgentState>,
+    session_id: String,
+) -> Result<(), String> {
+    force_stop(state.handle(), &session_id).await
+}
+
+/// `force_stop_agent` on the session map: SIGINT, then SIGKILL when the
+/// session's process is still registered two seconds later.
+async fn force_stop(handle: SessionMap, session_id: &str) -> Result<(), String> {
+    let pid = handle
+        .lock()
+        .await
+        .get(session_id)
+        .and_then(|e| e.pid)
+        .ok_or_else(|| format!("Agent session '{}' has no live process", session_id))?;
+    signal_agent_pid(pid, false);
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !handle.lock().await.contains_key(session_id) {
+            return Ok(());
+        }
+    }
+    log::warn!("agent[{session_id}] ignored SIGINT; killing it");
+    signal_agent_pid(pid, true);
+    Ok(())
+}
+
+fn signal_agent_pid(pid: u32, kill: bool) {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(pid) else {
+            return;
+        };
+        let signal = if kill { libc::SIGKILL } else { libc::SIGINT };
+        // Safety: FFI with a validated pid and a known signal constant.
+        unsafe {
+            libc::kill(pid, signal);
+        }
+    }
+    #[cfg(windows)]
+    {
+        // No SIGINT for a process without a shared console: end it (with
+        // the processes it started), as interrupt_agent does.
+        let _ = kill;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output();
+    }
+}
+
 /// Graceful shutdown: drop stdin (signals EOF), wait briefly, then kill.
 /// Removes the entry from state so the session id can be reused.
 #[tauri::command]
@@ -897,10 +1240,18 @@ pub async fn close_agent_session(
     session_id: String,
 ) -> Result<(), String> {
     let sessions_handle = state.handle();
+    // Under the session's lock, so a close that arrives mid-restart stops
+    // the new process instead of running first and leaving it orphaned.
+    state
+        .gate
+        .exclusive(&session_id, || close_child(&sessions_handle, &session_id))
+        .await
+}
 
+async fn close_child(sessions_handle: &SessionMap, session_id: &str) -> Result<(), String> {
     let entry_opt = {
         let mut sessions = sessions_handle.lock().await;
-        sessions.remove(&session_id)
+        sessions.remove(session_id)
     };
 
     let mut entry = match entry_opt {
@@ -1204,6 +1555,40 @@ mod e2e_tests;
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn installed_apps_use_the_packed_runtime_and_dev_builds_the_source_tree() {
+        let packed = Some(PathBuf::from("/res/bridge/runtime"));
+        let candidates = vec![
+            PathBuf::from("/src/bridge/hermes-claude-bridge.mjs"),
+            PathBuf::from("/res/bridge/hermes-claude-bridge.mjs"),
+        ];
+        let only_source = |p: &std::path::Path| p.starts_with("/src");
+        let nothing = |_: &std::path::Path| false;
+
+        // Installed app (and test builds): the packed runtime, even when a
+        // source tree happens to exist at the build path.
+        assert_eq!(
+            pick_bridge_source(false, packed.clone(), &candidates, only_source),
+            Some(BridgeSource::Packed(PathBuf::from("/res/bridge/runtime")))
+        );
+        // `tauri dev`: the live source tree wins over a stale packed copy…
+        assert_eq!(
+            pick_bridge_source(true, packed.clone(), &candidates, only_source),
+            Some(BridgeSource::File(candidates[0].clone()))
+        );
+        // …and the packed runtime is still used when there is no source.
+        assert_eq!(
+            pick_bridge_source(true, packed.clone(), &candidates, nothing),
+            Some(BridgeSource::Packed(PathBuf::from("/res/bridge/runtime")))
+        );
+        // No packed runtime: the first script that exists, else nothing.
+        assert_eq!(
+            pick_bridge_source(false, None, &candidates, |p| p.starts_with("/res")),
+            Some(BridgeSource::File(candidates[1].clone()))
+        );
+        assert_eq!(pick_bridge_source(false, None, &candidates, nothing), None);
+    }
 
     fn fixture(name: &str) -> PathBuf {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -1760,6 +2145,70 @@ mod tests {
     }
 
     #[test]
+    fn node_safe_path_leaves_plain_paths_untouched() {
+        let p = std::path::Path::new("/tmp/project");
+        assert_eq!(node_safe_path(p), PathBuf::from("/tmp/project"));
+    }
+
+    // Guards the spawn wiring, not just the helper: bridge, cwd and every
+    // add-dir must pass through the normalizer.  Uses a fake normalizer so it
+    // is meaningful on macOS/Linux, where dunce is a no-op.
+    #[test]
+    fn node_spawn_paths_normalizes_bridge_cwd_and_every_add_dir() {
+        let strip = |p: &std::path::Path| {
+            PathBuf::from(p.to_string_lossy().trim_start_matches(r"\\?\").to_string())
+        };
+        let got = node_spawn_paths_with(
+            std::path::Path::new(r"\\?\C:\Hermes\bridge\hermes-claude-bridge.mjs"),
+            r"\\?\C:\Users\me\project",
+            &[r"\\?\D:\lib".to_string(), r"\\?\E:\docs".to_string()],
+            strip,
+        );
+        assert_eq!(
+            got,
+            NodeSpawnPaths {
+                bridge: PathBuf::from(r"C:\Hermes\bridge\hermes-claude-bridge.mjs"),
+                working_dir: r"C:\Users\me\project".to_string(),
+                add_dirs: vec![r"D:\lib".to_string(), r"E:\docs".to_string()],
+            }
+        );
+    }
+
+    // Production wiring: node_spawn_paths must use node_safe_path (real
+    // stripping only happens on Windows; CI runs cargo test on windows-2022).
+    #[cfg(windows)]
+    #[test]
+    fn node_spawn_paths_strips_verbatim_prefix_on_windows() {
+        let got = node_spawn_paths(
+            std::path::Path::new(r"\\?\C:\Hermes\bridge\hermes-claude-bridge.mjs"),
+            r"\\?\C:\Users\me\project",
+            &[r"\\?\D:\lib".to_string()],
+        );
+        assert_eq!(
+            got.bridge,
+            PathBuf::from(r"C:\Hermes\bridge\hermes-claude-bridge.mjs")
+        );
+        assert_eq!(got.working_dir, r"C:\Users\me\project");
+        assert_eq!(got.add_dirs, vec![r"D:\lib".to_string()]);
+    }
+
+    // Issue #296: a `\\?\C:\...` bridge path / cwd crashed node with
+    // `EISDIR: lstat 'C:'`.  The verbatim prefix must be stripped.
+    #[cfg(windows)]
+    #[test]
+    fn node_safe_path_strips_windows_verbatim_prefix() {
+        let p = std::path::Path::new(
+            r"\\?\C:\Program Files\Hermes IDE\bridge\hermes-claude-bridge.mjs",
+        );
+        assert_eq!(
+            node_safe_path(p),
+            PathBuf::from(r"C:\Program Files\Hermes IDE\bridge\hermes-claude-bridge.mjs")
+        );
+        let wd = std::path::Path::new(r"\\?\C:\Users\me\project");
+        assert_eq!(node_safe_path(wd), PathBuf::from(r"C:\Users\me\project"));
+    }
+
+    #[test]
     fn bridge_candidates_no_resource_dir_doesnt_panic() {
         // Confidence test: in environments where Tauri can't determine
         // the resource dir (unusual but possible at startup), the
@@ -2031,5 +2480,108 @@ mod tests {
         // buf is taken — caller's slot now holds an empty Vec with the
         // original capacity for reuse.
         assert!(buf.is_empty());
+    }
+
+    #[cfg(unix)]
+    fn signal_of(child: &mut std::process::Child) -> Option<i32> {
+        use std::os::unix::process::ExitStatusExt;
+        for _ in 0..100 {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status.signal();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        None
+    }
+
+    /// A process that ignores SIGINT (as a wedged agent effectively does).
+    #[cfg(unix)]
+    fn deaf_child() -> std::process::Child {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "trap '' INT; echo ready; exec /bin/sleep 30"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Nothing signals it before the shell has installed the trap.
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "ready");
+        child
+    }
+
+    #[cfg(unix)]
+    fn registered(pid: u32) -> SessionMap {
+        let map: SessionMap = Arc::new(Mutex::new(HashMap::new()));
+        map.try_lock().unwrap().insert(
+            "s1".to_string(),
+            AgentChild {
+                child: None,
+                stdin: None,
+                pid: Some(pid),
+                agent_session_id: "a1".to_string(),
+                task_handles: Vec::new(),
+            },
+        );
+        map
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_signal_is_sigint_and_a_kill_is_sigkill() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        signal_agent_pid(child.id(), false);
+        assert_eq!(signal_of(&mut child), Some(libc::SIGINT));
+        let mut deaf = deaf_child();
+        signal_agent_pid(deaf.id(), false);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(deaf.try_wait().unwrap().is_none(), "SIGINT is ignored");
+        signal_agent_pid(deaf.id(), true);
+        assert_eq!(signal_of(&mut deaf), Some(libc::SIGKILL));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_stop_kills_an_agent_that_ignores_the_interrupt() {
+        let mut deaf = deaf_child();
+        let map = registered(deaf.id());
+        force_stop(Arc::clone(&map), "s1").await.unwrap();
+        assert_eq!(signal_of(&mut deaf), Some(libc::SIGKILL));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_stop_stops_at_the_interrupt_when_the_agent_goes() {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let map = registered(child.id());
+        // The child waiter: unregisters the session once its process exits.
+        let waiter_map = Arc::clone(&map);
+        let waiter = std::thread::spawn(move || {
+            let mut child = child;
+            let signal = signal_of(&mut child);
+            waiter_map.blocking_lock().remove("s1");
+            signal
+        });
+        let started = std::time::Instant::now();
+        force_stop(Arc::clone(&map), "s1").await.unwrap();
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        assert_eq!(waiter.join().unwrap(), Some(libc::SIGINT));
+    }
+
+    #[tokio::test]
+    async fn force_stop_needs_a_live_process() {
+        let map: SessionMap = Arc::new(Mutex::new(HashMap::new()));
+        let err = force_stop(map, "nope").await.unwrap_err();
+        assert_eq!(err, "Agent session 'nope' has no live process");
     }
 }

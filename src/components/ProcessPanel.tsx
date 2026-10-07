@@ -1,9 +1,12 @@
 import { useState, useMemo, useCallback, useRef, memo } from "react";
 import "../styles/components/ProcessPanel.css";
+import "../styles/components/CloseSessionDialog.css";
 import { useProcesses } from "../hooks/useProcesses";
 import { killProcess, killProcessTree, getProcessDetail, revealProcessInFinder } from "../api/processes";
 import type { ProcessInfo, ProcessSortField, SortDirection, ProcessFilter } from "../types/process";
 import { useContextMenu, buildProcessMenuItems } from "../hooks/useContextMenu";
+import { useModalFocus } from "../hooks/useModalFocus";
+import { Button, Checkbox } from "./ui";
 
 // ─── Constants ──────────────────────────────────────────────────────
 
@@ -239,15 +242,27 @@ interface KillConfirmDialogProps {
   onToggleSkip: () => void;
 }
 
-function KillConfirmDialog({ processName, pid, signal, isTree, onConfirm, onCancel, skipConfirm, onToggleSkip }: KillConfirmDialogProps) {
+/** A modal alert dialog with the same keyboard rules as "Close session?" (useModalFocus). */
+export function KillConfirmDialog({ processName, pid, signal, isTree, onConfirm, onCancel, skipConfirm, onToggleSkip }: KillConfirmDialogProps) {
   const isDangerous = signal === "SIGKILL" || isTree;
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  useModalFocus(dialogRef, confirmRef, onCancel);
   return (
     <div className="close-dialog-backdrop" onClick={onCancel}>
-      <div className="close-dialog" onClick={(e) => e.stopPropagation()}>
-        <div className="close-dialog-title">
+      <div
+        className="close-dialog"
+        ref={dialogRef}
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby={`kill-dialog-title-${pid}`}
+        aria-describedby={`kill-dialog-body-${pid}`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="close-dialog-title" id={`kill-dialog-title-${pid}`}>
           {isTree ? "Kill Process Tree" : "Kill Process"}
         </div>
-        <div className="close-dialog-body">
+        <div className="close-dialog-body" id={`kill-dialog-body-${pid}`}>
           {isTree
             ? `Kill "${processName}" (PID ${pid}) and all its children with ${signal}?`
             : `Send ${signal} to "${processName}" (PID ${pid})?`
@@ -258,15 +273,12 @@ function KillConfirmDialog({ processName, pid, signal, isTree, onConfirm, onCanc
             </div>
           )}
         </div>
-        <label className="close-dialog-checkbox">
-          <input type="checkbox" checked={skipConfirm} onChange={onToggleSkip} />
-          Don't ask again this session
-        </label>
+        <Checkbox className="close-dialog-checkbox" checked={skipConfirm} onChange={onToggleSkip} label="Don't ask again this session" />
         <div className="close-dialog-actions">
-          <button className="close-dialog-btn" onClick={onCancel}>Cancel</button>
-          <button className="close-dialog-btn close-dialog-btn-confirm" onClick={onConfirm}>
+          <Button onClick={onCancel}>Cancel</Button>
+          <Button ref={confirmRef} variant="danger-solid" className="process-kill-confirm" onClick={onConfirm}>
             {isTree ? "Kill Tree" : "Kill"}
-          </button>
+          </Button>
         </div>
       </div>
     </div>

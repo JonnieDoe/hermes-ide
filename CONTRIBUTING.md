@@ -80,6 +80,17 @@ cd src-tauri && cargo check  # Check Rust compilation
 cd src-tauri && cargo test   # Run Rust tests
 ```
 
+### Dev builds and your installed Hermes
+
+`npm run tauri dev` runs as its own app (`com.hermes-ide.terminal.dev`) with its own data folder, so it never touches the database, worktrees or terminals of a Hermes you have installed. Set `HERMES_DATA_DIR=/absolute/path` to use a throwaway data folder instead. Dev and test builds refuse to start if they would use the installed app's data folder, and CI fails if a dev or test config uses the production identifier.
+
+Running the Tauri CLI or Cargo directly (`npx tauri dev`, `cargo run`) builds with the production identifier, so that debug build stops with exit code 78 and says why. Use `npm run tauri dev`, or set one of:
+
+- `HERMES_DATA_DIR=/absolute/path` — use that folder for all app data. Honoured by dev, test and beta builds; the released app ignores it.
+- `HERMES_ALLOW_PRODUCTION_DATA=1` — let a debug build with the production identifier use the installed app's data folder. Only do this if you mean to work on your real sessions; it has no effect on test builds.
+
+`HERMES_DATA_DIR` moves the database, worktrees and other app files, but not the web view's own storage (local storage, IndexedDB), which is kept per app identifier. Two runs of the same build with different `HERMES_DATA_DIR` values still share that storage; use a different identifier (as `npm run tauri dev` does) when you need it separate.
+
 ## Finding Good First Issues
 
 If you are new to the project, look for issues labeled [`good-first-issue`](https://github.com/hermes-hq/hermes-ide/labels/good-first-issue). These are intentionally scoped to be approachable for newcomers and usually include enough context to get started without deep codebase knowledge.
@@ -121,6 +132,22 @@ Keep the description concise (under 72 characters). Use the commit body for addi
 3. Ensure `npx tsc --noEmit` and `npm run test` pass.
 4. Open a PR with a clear description of what and why.
 5. Link to the issue or discussion that approved the change (for features).
+
+### Checks
+
+The one required check is `gate`. It passes only when every check that had to run succeeded; a failed, cancelled or wrongly skipped check fails it.
+
+On pull requests, checks run only for what the PR touches:
+
+- Frontend (type check, lint, unit tests): `src/`, `package*.json`, lint and build config.
+- Rust (format, clippy, tests on Linux, macOS and Windows): `src-tauri/`, `package*.json`, `rust-toolchain.toml`.
+- Real-app scenarios on all three OSes: frontend or Rust changes.
+- Workflow lint: `.github/workflows/`.
+- Privacy: every PR.
+
+Changing `.github/workflows/ci.yml`, `scripts/ci-gate.mjs` or `e2e/` runs the frontend, Rust and real-app checks.
+
+So a frontend-only PR runs no Rust tests, and the `gate` log shows those jobs as `ok ... skipped`. That means "not needed", not "passed". Every push to `main` and every merge-queue run executes all checks. The Rust security audit runs on `main` only and is not part of the gate.
 
 ### Review Timeline
 

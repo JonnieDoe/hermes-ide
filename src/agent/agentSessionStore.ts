@@ -43,13 +43,19 @@
  */
 
 import type { AgentEvent } from "./types";
-import { emptyState, freezePendingThinking, reduceEvent } from "./messageStore";
+import { isInitEvent } from "./types";
+import { emptyState, freezePendingThinking, reduceEvent, withHistory } from "./messageStore";
 import type { AgentSessionState } from "./messageStore";
 import { isPermRequest, type PermRequest } from "../utils/permissionRequest";
+import type { AgentErrorKind } from "../api/agent";
+import { peekAgentInitCache } from "./useAgentInit";
 
 export interface AgentExitInfo {
   code: number | null;
   signal: string | null;
+  /** Set on the synthetic exit a failed spawn / restart emits
+   *  (see utils/agentSpawnFailure.ts). */
+  kind?: AgentErrorKind;
 }
 
 /** Frozen view of everything an AgentSessionView needs to render. */
@@ -62,6 +68,27 @@ export interface AgentViewSnapshot {
    *  session switch doesn't lose the request and leave the bridge
    *  hanging on `canUseTool`. */
   pendingPermRequest: PermRequest | null;
+  /** The last line of agent output Hermes could not read (not JSON, or too
+   *  long), since the agent last started. Null when the stream is clean. */
+  protocolError: string | null;
+}
+
+/** Text of a stdout line Hermes could not parse, or null for a normal event.
+ *  Covers the backend's `parse_error` event and its oversize-line notice. */
+export function protocolErrorOf(event: unknown): string | null {
+  const ev = event as { type?: string; subtype?: string; error?: unknown; raw?: unknown; limit?: unknown } | null;
+  if (!ev || typeof ev !== "object") return null;
+  if (ev.type === "parse_error") {
+    const raw = typeof ev.raw === "string" ? ev.raw.slice(0, 200) : "";
+    const why = typeof ev.error === "string" ? ev.error : "not valid JSON";
+    return raw ? `${why}: ${raw}` : why;
+  }
+  if (ev.type === "_hermes_event" && ev.subtype === "parse_error") {
+    return typeof ev.limit === "number"
+      ? `An output line longer than ${ev.limit} bytes was dropped`
+      : "An output line that was too long was dropped";
+  }
+  return null;
 }
 
 type Unlisten = () => void;
@@ -116,11 +143,17 @@ export class AgentSessionStore {
   private lastInitAt = 0;
 
   constructor(public readonly sessionId: string, listen: ListenFn) {
+    // The agent's init fires once, right after it starts, and Tauri does
+    // not replay it. A store created after that (the view mounted late on
+    // a slow machine) would never be initialized: no model in the header
+    // and no Stop while a turn runs. The session's own listener caught it.
+    const init = peekAgentInitCache(sessionId);
     this.snapshot = {
-      state: emptyState(),
+      state: init ? reduceEvent(emptyState(), init) : emptyState(),
       stderr: "",
       exit: null,
       pendingPermRequest: null,
+      protocolError: null,
     };
 
     // Subscribe up-front so events that arrive while no view is mounted
@@ -142,9 +175,13 @@ export class AgentSessionStore {
         return;
       }
 
+      // The init may have fired while this listener was still being
+      // registered: the session's own listener cached it, this one missed it.
+      if (!isInitEvent(payload)) this.adoptCachedInit(false);
       this.snapshot = {
         ...this.snapshot,
         state: reduceEvent(this.snapshot.state, payload),
+        protocolError: nextProtocolError(this.snapshot.protocolError, payload),
       };
       // Drop the locally-cached exitInfo when a fresh init arrives —
       // a new init session_id means the agent is alive again, so any
@@ -165,10 +202,14 @@ export class AgentSessionStore {
           exit: null,
           stderr: "",
           pendingPermRequest: null,
+          protocolError: null,
         };
       }
       this.notify();
-    }).then((un) => this.collect(un)).catch(() => undefined);
+    }).then((un) => {
+      this.collect(un);
+      this.adoptCachedInit(true);
+    }).catch(() => undefined);
 
     listen<string>(`agent-stderr-${sessionId}`, (msg) => {
       if (this.destroyed) return;
@@ -203,6 +244,20 @@ export class AgentSessionStore {
     }).then((un) => this.collect(un)).catch(() => undefined);
   }
 
+  /** Takes the session's cached init when this store has not seen one.
+   *  Only marks the store initialized: nothing else in the state belongs
+   *  to an earlier agent process, so nothing is reset. */
+  private adoptCachedInit(notify: boolean) {
+    if (this.destroyed || this.snapshot.state.initialized) return;
+    const init = peekAgentInitCache(this.sessionId);
+    if (!init) return;
+    this.snapshot = {
+      ...this.snapshot,
+      state: { ...this.snapshot.state, initialized: true, initEvent: init },
+    };
+    if (notify) this.notify();
+  }
+
   private collect(un: Unlisten) {
     if (this.destroyed) {
       // Race: destroy() called before listen() resolved — clean up now.
@@ -227,8 +282,8 @@ export class AgentSessionStore {
   /** Test hook + manual "Start fresh" button — clears the local
    *  exit / stderr buffers without touching the messages list. */
   clearExitNotice = () => {
-    if (this.snapshot.exit === null && this.snapshot.stderr === "") return;
-    this.snapshot = { ...this.snapshot, exit: null, stderr: "" };
+    if (this.snapshot.exit === null && this.snapshot.stderr === "" && this.snapshot.protocolError === null) return;
+    this.snapshot = { ...this.snapshot, exit: null, stderr: "", protocolError: null };
     this.notify();
   };
 
@@ -249,7 +304,18 @@ export class AgentSessionStore {
       stderr: "",
       exit: null,
       pendingPermRequest: null,
+      protocolError: null,
     };
+    this.notify();
+  };
+
+  /** A restored session's earlier conversation, read back from the agent's
+   *  transcript, drawn in front of anything already shown. */
+  seedHistory = (history: AgentEvent[]) => {
+    if (this.destroyed) return;
+    const state = withHistory(this.snapshot.state, history);
+    if (state === this.snapshot.state) return;
+    this.snapshot = { ...this.snapshot, state };
     this.notify();
   };
 
@@ -263,12 +329,13 @@ export class AgentSessionStore {
     this.snapshot = {
       ...this.snapshot,
       state: reduceEvent(this.snapshot.state, event),
+      protocolError: nextProtocolError(this.snapshot.protocolError, event),
     };
     const ev = event as { type?: string; subtype?: string };
     if (ev?.type === "system" && ev?.subtype === "init") {
       this.initGeneration += 1;
       this.lastInitAt = Date.now();
-      this.snapshot = { ...this.snapshot, exit: null, stderr: "" };
+      this.snapshot = { ...this.snapshot, exit: null, stderr: "", protocolError: null };
     }
     this.notify();
   };
@@ -307,6 +374,16 @@ export class AgentSessionStore {
     this.unlisteners = [];
     this.listeners.clear();
   }
+}
+
+/** A bad line sets the protocol error; a turn that then completes normally
+ *  clears it (the stream recovered). Everything else leaves it as it was. */
+function nextProtocolError(current: string | null, event: unknown): string | null {
+  const bad = protocolErrorOf(event);
+  if (bad) return bad;
+  const ev = event as { type?: string; is_error?: boolean } | null;
+  if (current && ev?.type === "result" && ev.is_error === false) return null;
+  return current;
 }
 
 /**

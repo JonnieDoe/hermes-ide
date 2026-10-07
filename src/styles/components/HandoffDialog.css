@@ -1,0 +1,110 @@
+/* ─── Handoff dialog (N19) ─────────────────────────────────────────── */
+
+.handoff-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.handoff-modal {
+  background: var(--bg-1);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  width: min(92vw, 520px);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+.handoff-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.handoff-title {
+  flex: 1;
+  font-size: var(--text-base);
+  font-weight: 600;
+  color: var(--text-0);
+}
+
+.handoff-body {
+  padding: var(--space-3);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.handoff-body .handoff-agents {
+  flex-direction: row;
+  flex-wrap: wrap;
+  column-gap: var(--space-4);
+}
+
+.handoff-section-label {
+  color: var(--text-2);
+  font-size: var(--text-xs);
+  margin-top: var(--space-1);
+}
+
+.handoff-file-list {
+  margin: var(--space-1) 0 0;
+  padding-left: var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-1);
+}
+
+.handoff-muted {
+  color: var(--text-3);
+  font-size: var(--text-xs);
+}
+
+.handoff-seed summary {
+  cursor: pointer;
+  color: var(--text-2);
+  font-size: var(--text-xs);
+}
+.handoff-seed-text {
+  margin: var(--space-1) 0 0;
+  padding: var(--space-2);
+  background: var(--bg-0);
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-1);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.handoff-note {
+  margin: 0;
+  color: var(--text-3);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+
+.handoff-error {
+  color: var(--danger);
+  font-size: var(--text-xs);
+}
+
+.handoff-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-top: 1px solid var(--border);
+}

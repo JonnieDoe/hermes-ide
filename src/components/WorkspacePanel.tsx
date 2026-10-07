@@ -1,8 +1,10 @@
 import "../styles/components/WorkspacePanel.css";
+import { Button, CloseButton, Input } from "./ui";
 import { useState, useEffect, useCallback } from "react";
 import { Project } from "../hooks/useSessionProjects";
 import { getProjects, createProject, deleteProject as apiDeleteProject, scanProject, scanDirectory as apiScanDirectory } from "../api/projects";
 import { LANG_COLORS } from "../utils/langColors";
+import { useI18n } from "../i18n/I18nProvider";
 
 interface WorkspacePanelProps {
   onClose: () => void;
@@ -12,14 +14,15 @@ function projectShortPath(path: string): string {
   return path.replace(/^\/Users\/[^/]+/, "~");
 }
 
-const SCAN_STATUS_LABELS: Record<string, string> = {
-  pending: "Pending",
-  surface: "Surface",
-  deep: "Deep",
-  full: "Full",
+const SCAN_STATUS_KEYS: Record<string, string> = {
+  pending: "workspace.scan.pending",
+  surface: "workspace.scan.surface",
+  deep: "workspace.scan.deep",
+  full: "workspace.scan.full",
 };
 
 export function WorkspacePanel({ onClose }: WorkspacePanelProps) {
+  const { t } = useI18n();
   const [projects, setProjects] = useState<Project[]>([]);
   const [scanPath, setScanPath] = useState("");
   const [scanning, setScanning] = useState(false);
@@ -80,37 +83,39 @@ export function WorkspacePanel({ onClose }: WorkspacePanelProps) {
     <div className="workspace-overlay" onClick={onClose}>
       <div className="workspace-panel" onClick={(e) => e.stopPropagation()}>
         <div className="workspace-header">
-          <span className="workspace-title">Projects</span>
-          <span className="workspace-count">{projects.length} projects</span>
-          <button className="settings-close" onClick={onClose} title="Close">&times;</button>
+          <span className="workspace-title">{t("workspace.projects")}</span>
+          <span className="workspace-count">{t("workspace.projectCount", { count: projects.length })}</span>
+          <CloseButton className="workspace-close" onClick={onClose} label={t("common.close")} />
         </div>
 
         <div className="workspace-scan-row">
-          <input
-            className="workspace-scan-input"
-            placeholder="Path to scan (e.g. ~/Projects)"
+          <Input
+            code
+            className="workspace-panel-scan-input"
+            aria-label={t("workspace.pathPlaceholder")}
+            placeholder={t("workspace.pathPlaceholder")}
             value={scanPath}
             onChange={(e) => setScanPath(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter") scanDirectory(); }}
           />
-          <button className="workspace-scan-btn" onClick={scanDirectory} disabled={scanning}>
-            {scanning ? "..." : "Scan"}
-          </button>
+          <Button variant="primary" className="workspace-panel-scan" onClick={scanDirectory} disabled={scanning}>
+            {scanning ? "..." : t("common.scan")}
+          </Button>
         </div>
 
         <div className="workspace-body">
           {projects.length === 0 && !scanning && (
             <div className="workspace-empty">
-              <p>No projects detected yet.</p>
-              <button className="workspace-scan-home-btn" onClick={scanHome}>
-                Scan home directory
-              </button>
+              <p>{t("workspace.noProjects")}</p>
+              <Button className="workspace-scan-home-btn" onClick={scanHome}>
+                {t("workspace.scanHome")}
+              </Button>
             </div>
           )}
           {scanning && (
             <div className="workspace-scanning">
               <div className="loading-spinner" style={{ width: 20, height: 20, borderWidth: 2 }} />
-              <span>Scanning...</span>
+              <span>{t("workspace.scanning")}</span>
             </div>
           )}
           <div className="workspace-project-list">
@@ -119,7 +124,7 @@ export function WorkspacePanel({ onClose }: WorkspacePanelProps) {
                 <div className="workspace-project-header">
                   <span className="workspace-project-name">{project.name}</span>
                   <span className="project-scan-badge" data-status={project.scan_status}>
-                    {SCAN_STATUS_LABELS[project.scan_status] || project.scan_status}
+                    {SCAN_STATUS_KEYS[project.scan_status] ? t(SCAN_STATUS_KEYS[project.scan_status]) : project.scan_status}
                   </span>
                   <div className="workspace-project-tags">
                     {project.languages.map((lang) => (
@@ -148,36 +153,42 @@ export function WorkspacePanel({ onClose }: WorkspacePanelProps) {
                 )}
                 <div className="workspace-project-path mono">{projectShortPath(project.path)}</div>
                 <div className="project-actions">
-                  <button
-                    className="project-action-btn"
+                  <Button
+                    size="sm"
+                    className="project-action-scan"
                     onClick={() => triggerScan(project.id)}
-                    title="Trigger deep scan"
+                    title={t("workspace.triggerDeepScan")}
                   >
-                    Scan
-                  </button>
+                    {t("common.scan")}
+                  </Button>
                   {confirmDeleteId === project.id ? (
                     <>
-                      <button
-                        className="project-action-btn project-action-delete"
+                      <Button
+                        size="sm"
+                        variant="danger"
+                        className="project-action-delete"
                         onClick={() => { deleteProjectById(project.id); setConfirmDeleteId(null); }}
                       >
-                        Confirm?
-                      </button>
-                      <button
-                        className="project-action-btn"
+                        {t("common.confirmQuestion")}
+                      </Button>
+                      <Button
+                        size="sm"
+                        className="project-action-cancel"
                         onClick={() => setConfirmDeleteId(null)}
                       >
-                        Cancel
-                      </button>
+                        {t("common.cancel")}
+                      </Button>
                     </>
                   ) : (
-                    <button
-                      className="project-action-btn project-action-delete"
+                    <Button
+                      size="sm"
+                      variant="danger"
+                      className="project-action-delete"
                       onClick={() => setConfirmDeleteId(project.id)}
-                      title="Delete project"
+                      title={t("workspace.deleteProject")}
                     >
-                      Delete
-                    </button>
+                      {t("common.delete")}
+                    </Button>
                   )}
                 </div>
               </div>
@@ -188,4 +199,3 @@ export function WorkspacePanel({ onClose }: WorkspacePanelProps) {
     </div>
   );
 }
-

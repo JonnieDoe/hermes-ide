@@ -3,7 +3,7 @@ import React, { useState, useCallback, useMemo, useEffect, useRef, memo } from "
 import { fmt } from "../utils/platform";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { SessionData, useExecutionMode, useSession } from "../state/SessionContext";
+import { SessionData, useSession } from "../state/SessionContext";
 import { addWorkspacePath as apiAddWorkspacePath, removeWorkspacePath as apiRemoveWorkspacePath } from "../api/sessions";
 import { getSessionProjects } from "../api/projects";
 import { addContextPin, removeContextPin } from "../api/context";
@@ -13,6 +13,12 @@ import { useContextState } from "../hooks/useContextState";
 import { ContextStatusBar } from "./ContextStatusBar";
 import { ContextPreview } from "./ContextPreview";
 import type { PersistedMemory } from "../types";
+import { useI18n } from "../i18n/I18nProvider";
+import { isFeatureFlagEnabled } from "../featureFlags";
+import { useSessionEvents } from "../agent/contract/sessionEventStore";
+import { spendOf, spendText } from "../fleet/spend";
+import { CloseButton } from "./ui/Button";
+import { NativeSelect } from "./ui/Select";
 
 interface ContextPanelProps {
   session: SessionData;
@@ -131,6 +137,7 @@ function ToolTimeline({ toolCalls }: { toolCalls: { tool: string; args: string; 
 
 // ─── Domain Section (Attached Projects) ──────────────────────────────
 function DomainSection({ sessionId }: { sessionId: string }) {
+  const { t } = useI18n();
   const [projects, setProjects] = useState<{
     id: string; name: string; path: string; languages: string[];
     scan_status: string; architecture: { pattern: string; layers: string[] } | null;
@@ -167,7 +174,7 @@ function DomainSection({ sessionId }: { sessionId: string }) {
 
   if (loading) return (
     <div className="ctx-section">
-      <div className="ctx-section-title">Projects</div>
+      <div className="ctx-section-title">{t("ctxPanel.projects")}</div>
       <div className="text-muted">Loading...</div>
     </div>
   );
@@ -175,7 +182,7 @@ function DomainSection({ sessionId }: { sessionId: string }) {
 
   return (
     <div className="ctx-section">
-      <div className="ctx-section-title">Projects</div>
+      <div className="ctx-section-title">{t("ctxPanel.projects")}</div>
       {projects.map((project) => (
         <div key={project.id} className="ctx-domain-project">
           <div
@@ -194,19 +201,19 @@ function DomainSection({ sessionId }: { sessionId: string }) {
             <div className="ctx-domain-project-detail">
               {project.architecture && (
                 <div className="ctx-kv">
-                  <span>Architecture</span>
+                  <span>{t("ctxPanel.architecture")}</span>
                   <span className="mono">{project.architecture.pattern}</span>
                 </div>
               )}
               {project.architecture && project.architecture.layers.length > 0 && (
                 <div className="ctx-kv">
-                  <span>Layers</span>
+                  <span>{t("ctxPanel.layers")}</span>
                   <span className="mono">{project.architecture.layers.join(", ")}</span>
                 </div>
               )}
               {project.languages.length > 0 && (
                 <div className="ctx-kv">
-                  <span>Languages</span>
+                  <span>{t("ctxPanel.languages")}</span>
                   <span className="mono">{project.languages.join(", ")}</span>
                 </div>
               )}
@@ -229,12 +236,13 @@ function WorkspaceCompact({ cwd, extraPaths, workspaceInput, setWorkspaceInput, 
   cwd: string; extraPaths: string[];
   workspaceInput: string; setWorkspaceInput: (v: string) => void; onAddPath: () => void; onRemovePath: (path: string) => void;
 }) {
+  const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
   const basename = cwd.replace(/\\/g, "/").split("/").pop() || cwd;
 
   return (
     <div className="ctx-section">
-      <div className="ctx-section-title">Workspace</div>
+      <div className="ctx-section-title">{t("ctxPanel.workspace")}</div>
       <div className="ctx-workspace-compact" role="button" tabIndex={0} onClick={() => setExpanded(!expanded)} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setExpanded(!expanded); } }} title={cwd}>
         <span className="mono">{basename}</span>
         {extraPaths.length > 0 && (
@@ -260,7 +268,8 @@ function WorkspaceCompact({ cwd, extraPaths, workspaceInput, setWorkspaceInput, 
           <div className="ctx-workspace-add">
             <input
               className="ctx-workspace-input"
-              placeholder="Add project path..."
+              placeholder={t("ctxPanel.addPath")}
+              aria-label={t("ctxPanel.addPath")}
               value={workspaceInput}
               onChange={(e) => setWorkspaceInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") onAddPath(); }}
@@ -275,10 +284,10 @@ function WorkspaceCompact({ cwd, extraPaths, workspaceInput, setWorkspaceInput, 
 // ─── Constants ──────────────────────────────────────────────────────
 const COPY_FEEDBACK_MS = 2000;
 export function ContextPanel({ session }: ContextPanelProps) {
+  const { t } = useI18n();
   const { metrics, detected_agent } = session;
-  const mode = useExecutionMode(session.id);
   const { state: sessionState, dispatch } = useSession();
-  const contextManager = useContextState(session, mode);
+  const contextManager = useContextState(session);
   const [workspaceInput, setWorkspaceInput] = useState("");
   const [persistedMemory, setPersistedMemory] = useState<PersistedMemory[]>([]);
   const [memoryKeyInput, setMemoryKeyInput] = useState("");
@@ -468,6 +477,12 @@ export function ContextPanel({ session }: ContextPanelProps) {
     }
   }, [session.id]);
 
+  // With the 2.0 fleet controls on, tokens and cost come only from the
+  // session's `usage` events: the agent's own cost, or Hermes's estimate
+  // from the agent's transcript (marked); never the terminal analyzer's.
+  const fleetOn = isFeatureFlagEnabled("fleetControls");
+  const reportedUsage = useSessionEvents(session.id).usage;
+  const reportedSpend = spendOf(reportedUsage);
   const { totalInput, totalOutput, totalCost, totalTokens } = useMemo(() => {
     let inp = 0, out = 0, cost = 0;
     for (const t of Object.values(metrics.token_usage)) {
@@ -621,8 +636,27 @@ export function ContextPanel({ session }: ContextPanelProps) {
           </div>
         )}
 
-        {/* Tokens */}
-        {totalTokens > 0 && (
+        {/* Tokens: with the fleet controls, the session's usage events only
+            (the same numbers as its row and the status bar). */}
+        {fleetOn && reportedUsage && (
+          <div className="ctx-section ctx-usage">
+            <div className="ctx-section-title">
+              {t("fleet.usageTokens")}{" "}
+              <span className="ctx-cost" data-spend={reportedSpend.kind} title={reportedSpend.kind === "estimated" ? t("fleet.spendEstimatedTitle") : undefined}>
+                {spendText(reportedSpend, t)}
+              </span>
+            </div>
+            <div className="ctx-tokens-row">
+              <span className="ctx-token-in" data-tokens={reportedUsage.inputTokens ?? ""}>
+                {t("fleet.tokensIn", { tokens: reportedUsage.inputTokens === null ? t("fleet.spendNa") : formatTokens(reportedUsage.inputTokens) })}
+              </span>
+              <span className="ctx-token-out" data-tokens={reportedUsage.outputTokens ?? ""}>
+                {t("fleet.tokensOut", { tokens: reportedUsage.outputTokens === null ? t("fleet.spendNa") : formatTokens(reportedUsage.outputTokens) })}
+              </span>
+            </div>
+          </div>
+        )}
+        {!fleetOn && totalTokens > 0 && (
           <div className="ctx-section">
             <div className="ctx-section-title">Tokens <span className="ctx-cost">{formatCost(totalCost)}</span></div>
             {sparkData.length >= 2 && (
@@ -662,22 +696,22 @@ export function ContextPanel({ session }: ContextPanelProps) {
                 <span className={`ctx-pin-scope-badge ${pin.session_id === null ? "ctx-pin-scope-project" : "ctx-pin-scope-session"}`}>
                   {pin.session_id === null ? "project" : "session"}
                 </span>
-                <button className="ctx-memory-delete" onClick={() => removePin(pin.id)} title="Unpin">&times;</button>
+                <CloseButton className="ctx-memory-delete" label="Unpin" onClick={() => removePin(pin.id)} />
               </div>
             ))}
             {showPinAdd && (
               <div className="ctx-memory-add-form">
                 <div className="ctx-pin-form-row">
-                  <select className="ctx-pin-select" value={pinKind} onChange={(e) => setPinKind(e.target.value)}>
+                  <NativeSelect size="sm" className="ctx-pin-select" aria-label="Pin kind" value={pinKind} onChange={(e) => setPinKind(e.target.value)}>
                     <option value="file">File</option>
                     <option value="directory">Directory</option>
                     <option value="memory">Memory</option>
                     <option value="text">Text</option>
-                  </select>
-                  <select className="ctx-pin-scope-select" value={pinScope} onChange={(e) => setPinScope(e.target.value as "project" | "session")}>
+                  </NativeSelect>
+                  <NativeSelect size="sm" className="ctx-pin-scope-select" aria-label="Pin scope" value={pinScope} onChange={(e) => setPinScope(e.target.value as "project" | "session")}>
                     <option value="project">Project</option>
                     <option value="session">Session only</option>
-                  </select>
+                  </NativeSelect>
                 </div>
                 {pinKind === "file" ? (
                   <div className="ctx-pin-file-row">
@@ -711,13 +745,13 @@ export function ContextPanel({ session }: ContextPanelProps) {
         {/* Response Time */}
         {metrics.latency_p50_ms != null && (
           <div className="ctx-section">
-            <div className="ctx-section-title">Response Time</div>
+            <div className="ctx-section-title">{t("ctxPanel.responseTime")}</div>
             <div className="ctx-kv">
-              <span>Typical</span>
+              <span>{t("ctxPanel.typical")}</span>
               <span className="mono">
                 {(metrics.latency_p50_ms / 1000).toFixed(1)}s
-                {metrics.latency_p50_ms > 3000 && <span className="text-yellow"> slow</span>}
-                {metrics.latency_p50_ms > 8000 && <span className="text-red"> very slow</span>}
+                {metrics.latency_p50_ms > 3000 && metrics.latency_p50_ms <= 8000 && <span className="text-yellow"> {t("ctxPanel.slow")}</span>}
+                {metrics.latency_p50_ms > 8000 && <span className="text-red"> {t("ctxPanel.verySlow")}</span>}
               </span>
             </div>
             <div className="ctx-perf-bar">
@@ -729,10 +763,10 @@ export function ContextPanel({ session }: ContextPanelProps) {
         {/* Health — hide when nothing to report */}
         {metrics.output_lines > 0 && (
           <div className="ctx-section">
-            <div className="ctx-section-title">Health</div>
+            <div className="ctx-section-title">{t("ctxPanel.health")}</div>
             <div className="ctx-kv">
-              <span>Output</span>
-              <span className="mono">{metrics.output_lines.toLocaleString()} lines</span>
+              <span>{t("ctxPanel.output")}</span>
+              <span className="mono">{t("ctxPanel.lines", { count: metrics.output_lines.toLocaleString() })}</span>
             </div>
           </div>
         )}
@@ -787,7 +821,7 @@ export function ContextPanel({ session }: ContextPanelProps) {
                   <span className={`ctx-pin-scope-badge ${m.scope === "project" ? "ctx-pin-scope-project" : "ctx-pin-scope-global"}`}>
                     {m.scope === "project" ? "project" : "global"}
                   </span>
-                  <button className="ctx-memory-delete" onClick={() => deleteMemoryFact(m.key)} title="Delete">&times;</button>
+                  <CloseButton className="ctx-memory-delete" label="Delete" onClick={() => deleteMemoryFact(m.key)} />
                 </div>
               ))}
               {showMemoryAdd && (
@@ -795,10 +829,10 @@ export function ContextPanel({ session }: ContextPanelProps) {
                   <input className="ctx-memory-input" placeholder="Key (e.g. db_host)" value={memoryKeyInput} onChange={(e) => setMemoryKeyInput(e.target.value)} />
                   <input className="ctx-memory-input" placeholder="Value" value={memoryValueInput} onChange={(e) => setMemoryValueInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addMemoryFact(); }} />
                   <div className="ctx-memory-add-actions">
-                    <select className="ctx-pin-scope-select" value={memoryScopeInput} onChange={(e) => setMemoryScopeInput(e.target.value as "project" | "global")}>
+                    <NativeSelect size="sm" className="ctx-pin-scope-select" aria-label="Memory scope" value={memoryScopeInput} onChange={(e) => setMemoryScopeInput(e.target.value as "project" | "global")}>
                       <option value="project">Project</option>
                       <option value="global">Global</option>
-                    </select>
+                    </NativeSelect>
                     <button className="ctx-memory-save-btn" onClick={addMemoryFact}>Save</button>
                     <button className="ctx-memory-cancel-btn" onClick={() => setShowMemoryAdd(false)}>Cancel</button>
                   </div>
@@ -838,25 +872,26 @@ export function ContextPanel({ session }: ContextPanelProps) {
           <button
             className="ctx-advanced-toggle"
             onClick={() => setShowAdvanced(!showAdvanced)}
-            title="Toggle advanced diagnostics"
+            title={t("ctxPanel.toggleAdvanced")}
+            aria-expanded={showAdvanced}
           >
-            {showAdvanced ? "\u25BE" : "\u25B8"} Advanced
+            {showAdvanced ? "\u25BE" : "\u25B8"} {t("ctxPanel.advanced")}
           </button>
           {showAdvanced && (
             <div className="ctx-advanced-body">
               <div className="ctx-kv">
-                <span>Context version</span>
+                <span>{t("ctxPanel.contextVersion")}</span>
                 <span className="mono">v{contextManager.currentVersion}</span>
               </div>
               <div className="ctx-kv">
-                <span>Injected version</span>
+                <span>{t("ctxPanel.injectedVersion")}</span>
                 <span className="mono">
                   {contextManager.injectedVersion > 0 ? `v${contextManager.injectedVersion}` : "—"}
                 </span>
               </div>
               {metrics.latency_p95_ms != null && (
                 <div className="ctx-kv">
-                  <span>Worst 5% response</span>
+                  <span>{t("ctxPanel.worstResponse")}</span>
                   <span className="mono">{(metrics.latency_p95_ms / 1000).toFixed(1)}s</span>
                 </div>
               )}

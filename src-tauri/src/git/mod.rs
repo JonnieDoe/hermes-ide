@@ -1,4 +1,12 @@
+pub mod cli;
+pub mod cow_clone;
+pub mod disk_guard;
+pub mod fast_setup;
+pub mod hygiene;
+pub mod hygiene_app;
 pub mod journal;
+pub mod recipe;
+pub mod safety;
 pub mod watcher;
 pub mod worktree;
 
@@ -11,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::db::Database;
 use crate::AppState;
@@ -22,64 +30,18 @@ use crate::AppState;
 /// exclusion fails or a repo has an unusual number of real changes.
 const VCS_STATUS_FILE_CAP: usize = 10_000;
 
-/// Returns the custom worktree base path if configured in settings.
-pub fn get_custom_worktree_base(db: &Database) -> Option<std::path::PathBuf> {
-    db.get_setting("worktree_base_path")
-        .ok()
-        .flatten()
-        .filter(|s| !s.trim().is_empty())
-        .map(std::path::PathBuf::from)
-}
-
-/// Resolves the worktree base directory path using the complete hierarchy:
-/// 1. Session-level setting (`session_id` -> `worktree_base_path`)
-/// 2. Project-level setting (`project_id` -> `worktree_base_path`)
-/// 3. Global custom base setting (`settings` -> `worktree_base_path`)
-/// 4. Default (`None`)
-pub fn resolve_worktree_base(
-    db: &Database,
-    session_id: Option<&str>,
-    project_id: Option<&str>,
-) -> Option<std::path::PathBuf> {
-    // 1. Session tier
-    if let Some(sid) = session_id {
-        if let Ok(Some(path)) = db.get_session_worktree_base_path(sid) {
-            if !path.trim().is_empty() {
-                return Some(std::path::PathBuf::from(path));
-            }
-        }
-    }
-
-    // 2. Project tier
-    if let Some(pid) = project_id {
-        if let Ok(Some(project)) = db.get_project(pid) {
-            if let Some(ref path) = project.worktree_base_path {
-                if !path.trim().is_empty() {
-                    return Some(std::path::PathBuf::from(path));
-                }
-            }
-        }
-    }
-
-    // 3. Global custom base tier
-    get_custom_worktree_base(db)
-}
-
 /// Validates that a path is inside the Hermes worktrees directory
-/// (`hermes-worktrees/` or a custom configured base). Returns the
-/// canonical path if valid, or an error if the path is outside the
-/// expected directory (prevents path traversal attacks).
-fn validate_worktree_path(
-    path: &str,
-    custom_base: Option<&std::path::Path>,
-) -> Result<std::path::PathBuf, String> {
+/// (`hermes-worktrees/`). Returns the canonical path if valid, or an error
+/// if the path is outside the expected worktree directory (prevents path
+/// traversal attacks).
+fn validate_worktree_path(path: &str) -> Result<std::path::PathBuf, String> {
     let p = std::path::Path::new(path);
 
     // First check the raw path string before canonicalizing
     // (canonicalize follows symlinks, which we want for the final check)
-    if !worktree::is_hermes_worktree_path(path, custom_base) {
+    if !worktree::is_hermes_worktree_path(path) {
         return Err(format!(
-            "Refusing to operate on '{}': not inside a valid worktree directory",
+            "Refusing to operate on '{}': not inside a hermes-worktrees/ directory",
             path
         ));
     }
@@ -90,9 +52,9 @@ fn validate_worktree_path(
             .canonicalize()
             .map_err(|e| format!("Failed to resolve path '{}': {}", path, e))?;
         let canonical_str = canonical.to_string_lossy();
-        if !worktree::is_hermes_worktree_path(&canonical_str, custom_base) {
+        if !worktree::is_hermes_worktree_path(&canonical_str) {
             return Err(format!(
-                "Refusing to operate on '{}': canonical path '{}' is not inside a valid worktree directory",
+                "Refusing to operate on '{}': canonical path '{}' is not inside a hermes-worktrees/ directory",
                 path, canonical_str
             ));
         }
@@ -710,6 +672,16 @@ pub fn git_stage(
     })
 }
 
+/// Every path to unstage stays inside the project (`.` means everything).
+fn check_unstage_paths(project_path: &str, paths: &[String]) -> Result<(), String> {
+    for path in paths {
+        if path != "." {
+            safe_join(project_path, path)?;
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn git_unstage(
     state: State<'_, AppState>,
@@ -723,24 +695,11 @@ pub fn git_unstage(
         .map_err(|e| format!("DB lock error: {}", e))?;
     let project_path = resolve_worktree_path(&db, &session_id, &project_id)?;
     drop(db);
-    let repo = Repository::open(&project_path).map_err(|e| e.to_string())?;
 
-    // `reset_default` resets index entries to match the given commit
-    // (libgit2's equivalent of `git reset` for paths).  The target
-    // argument must be peelable to a commit — passing the HEAD's tree
-    // (as we did pre-1.1.15) tripped libgit2's peel-to-commit check
-    // with: "git_object … can not be successfully peeled into a commit".
-    // Use the HEAD commit itself; trees are not commitish.
-    let head_commit = repo.head().and_then(|h| h.peel_to_commit()).ok();
-
-    if paths.len() == 1 && paths[0] == "." {
-        let all_paths: Vec<String> = vec!["*".to_string()];
-        repo.reset_default(head_commit.as_ref().map(|c| c.as_object()), &all_paths)
-            .map_err(|e| e.to_string())?;
-    } else {
-        repo.reset_default(head_commit.as_ref().map(|c| c.as_object()), &paths)
-            .map_err(|e| e.to_string())?;
-    }
+    // `git reset -- <paths>` with literal pathspecs: `pages/[id].tsx` is
+    // that file only (libgit2's reset_default treats it as a pattern).
+    check_unstage_paths(&project_path, &paths)?;
+    safety::unstage_paths(Path::new(&project_path), &paths)?;
 
     Ok(GitOperationResult {
         success: true,
@@ -764,22 +723,41 @@ pub fn git_discard_changes(
     drop(db);
     let repo = Repository::open(&project_path).map_err(|e| e.to_string())?;
 
-    let mut checkout_builder = git2::build::CheckoutBuilder::new();
-    checkout_builder.force();
-
     for path in &paths {
         safe_join(&project_path, path)?;
-        checkout_builder.path(path.as_str());
     }
-
-    repo.checkout_head(Some(&mut checkout_builder))
-        .map_err(|e| format!("Failed to discard changes: {}", e))?;
+    // Literal paths: discarding `pages/[id].tsx` never touches pages/i.tsx.
+    safety::discard_paths(&repo, &paths)?;
 
     Ok(GitOperationResult {
         success: true,
         message: format!("Discarded changes in {} file(s)", paths.len()),
         error: None,
     })
+}
+
+/// 3C: the author override when both name and email are given, otherwise
+/// None (the repository's own identity, which must then exist).
+fn commit_author<'a>(
+    repo: &Repository,
+    author_name: &'a Option<String>,
+    author_email: &'a Option<String>,
+) -> Result<Option<(&'a str, &'a str)>, String> {
+    match (author_name, author_email) {
+        (Some(name), Some(email)) if !name.is_empty() && !email.is_empty() => {
+            Ok(Some((name.as_str(), email.as_str())))
+        }
+        _ => {
+            repo.signature().map_err(|e| {
+                format!(
+                    "Git user not configured. Run: git config --global user.name \"...\"; \
+                     git config --global user.email \"...\"\nError: {}",
+                    e
+                )
+            })?;
+            Ok(None)
+        }
+    }
 }
 
 #[tauri::command]
@@ -798,31 +776,12 @@ pub fn git_commit(
     let project_path = resolve_worktree_path(&db, &session_id, &project_id)?;
     drop(db);
     let repo = Repository::open(&project_path).map_err(|e| e.to_string())?;
+    let author = commit_author(&repo, &author_name, &author_email)?;
+    drop(repo);
 
-    // 3C: Use author overrides if provided, otherwise fall back to repo config
-    let sig = match (&author_name, &author_email) {
-        (Some(name), Some(email)) if !name.is_empty() && !email.is_empty() => {
-            git2::Signature::now(name, email).map_err(|e| e.to_string())?
-        }
-        _ => repo.signature().map_err(|e| {
-            format!(
-                "Git user not configured. Run: git config --global user.name \"...\"; \
-                 git config --global user.email \"...\"\nError: {}",
-                e
-            )
-        })?,
-    };
-
-    let mut index = repo.index().map_err(|e| e.to_string())?;
-    let tree_oid = index.write_tree().map_err(|e| e.to_string())?;
-    let tree = repo.find_tree(tree_oid).map_err(|e| e.to_string())?;
-
-    let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
-
-    let parents: Vec<&git2::Commit> = parent.iter().collect();
-
-    repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &parents)
-        .map_err(|e| e.to_string())?;
+    // `git commit` itself: the repository's hooks run and its signing
+    // settings apply. A hook that refuses comes back as HOOK_REFUSED.
+    safety::commit_staged(Path::new(&project_path), &message, author)?;
 
     Ok(GitOperationResult {
         success: true,
@@ -939,16 +898,14 @@ pub async fn git_pull(
             });
         }
 
-        if merge_analysis.is_fast_forward() {
-            let refname = format!("refs/heads/{}", branch_name);
-            let mut reference = repo.find_reference(&refname).map_err(|e| e.to_string())?;
-            reference
-                .set_target(fetch_commit.id(), "fast-forward pull")
-                .map_err(|e| e.to_string())?;
-            repo.set_head(&refname).map_err(|e| e.to_string())?;
-            repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
-                .map_err(|e| e.to_string())?;
+        let target = fetch_commit.id().to_string();
+        let dir = Path::new(&project_path);
 
+        // Both paths go through the git CLI, which refuses rather than
+        // overwrite an uncommitted edit the incoming commits also change
+        // (a forced libgit2 checkout used to reset such files silently).
+        if merge_analysis.is_fast_forward() {
+            safety::fast_forward(dir, &target)?;
             return Ok(GitOperationResult {
                 success: true,
                 message: "Fast-forward pull complete".to_string(),
@@ -958,62 +915,20 @@ pub async fn git_pull(
 
         // Perform actual merge
         if merge_analysis.is_normal() {
-            let fetch_commit_obj = repo
-                .find_commit(fetch_commit.id())
-                .map_err(|e| e.to_string())?;
-
-            // Merge the fetched commit
-            let mut merge_opts = git2::MergeOptions::new();
-            let mut checkout_builder = git2::build::CheckoutBuilder::new();
-            checkout_builder.allow_conflicts(true);
-
-            repo.merge(
-                &[&fetch_commit],
-                Some(&mut merge_opts),
-                Some(&mut checkout_builder),
-            )
-            .map_err(|e| format!("Merge failed: {}", e))?;
-
-            // Check for conflicts
-            let index = repo.index().map_err(|e| e.to_string())?;
-            if index.has_conflicts() {
-                return Ok(GitOperationResult {
+            let msg = format!("Merge branch '{}' of {}", branch_name, remote_name);
+            return match safety::merge(dir, &target, &msg)? {
+                safety::MergeRun::Conflicts => Ok(GitOperationResult {
                     success: false,
                     message: "Pull complete but merge has conflicts. Resolve them to finish the merge."
                         .to_string(),
                     error: Some("Merge conflicts detected".to_string()),
-                });
-            }
-
-            // Auto-commit if no conflicts
-            let sig = repo.signature().map_err(|e| e.to_string())?;
-            let mut index = repo.index().map_err(|e| e.to_string())?;
-            let tree_oid = index.write_tree().map_err(|e| e.to_string())?;
-            let tree = repo.find_tree(tree_oid).map_err(|e| e.to_string())?;
-
-            let head_commit = repo
-                .head()
-                .and_then(|h| h.peel_to_commit())
-                .map_err(|e| e.to_string())?;
-
-            let msg = format!("Merge branch '{}' of {}", branch_name, remote_name);
-            repo.commit(
-                Some("HEAD"),
-                &sig,
-                &sig,
-                &msg,
-                &tree,
-                &[&head_commit, &fetch_commit_obj],
-            )
-            .map_err(|e| format!("Merge commit failed: {}", e))?;
-
-            repo.cleanup_state().map_err(|e| e.to_string())?;
-
-            return Ok(GitOperationResult {
-                success: true,
-                message: "Pull with merge complete".to_string(),
-                error: None,
-            });
+                }),
+                safety::MergeRun::Merged => Ok(GitOperationResult {
+                    success: true,
+                    message: "Pull with merge complete".to_string(),
+                    error: None,
+                }),
+            };
         }
 
         Err("Pull failed: unexpected merge analysis result".to_string())
@@ -1573,6 +1488,10 @@ pub fn git_create_branch(
         .and_then(|h| h.peel_to_commit())
         .map_err(|e| format!("Cannot resolve HEAD: {}", e))?;
 
+    // Not even a case-only variant of an existing branch (see BranchClash).
+    if let Some(clash) = worktree::local_branch_clash(&repo, &name) {
+        return Err(worktree::branch_clash_error(&name, &clash));
+    }
     repo.branch(&name, &head_commit, false)
         .map_err(|e| format!("Failed to create branch '{}': {}", name, e))?;
 
@@ -1667,6 +1586,9 @@ pub async fn git_checkout_branch(
         if let Ok(remote_ref) = repo.find_reference(&remote_refname) {
             let commit = remote_ref.peel_to_commit().map_err(|e| e.to_string())?;
             let local_name = name.split_once('/').map_or(name.as_str(), |(_, rest)| rest);
+            if let Some(clash) = worktree::local_branch_clash(&repo, local_name) {
+                return Err(worktree::branch_clash_error(local_name, &clash));
+            }
 
             let mut local_branch = repo
                 .branch(local_name, &commit, false)
@@ -1735,10 +1657,16 @@ pub fn git_delete_branch(
             .delete()
             .map_err(|e| format!("Failed to force delete '{}': {}", name, e))?;
     } else {
+        // Like `git branch -d`: a branch whose commits no other branch has
+        // is kept, and the person is asked (BRANCH_UNMERGED).
+        if let Some(unmerged) = safety::unmerged_commits(&repo, &name)? {
+            return Err(unmerged.error());
+        }
         branch.delete().map_err(|e| {
             format!(
-                "Failed to delete '{}': {}. Use force delete if unmerged.",
-                name, e
+                "Could not delete {}: {}",
+                name,
+                worktree::plain_git2_error(&e)
             )
         })?;
     }
@@ -2643,17 +2571,11 @@ pub fn git_abort_merge(
     if repo.state() != git2::RepositoryState::Merge {
         return Err("No merge in progress".to_string());
     }
+    drop(repo);
 
-    // Reset to HEAD
-    let head = repo
-        .head()
-        .and_then(|h| h.peel_to_commit())
-        .map_err(|e| format!("Cannot resolve HEAD: {}", e))?;
-    repo.reset(head.as_object(), git2::ResetType::Hard, None)
-        .map_err(|e| format!("Reset failed: {}", e))?;
-
-    repo.cleanup_state()
-        .map_err(|e| format!("Cleanup failed: {}", e))?;
+    // `git merge --abort`, not a hard reset: the files the merge changed go
+    // back, every other uncommitted edit stays. git's refusal is shown.
+    safety::abort_merge(Path::new(&project_path))?;
 
     Ok(GitOperationResult {
         success: true,
@@ -2895,6 +2817,7 @@ pub fn search_project(
 // ─── Worktree IPC Commands ──────────────────────────────────────────
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command: one argument per IPC field
 pub fn git_create_worktree(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -2903,15 +2826,14 @@ pub fn git_create_worktree(
     branch_name: String,
     create_branch: bool,
     from_remote: Option<String>,
-    worktree_base_path: Option<String>, // Session override
+    // Set by the frontend while the "diskGuard" feature flag is on.
+    enforce_disk_guard: Option<bool>,
+    base_branch: Option<String>,
 ) -> Result<worktree::WorktreeCreateResult, String> {
     // Get the app data directory for storing worktrees outside the project
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let app_data_dir = crate::instance::app_data_dir(&app)?;
 
-    // 1. Get project path and settings from DB
+    // 1. Get project path from DB
     let db = state
         .db
         .lock()
@@ -2921,33 +2843,32 @@ pub fn git_create_worktree(
         .map_err(|e| format!("Failed to look up project: {}", e))?
         .ok_or_else(|| format!("Project '{}' not found", project_id))?;
     let root_path = project.path.clone();
-
-    let custom_base = if let Some(ref path) = worktree_base_path {
-        if !path.trim().is_empty() {
-            Some(std::path::PathBuf::from(path))
-        } else {
-            resolve_worktree_base(&db, Some(&session_id), Some(&project_id))
-        }
-    } else {
-        resolve_worktree_base(&db, Some(&session_id), Some(&project_id))
-    };
     drop(db);
 
-    if let Some(ref base) = custom_base {
-        worktree::validate_custom_worktree_base(
-            base.to_str().unwrap_or_default(),
-            Some(&root_path),
-        )?;
+    // Disk guard: below 10 GB free, create nothing (no folder, branch,
+    // journal entry or record) and raise an inbox item. Reusing a worktree
+    // that already exists (this session's, or the branch checked out
+    // elsewhere) needs no space, so that is never refused.
+    if enforce_disk_guard.unwrap_or(false) {
+        let reuses = worktree::would_reuse_existing_worktree(
+            &app_data_dir,
+            &root_path,
+            &session_id,
+            &branch_name,
+            from_remote.as_deref(),
+        );
+        if !reuses {
+            if let Err(low) = disk_guard::check_room_for_worktree(&app_data_dir) {
+                log::warn!("[disk-guard] refused a worktree: {}", low.message());
+                let _ = app.emit(disk_guard::INBOX_ITEM_EVENT, low.inbox_item(&project.name));
+                return Err(low.message());
+            }
+        }
     }
 
     // Journal: log the CREATE operation before performing it
-    let intended_path = worktree::worktree_path_for_session(
-        &app_data_dir,
-        &root_path,
-        &session_id,
-        &branch_name,
-        custom_base.as_deref(),
-    );
+    let intended_path =
+        worktree::worktree_path_for_session(&app_data_dir, &root_path, &session_id, &branch_name);
     let _ = journal::log_operation(
         &app_data_dir,
         &root_path,
@@ -2956,19 +2877,27 @@ pub fn git_create_worktree(
         &project_id,
         &branch_name,
         &intended_path.to_string_lossy(),
-        custom_base.as_deref(),
     );
 
-    // 2. Create the worktree
-    let result = worktree::create_worktree(
+    let cut_from = cut_from_branch(
+        &root_path,
+        create_branch,
+        from_remote.as_deref(),
+        base_branch.as_deref(),
+    );
+
+    // 2. Create the worktree. A branch that is checked out elsewhere comes
+    //    back as a BRANCH_IN_USE error, enriched with who holds it.
+    let result = worktree::create_worktree_from(
         &app_data_dir,
         &root_path,
         &session_id,
         &branch_name,
         create_branch,
         from_remote.as_deref(),
-        custom_base.as_deref(),
-    )?;
+        base_branch.as_deref(),
+    )
+    .map_err(|e| describe_branch_in_use(&state.db, &root_path, e))?;
 
     // 3. Insert into session_worktrees table — if this fails, roll back the worktree
     let id = uuid::Uuid::new_v4().to_string();
@@ -2987,14 +2916,21 @@ pub fn git_create_worktree(
         // Rollback: remove the worktree we just created
         log::warn!("DB insert failed for worktree, rolling back: {}", db_err);
         if !result.is_main_worktree {
-            let _ = worktree::remove_worktree(
-                &root_path,
-                &session_id,
-                &result.worktree_path,
-                custom_base.as_deref(),
-            );
+            let _ = worktree::remove_worktree(&root_path, &session_id, &result.worktree_path);
         }
         return Err(format!("Failed to record worktree: {}", db_err));
+    }
+    if let Some(base) = base_to_record(cut_from.as_deref(), &result.branch_name) {
+        if let Err(e) = worktree::record_base_branch(&root_path, &result.branch_name, base) {
+            log::warn!("Could not keep the base branch in the repository config: {e}");
+        }
+        if let Err(e) = db.set_worktree_base_branch(&id, base) {
+            log::warn!(
+                "Could not record the base branch of {}: {}",
+                result.branch_name,
+                e
+            );
+        }
     }
     drop(db);
 
@@ -3005,7 +2941,6 @@ pub fn git_create_worktree(
         "CREATE",
         &session_id,
         &project_id,
-        custom_base.as_deref(),
     );
 
     // 4. Emit event for frontend
@@ -3013,6 +2948,469 @@ pub fn git_create_worktree(
 
     // 5. Return result
     Ok(result)
+}
+
+/// The branch a new branch is cut from: the launcher's base, else what
+/// the project folder has checked out right now. Land lands into it.
+/// None when no branch is made here (an existing or remote branch).
+fn cut_from_branch(
+    root_path: &str,
+    create_branch: bool,
+    from_remote: Option<&str>,
+    base_branch: Option<&str>,
+) -> Option<String> {
+    if !(create_branch && from_remote.is_none()) {
+        return None;
+    }
+    base_branch.map(str::to_string).or_else(|| {
+        Repository::open(root_path).ok().and_then(|r| {
+            r.head()
+                .ok()
+                .filter(|h| h.is_branch())
+                .and_then(|h| h.shorthand().map(str::to_string))
+        })
+    })
+}
+
+/// The base branch worth recording for `branch`: never the branch itself.
+fn base_to_record<'a>(cut_from: Option<&'a str>, branch: &str) -> Option<&'a str> {
+    cut_from.filter(|b| *b != branch)
+}
+
+/// Add who holds the branch to a `BRANCH_IN_USE:` error: the session whose
+/// worktree has it (if Hermes made that worktree) and whether it is the
+/// project folder itself. Any other error passes through unchanged.
+fn describe_branch_in_use(db: &std::sync::Mutex<Database>, root_path: &str, err: String) -> String {
+    let Some((branch, path)) = worktree::parse_branch_in_use_error(&err) else {
+        return err;
+    };
+    let session_id = db.lock().ok().and_then(|db| {
+        db.get_all_session_worktrees()
+            .ok()?
+            .into_iter()
+            .find(|row| worktree::same_dir(&row.worktree_path, &path))
+            .map(|row| row.session_id)
+    });
+    // A checkout in this Hermes' own worktree folder that no session uses
+    // is a leftover of ours (a launch that failed half-way), not "a
+    // checkout outside Hermes".
+    let leftover = session_id.is_none()
+        && !worktree::same_dir(&path, root_path)
+        && worktree::is_instance_worktree_path(&path);
+    format!(
+        "{}{}",
+        worktree::BRANCH_IN_USE_PREFIX,
+        serde_json::json!({
+            "branch": branch,
+            "path": path,
+            "sessionId": session_id,
+            "projectFolder": worktree::same_dir(&path, root_path),
+            "leftover": leftover,
+        })
+    )
+}
+
+/// Link a session to the checkout that already has `branch_name` checked
+/// out. Only called after the user explicitly chose "reuse" in the
+/// branch-in-use dialog; creating a worktree never does this on its own.
+#[tauri::command]
+pub fn git_attach_worktree(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    project_id: String,
+    branch_name: String,
+) -> Result<worktree::WorktreeCreateResult, String> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|e| format!("DB lock error: {}", e))?;
+    let project = db
+        .get_project(&project_id)
+        .map_err(|e| format!("Failed to look up project: {}", e))?
+        .ok_or_else(|| format!("Project '{}' not found", project_id))?;
+    let mut result = worktree::attach_existing_worktree(&project.path, &branch_name)?;
+    // Record the checkout exactly as its owner did, so every later
+    // comparison (ref-count on close, sharing checks) sees one checkout.
+    if let Some(existing) = known_spelling_of_checkout(&db, &project.path, &result.worktree_path)? {
+        result.worktree_path = existing;
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    db.insert_session_worktree(
+        &id,
+        &session_id,
+        &project_id,
+        &result.worktree_path,
+        Some(&result.branch_name),
+        result.is_main_worktree,
+    )
+    .map_err(|e| format!("Failed to record worktree: {}", e))?;
+    drop(db);
+    let _ = app.emit(&format!("worktree-created-{}", project_id), &result);
+    Ok(result)
+}
+
+/// The spelling Hermes already uses for the checkout at `path`: the path an
+/// existing session row recorded for it, or the project folder's own path.
+/// `None` when Hermes has never recorded that directory.
+fn known_spelling_of_checkout(
+    db: &Database,
+    project_path: &str,
+    path: &str,
+) -> Result<Option<String>, String> {
+    let rows = db
+        .get_all_session_worktrees()
+        .map_err(|e| format!("Failed to list worktrees: {}", e))?;
+    if let Some(row) = rows
+        .into_iter()
+        .find(|row| worktree::same_dir(&row.worktree_path, path))
+    {
+        return Ok(Some(row.worktree_path));
+    }
+    Ok(worktree::same_dir(project_path, path).then(|| project_path.to_string()))
+}
+
+/// Whether another session also works in the checkout this session row
+/// points at. Closing (or committing from) such a session must leave that
+/// checkout and its changes alone: they belong to the other session too.
+fn checkout_is_shared(db: &Database, wt: &crate::db::SessionWorktreeRow) -> bool {
+    // On a lookup error assume shared: skipping a delete is recoverable,
+    // deleting someone else's work is not.
+    db.count_sessions_for_worktree_path(&wt.worktree_path)
+        .map(|n| n > 1)
+        .unwrap_or(true)
+}
+
+/// A session's worktree link, plus whether another session shares that
+/// checkout (`sharedWithOtherSessions`) and whether the session owns it
+/// alone (`ownedBySession`: a worktree Hermes made for it, shared with no
+/// one). The close dialog only asks about changes in a checkout the session
+/// owns alone; the project folder and a checkout made outside Hermes are
+/// never asked about, never cleaned up.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionWorktreeInfo {
+    #[serde(flatten)]
+    pub row: crate::db::SessionWorktreeRow,
+    pub shared_with_other_sessions: bool,
+    pub owned_by_session: bool,
+    /// Ports and cloned dependencies (fast worktrees), once prepared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup: Option<fast_setup::WorktreeSetup>,
+}
+
+impl SessionWorktreeInfo {
+    fn describe(db: &Database, row: crate::db::SessionWorktreeRow) -> Self {
+        let shared = !row.is_main_worktree && checkout_is_shared(db, &row);
+        let owned = worktree::is_owned_checkout(row.is_main_worktree, &row.worktree_path);
+        SessionWorktreeInfo {
+            shared_with_other_sessions: shared,
+            owned_by_session: owned && !shared,
+            setup: db
+                .get_worktree_setup(&row.session_id, &row.project_id)
+                .ok()
+                .and_then(|(base, report)| {
+                    fast_setup::WorktreeSetup::from_record(base, report.as_deref())
+                }),
+            row,
+        }
+    }
+}
+
+/// Drop a session's link to a worktree without touching the disk. Undoes a
+/// `git_attach_worktree` when session creation is cancelled: the checkout
+/// belongs to someone else, so it must never be removed.
+#[tauri::command]
+pub fn git_detach_worktree(
+    state: State<'_, AppState>,
+    session_id: String,
+    project_id: String,
+) -> Result<(), String> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|e| format!("DB lock error: {}", e))?;
+    if let Some(row) = db
+        .get_worktree_by_session_and_project(&session_id, &project_id)
+        .map_err(|e| format!("Failed to look up worktree: {}", e))?
+    {
+        db.delete_session_worktree(&row.id)?;
+    }
+    Ok(())
+}
+
+/// Commit a session worktree's uncommitted changes, for the close dialog:
+/// `target = "session"` commits on the session's branch, `"archive"` saves
+/// them on a new `hermes-archive/<branch>` branch and leaves the session
+/// branch alone. Never touches the stash. Refuses sessions that work
+/// directly in the project folder (closing those deletes nothing).
+#[tauri::command]
+pub fn git_commit_worktree(
+    state: State<'_, AppState>,
+    session_id: String,
+    project_id: String,
+    message: String,
+    target: worktree::CommitTarget,
+    // The branch the close dialog named: the commit lands there or nowhere.
+    expected_branch: Option<String>,
+) -> Result<worktree::CommitOutcome, String> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|e| format!("DB lock error: {}", e))?;
+    let wt = db
+        .get_worktree_by_session_and_project(&session_id, &project_id)
+        .map_err(|e| format!("Failed to look up worktree: {}", e))?
+        .ok_or_else(|| "This session has no worktree of its own".to_string())?;
+    let shared = checkout_is_shared(&db, &wt);
+    drop(db);
+    if wt.is_main_worktree {
+        return Err("This session works in the project folder; nothing to commit on close".into());
+    }
+    if !worktree::is_owned_checkout(false, &wt.worktree_path) {
+        return Err(format!(
+            "This session works in a checkout Hermes did not create ({}); its changes stay there",
+            wt.worktree_path
+        ));
+    }
+    if shared {
+        return Err(
+            "Another session works in this checkout; its changes are left for that session".into(),
+        );
+    }
+    worktree::commit_worktree_changes_on(
+        &wt.worktree_path,
+        &message,
+        target,
+        &|p| is_dirty_close_noise_file(p),
+        expected_branch.as_deref(),
+    )
+}
+
+/// A worktree this Hermes made for `project_id` that no session uses any
+/// more: what the close flow saves from after it stopped the session (the
+/// session's link went first, so the close left the folder). Returns the
+/// project folder.
+fn unused_instance_worktree(
+    db: &std::sync::Mutex<Database>,
+    project_id: &str,
+    worktree_path: &str,
+) -> Result<String, String> {
+    let db = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+    let project = db
+        .get_project(project_id)
+        .map_err(|e| format!("Failed to look up project: {}", e))?
+        .ok_or_else(|| format!("Project '{}' not found", project_id))?;
+    let used = db
+        .get_all_session_worktrees()
+        .map_err(|e| format!("Failed to list worktrees: {}", e))?
+        .into_iter()
+        .any(|row| worktree::same_dir(&row.worktree_path, worktree_path));
+    drop(db);
+    if used {
+        return Err("A session still works in that checkout".into());
+    }
+    if !worktree::is_instance_worktree_path(worktree_path) {
+        return Err("That checkout was not made by this Hermes".into());
+    }
+    let same_repo = Repository::open(worktree_path)
+        .ok()
+        .zip(Repository::open(&project.path).ok())
+        .map(|(w, p)| {
+            std::fs::canonicalize(w.commondir()).ok() == std::fs::canonicalize(p.commondir()).ok()
+        })
+        .unwrap_or(false);
+    if !same_repo {
+        return Err("That checkout does not belong to this project".into());
+    }
+    Ok(project.path)
+}
+
+/// Close flow, after the session was stopped: commit the uncommitted work
+/// of its (now unlinked) worktree on `expected_branch` ("session") or on a
+/// new hermes-archive/ branch ("archive"). Nothing to commit is not an
+/// error here: the outcome is then None.
+#[tauri::command]
+pub fn git_commit_kept_worktree(
+    state: State<'_, AppState>,
+    project_id: String,
+    worktree_path: String,
+    message: String,
+    target: worktree::CommitTarget,
+    expected_branch: Option<String>,
+) -> Result<Option<worktree::CommitOutcome>, String> {
+    commit_kept_worktree(
+        &state.db,
+        &project_id,
+        &worktree_path,
+        &message,
+        target,
+        expected_branch.as_deref(),
+    )
+}
+
+fn commit_kept_worktree(
+    db: &std::sync::Mutex<Database>,
+    project_id: &str,
+    worktree_path: &str,
+    message: &str,
+    target: worktree::CommitTarget,
+    expected_branch: Option<&str>,
+) -> Result<Option<worktree::CommitOutcome>, String> {
+    unused_instance_worktree(db, project_id, worktree_path)?;
+    match worktree::commit_worktree_changes_on(
+        worktree_path,
+        message,
+        target,
+        &|p| is_dirty_close_noise_file(p),
+        expected_branch,
+    ) {
+        Ok(out) => Ok(Some(out)),
+        Err(e) if e == "There are no changes to commit" => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Close flow, after the session was stopped: keep a detached HEAD's
+/// commits (and, with `message`, the uncommitted changes too) on a new
+/// `hermes-archive/<branch>-detached` branch. Returns the branch.
+#[tauri::command]
+pub fn git_save_kept_detached_head(
+    state: State<'_, AppState>,
+    project_id: String,
+    worktree_path: String,
+    recorded_branch: Option<String>,
+    message: Option<String>,
+) -> Result<String, String> {
+    save_kept_detached_head(
+        &state.db,
+        &project_id,
+        &worktree_path,
+        recorded_branch.as_deref(),
+        message.as_deref(),
+    )
+}
+
+fn save_kept_detached_head(
+    db: &std::sync::Mutex<Database>,
+    project_id: &str,
+    worktree_path: &str,
+    recorded_branch: Option<&str>,
+    message: Option<&str>,
+) -> Result<String, String> {
+    unused_instance_worktree(db, project_id, worktree_path)?;
+    let name = safety::save_detached_head(Path::new(worktree_path), recorded_branch)?;
+    if let Some(message) = message {
+        match worktree::commit_worktree_changes_on(
+            worktree_path,
+            message,
+            worktree::CommitTarget::Session,
+            &|p| is_dirty_close_noise_file(p),
+            Some(&name),
+        ) {
+            Ok(_) => {}
+            Err(e) if e == "There are no changes to commit" => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(name)
+}
+
+/// Close dialog: "Keep the worktree". The session's link to its worktree
+/// goes, so closing the session leaves the folder (and its branch) on disk.
+/// Returns the folder that is kept.
+#[tauri::command]
+pub fn git_keep_worktree(
+    state: State<'_, AppState>,
+    session_id: String,
+    project_id: String,
+) -> Result<String, String> {
+    keep_worktree(&state.db, &session_id, &project_id)
+}
+
+fn keep_worktree(
+    db: &std::sync::Mutex<Database>,
+    session_id: &str,
+    project_id: &str,
+) -> Result<String, String> {
+    let db = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+    let Some(row) = db
+        .get_worktree_by_session_and_project(session_id, project_id)
+        .map_err(|e| format!("Failed to look up worktree: {}", e))?
+    else {
+        return Err("This session has no worktree of its own".into());
+    };
+    db.delete_session_worktree(&row.id)?;
+    log::info!(
+        "[worktree] kept {} on close of session {}",
+        row.worktree_path,
+        session_id
+    );
+    Ok(row.worktree_path)
+}
+
+/// Branch In Use → "Remove it and retry": remove a worktree this Hermes made
+/// that no session uses any more (a launch that failed half-way, or a crash
+/// before its record was written). Refuses anything else.
+#[tauri::command]
+pub fn git_remove_leftover_worktree(
+    state: State<'_, AppState>,
+    project_id: String,
+    worktree_path: String,
+    // The session the folder belonged to (names the refs that keep any
+    // submodule commits); None for a leftover of a failed launch.
+    session_id: Option<String>,
+    // The uncommitted work was just archived on a hermes-archive/ branch:
+    // what is still uncommitted in the folder is that saved copy.
+    archived: Option<bool>,
+) -> Result<(), String> {
+    remove_leftover_worktree(
+        &state.db,
+        &project_id,
+        &worktree_path,
+        session_id.as_deref(),
+        archived,
+    )
+}
+
+fn remove_leftover_worktree(
+    db: &std::sync::Mutex<Database>,
+    project_id: &str,
+    worktree_path: &str,
+    session_id: Option<&str>,
+    archived: Option<bool>,
+) -> Result<(), String> {
+    let project_path = unused_instance_worktree(db, project_id, worktree_path)
+        .map_err(|e| format!("{e}; it was not removed"))?;
+    // Work in it is never thrown away from here.
+    if let Ok(repo) = Repository::open(worktree_path) {
+        let mut opts = StatusOptions::new();
+        opts.include_untracked(true).include_ignored(false);
+        let dirty = !archived.unwrap_or(false)
+            && repo
+                .statuses(Some(&mut opts))
+                .map(|s| {
+                    s.iter().any(|e| {
+                        !e.status().is_empty() && !is_dirty_close_noise_file(e.path().unwrap_or(""))
+                    })
+                })
+                .unwrap_or(true);
+        let lost = safety::head_state(Path::new(worktree_path))
+            .map(|h| h.lost_commits > 0)
+            .unwrap_or(false);
+        if dirty || lost {
+            return Err(format!(
+                "The leftover worktree at {worktree_path} has work in it that is on no branch; it was kept. Open it in a terminal to keep or remove that work."
+            ));
+        }
+    }
+    worktree::remove_worktree(
+        &project_path,
+        session_id.unwrap_or("leftover"),
+        worktree_path,
+    )?;
+    let _ = worktree::cleanup_stale_worktrees(&project_path);
+    Ok(())
 }
 
 #[tauri::command]
@@ -3045,9 +3443,7 @@ pub fn git_remove_worktree(
     let wt_branch = wt.branch_name.clone();
     let root_path = project.path.clone();
     let is_main = wt.is_main_worktree;
-
-    let custom_base = resolve_worktree_base(&db, Some(&session_id), Some(&project_id));
-    drop(db);
+    let shared = checkout_is_shared(&db, &wt);
 
     // SAFETY: never remove the main worktree (it IS the project root)
     if is_main {
@@ -3056,14 +3452,33 @@ pub fn git_remove_worktree(
         );
     }
 
-    // Safety: validate path before removal
-    let _ = validate_worktree_path(&wt_path, custom_base.as_deref())?;
+    // SAFETY: a checkout another session also works in stays on disk; only
+    // this session's link to it goes.
+    if shared {
+        db.delete_session_worktree(&wt_id)?;
+        return Ok(GitOperationResult {
+            success: true,
+            message: "Unlinked from a checkout another session still uses".to_string(),
+            error: None,
+        });
+    }
+    // SAFETY: a worktree made outside Hermes (reused on purpose) is not ours
+    // to delete either; `remove_worktree` would refuse it anyway.
+    if !worktree::is_owned_checkout(false, &wt_path) {
+        db.delete_session_worktree(&wt_id)?;
+        return Ok(GitOperationResult {
+            success: true,
+            message: format!(
+                "Unlinked from the checkout at {} (not made by Hermes)",
+                wt_path
+            ),
+            error: None,
+        });
+    }
+    drop(db);
 
     // Get the app data directory for journal storage
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let app_data_dir = crate::instance::app_data_dir(&app)?;
 
     // Journal: log the REMOVE operation before performing it
     let _ = journal::log_operation(
@@ -3074,12 +3489,10 @@ pub fn git_remove_worktree(
         &project_id,
         "",
         &wt_path,
-        custom_base.as_deref(),
     );
 
     // 2. Try to remove the worktree from the filesystem
-    let remove_result =
-        worktree::remove_worktree(&root_path, &session_id, &wt_path, custom_base.as_deref());
+    let remove_result = worktree::remove_worktree(&root_path, &session_id, &wt_path);
 
     // 3. Only delete DB record if git removal succeeded (or directory no longer exists)
     let dir_gone = !std::path::Path::new(&wt_path).is_dir();
@@ -3108,7 +3521,6 @@ pub fn git_remove_worktree(
         "REMOVE",
         &session_id,
         &project_id,
-        custom_base.as_deref(),
     );
 
     // 4. Emit event for frontend
@@ -3197,13 +3609,15 @@ pub fn git_session_worktree_info(
     state: State<'_, AppState>,
     session_id: String,
     project_id: String,
-) -> Result<Option<crate::db::SessionWorktreeRow>, String> {
+) -> Result<Option<SessionWorktreeInfo>, String> {
     let db = state
         .db
         .lock()
         .map_err(|e| format!("DB lock error: {}", e))?;
-    db.get_worktree_by_session_and_project(&session_id, &project_id)
-        .map_err(|e| format!("Failed to look up worktree: {}", e))
+    let row = db
+        .get_worktree_by_session_and_project(&session_id, &project_id)
+        .map_err(|e| format!("Failed to look up worktree: {}", e))?;
+    Ok(row.map(|row| SessionWorktreeInfo::describe(&db, row)))
 }
 
 #[tauri::command]
@@ -3330,7 +3744,7 @@ pub fn git_fetch_remote_branches(
     // Run `git fetch --all --prune` with a 5-second timeout.
     // If the fetch takes too long (slow network, auth prompt, etc.) we kill it
     // and fall back to listing whatever remote refs are cached locally.
-    match std::process::Command::new("git")
+    match crate::git::cli::git_command()
         .current_dir(&project_path)
         .args(["fetch", "--all", "--prune"])
         .stdout(std::process::Stdio::null())
@@ -3430,6 +3844,10 @@ pub fn git_is_git_repo(state: State<'_, AppState>, project_id: String) -> Result
 pub struct WorktreeChanges {
     pub has_changes: bool,
     pub files: Vec<WorktreeChangedFile>,
+    /// The branch HEAD is really on, a detached HEAD's commits that no
+    /// branch has, an operation in progress, and submodules with changes
+    /// inside: what the close dialog must know besides the files.
+    pub head: Option<safety::HeadState>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3464,8 +3882,12 @@ pub fn git_worktree_has_changes(
         .map_err(|e| format!("DB lock error: {}", e))?;
     let project_path = resolve_worktree_path(&db, &session_id, &project_id)?;
     drop(db);
+    worktree_changes_at(&project_path)
+}
 
-    let repo = Repository::open(&project_path).map_err(|e| e.to_string())?;
+/// What `git_worktree_has_changes` reports for the checkout at `project_path`.
+fn worktree_changes_at(project_path: &str) -> Result<WorktreeChanges, String> {
+    let repo = Repository::open(project_path).map_err(|e| e.to_string())?;
 
     // Exclude ignored files (.gitignore) to avoid counting node_modules/ etc.
     let mut opts = StatusOptions::new();
@@ -3505,9 +3927,38 @@ pub fn git_worktree_has_changes(
         });
     }
 
+    let head = safety::head_state(Path::new(project_path)).ok();
+    // A submodule whose only change is inside it (edits not committed in
+    // the submodule) cannot be committed from here: it is listed on its
+    // own (head.dirtySubmodules), not as a file to commit — unless its
+    // recorded commit changed too.
+    if let Some(h) = &head {
+        if !h.dirty_submodules.is_empty() {
+            let moved: HashSet<String> = repo
+                .submodules()
+                .map(|subs| {
+                    subs.iter()
+                        .filter_map(|sm| {
+                            let st = repo
+                                .submodule_status(sm.name()?, git2::SubmoduleIgnore::None)
+                                .ok()?;
+                            st.intersects(
+                                git2::SubmoduleStatus::WD_MODIFIED
+                                    | git2::SubmoduleStatus::INDEX_MODIFIED,
+                            )
+                            .then(|| sm.path().to_string_lossy().replace('\\', "/"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            files.retain(|f| !h.dirty_submodules.contains(&f.path) || moved.contains(&f.path));
+        }
+    }
+
     Ok(WorktreeChanges {
         has_changes: !files.is_empty(),
         files,
+        head,
     })
 }
 
@@ -3515,7 +3966,7 @@ pub fn git_worktree_has_changes(
 /// intent — typically dropped into the worktree by some AI CLI tool
 /// (Aider, etc.).  These get filtered from the dirty-close dialog so
 /// the user isn't asked about files they never created.
-fn is_dirty_close_noise_file(path: &str) -> bool {
+pub(crate) fn is_dirty_close_noise_file(path: &str) -> bool {
     let basename = path.rsplit('/').next().unwrap_or(path);
     matches!(
         basename,
@@ -3672,13 +4123,10 @@ pub fn git_detect_orphan_worktrees(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<OrphanWorktree>, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let app_data_dir = crate::instance::app_data_dir(&app)?;
 
     // 1. Collect all DB data while holding the lock
-    let (all_records, projects, custom_base) = {
+    let (all_records, projects) = {
         let db = state
             .db
             .lock()
@@ -3686,8 +4134,7 @@ pub fn git_detect_orphan_worktrees(
 
         let records = db.get_all_session_worktrees().unwrap_or_default();
         let projects = db.get_all_projects().unwrap_or_default();
-        let custom_base = get_custom_worktree_base(&db);
-        (records, projects, custom_base)
+        (records, projects)
     };
     // DB lock is dropped here
 
@@ -3717,46 +4164,33 @@ pub fn git_detect_orphan_worktrees(
     }
 
     // 3. Check for "directory_only" — directory exists but no DB record
-    //    Scan each project's worktree hash directory across all candidate bases (default, global, project)
+    //    Scan each project's worktree hash directory in the app data dir
     for project in &projects {
-        let mut bases: Vec<Option<&std::path::Path>> = vec![None]; // None represents default base
-        if let Some(ref gb) = custom_base {
-            bases.push(Some(gb.as_path()));
-        }
-        if let Some(ref pb) = project.worktree_base_path {
-            if !pb.trim().is_empty() {
-                bases.push(Some(std::path::Path::new(pb)));
-            }
-        }
-        bases.dedup();
-
-        for base in bases {
-            let wt_dir = worktree::worktree_dir(&app_data_dir, &project.path, base);
-            if wt_dir.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(&wt_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        // Skip non-directories and the repo_path.txt marker file
-                        if !path.is_dir() {
-                            continue;
-                        }
-                        let path_str = path
-                            .to_string_lossy()
-                            .trim_end_matches('/')
-                            .trim_end_matches('\\')
-                            .to_string();
-                        if !record_paths.contains(&path_str) {
-                            // Extract branch name from directory name: {session_prefix}_{branch}
-                            let dir_name = path.file_name().unwrap_or_default().to_string_lossy();
-                            let branch = dir_name.split_once('_').map(|x| x.1.to_string());
-                            orphans.push(OrphanWorktree {
-                                worktree_path: path_str,
-                                branch_name: branch,
-                                kind: "directory_only".to_string(),
-                                root_path: Some(project.path.clone()),
-                                session_id: None,
-                            });
-                        }
+        let wt_dir = worktree::worktree_dir(&app_data_dir, &project.path);
+        if wt_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&wt_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    // Skip non-directories and the repo_path.txt marker file
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let path_str = path
+                        .to_string_lossy()
+                        .trim_end_matches('/')
+                        .trim_end_matches('\\')
+                        .to_string();
+                    if !record_paths.contains(&path_str) {
+                        // Extract branch name from directory name: {session_prefix}_{branch}
+                        let dir_name = path.file_name().unwrap_or_default().to_string_lossy();
+                        let branch = dir_name.split_once('_').map(|x| x.1.to_string());
+                        orphans.push(OrphanWorktree {
+                            worktree_path: path_str,
+                            branch_name: branch,
+                            kind: "directory_only".to_string(),
+                            root_path: Some(project.path.clone()),
+                            session_id: None,
+                        });
                     }
                 }
             }
@@ -3767,20 +4201,9 @@ pub fn git_detect_orphan_worktrees(
 }
 
 #[tauri::command]
-pub fn git_worktree_disk_usage(
-    state: State<'_, AppState>,
-    worktree_path: String,
-) -> Result<u64, String> {
-    let custom_base = {
-        let db = state
-            .db
-            .lock()
-            .map_err(|e| format!("DB lock error: {}", e))?;
-        get_custom_worktree_base(&db)
-    };
-
-    // Validate the path is inside an allowed worktree directory
-    let validated = validate_worktree_path(&worktree_path, custom_base.as_deref())?;
+pub fn git_worktree_disk_usage(worktree_path: String) -> Result<u64, String> {
+    // Validate the path is inside a .hermes/worktrees/ directory
+    let validated = validate_worktree_path(&worktree_path)?;
 
     fn dir_size(path: &std::path::Path) -> u64 {
         let mut size = 0;
@@ -3808,19 +4231,11 @@ pub fn git_cleanup_orphan_worktrees(
     state: State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<Vec<CleanupResult>, String> {
-    let custom_base = {
-        let db = state
-            .db
-            .lock()
-            .map_err(|e| format!("DB lock error: {}", e))?;
-        get_custom_worktree_base(&db)
-    };
-
     let mut results = Vec::new();
 
     for path in &paths {
-        // Validate the path is inside an allowed worktree directory
-        let validated = match validate_worktree_path(path, custom_base.as_deref()) {
+        // Validate the path is inside a .hermes/worktrees/ directory
+        let validated = match validate_worktree_path(path) {
             Ok(v) => v,
             Err(e) => {
                 results.push(CleanupResult {
@@ -3840,7 +4255,7 @@ pub fn git_cleanup_orphan_worktrees(
                     // The repo hash dir contains repo_path.txt to find the repo root.
                     if let Some(hash_dir) = validated.parent() {
                         if let Some(repo_path) = worktree::read_repo_path(hash_dir) {
-                            let _ = std::process::Command::new("git")
+                            let _ = crate::git::cli::git_command()
                                 .arg("-C")
                                 .arg(repo_path.trim())
                                 .arg("worktree")
@@ -3881,6 +4296,273 @@ pub fn git_cleanup_orphan_worktrees(
     }
 
     Ok(results)
+}
+
+// ─── Disk guard & worktree hygiene (feature flag "diskGuard") ───────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DiskStatus {
+    /// Free space on the disk holding the worktrees; None if unreadable.
+    pub free_bytes: Option<u64>,
+    /// Under this, new worktrees are refused.
+    pub required_bytes: u64,
+    pub below_threshold: bool,
+}
+
+#[tauri::command]
+pub async fn git_disk_status(app: AppHandle) -> Result<DiskStatus, String> {
+    let base = worktree::worktrees_base_dir(&crate::instance::app_data_dir(&app)?);
+    let free = tokio::task::spawn_blocking(move || disk_guard::free_space_bytes(&base))
+        .await
+        .map_err(|e| e.to_string())?
+        .ok();
+    Ok(DiskStatus {
+        free_bytes: free,
+        required_bytes: disk_guard::MIN_FREE_BYTES_FOR_WORKTREE,
+        below_threshold: free.is_some_and(|f| disk_guard::check_room(f).is_err()),
+    })
+}
+
+/// A linked worktree folder of this app, or an error. Never the repo root.
+fn checked_worktree_folder<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    worktree_path: &str,
+) -> Result<std::path::PathBuf, String> {
+    let base = worktree::worktrees_base_dir(&crate::instance::app_data_dir(app)?);
+    let path = std::path::PathBuf::from(worktree_path);
+    if disk_guard::is_worktree_folder(&base, &path) {
+        Ok(path)
+    } else {
+        Err(format!(
+            "Refusing to operate on '{}': not a Hermes worktree folder",
+            worktree_path
+        ))
+    }
+}
+
+#[tauri::command]
+pub async fn git_worktree_usage(
+    app: AppHandle,
+    worktree_path: String,
+) -> Result<disk_guard::WorktreeUsage, String> {
+    let path = checked_worktree_folder(&app, &worktree_path)?;
+    let mut usage = tokio::task::spawn_blocking(move || disk_guard::worktree_usage(&path))
+        .await
+        .map_err(|e| e.to_string())?;
+    usage.path = worktree_path;
+    Ok(usage)
+}
+
+/// Remove the build output (node_modules, target, dist — only folders git
+/// ignores and tracks nothing in) of one worktree. Land and Archive call this
+/// once they exist; the Worktrees view calls it on request.
+#[tauri::command]
+pub async fn git_reclaim_build_output(
+    app: AppHandle,
+    worktree_path: String,
+) -> Result<disk_guard::ReclaimResult, String> {
+    let path = checked_worktree_folder(&app, &worktree_path)?;
+    let mut result = tokio::task::spawn_blocking(move || disk_guard::reclaim_build_output(&path))
+        .await
+        .map_err(|e| e.to_string())?;
+    result.path = worktree_path;
+    log::info!(
+        "[disk-guard] removed build output of '{}': {} folders, {} bytes",
+        result.path,
+        result.removed.len(),
+        result.freed_bytes
+    );
+    Ok(result)
+}
+
+/// Worktree paths the database says a session owns.
+fn owned_worktree_paths(
+    state: &State<'_, AppState>,
+) -> Result<HashSet<std::path::PathBuf>, String> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|e| format!("DB lock error: {}", e))?;
+    Ok(db
+        .get_all_session_worktrees()?
+        .into_iter()
+        .map(|r| std::path::PathBuf::from(r.worktree_path))
+        .collect())
+}
+
+/// Every worktree folder under this app's `hermes-worktrees/` that no
+/// session owns, for every repo — including repos Hermes no longer lists.
+#[tauri::command]
+pub async fn git_list_orphan_folders(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<disk_guard::OrphanFolder>, String> {
+    let base = worktree::worktrees_base_dir(&crate::instance::app_data_dir(&app)?);
+    let known = owned_worktree_paths(&state)?;
+    tokio::task::spawn_blocking(move || disk_guard::scan_orphan_folders(&base, &known))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Remove the given orphaned worktree folders (see `git_list_orphan_folders`).
+/// A path that is not an orphan when this runs is left alone.
+#[tauri::command]
+pub async fn git_sweep_orphan_folders(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<Vec<disk_guard::SweepResult>, String> {
+    let base = worktree::worktrees_base_dir(&crate::instance::app_data_dir(&app)?);
+    let known = owned_worktree_paths(&state)?;
+    let results = tokio::task::spawn_blocking(move || {
+        disk_guard::sweep_orphan_folders(&base, &known, &paths)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    log::info!(
+        "[disk-guard] orphan sweep: {} removed, {} bytes freed",
+        results.iter().filter(|r| r.removed).count(),
+        results.iter().map(|r| r.freed_bytes).sum::<u64>()
+    );
+    Ok(results)
+}
+
+// ─── Fast worktrees (N17) ───────────────────────────────────────────
+
+/// What preparing this session's worktree recorded, if it was prepared.
+fn recorded_setup(
+    state: &State<'_, AppState>,
+    session_id: &str,
+    project_id: &str,
+) -> Result<Option<fast_setup::WorktreeSetup>, String> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|e| format!("DB lock error: {}", e))?;
+    let (base, report) = db.get_worktree_setup(session_id, project_id)?;
+    Ok(fast_setup::WorktreeSetup::from_record(
+        base,
+        report.as_deref(),
+    ))
+}
+
+/// Get a session's new worktree ready to run, before its terminal starts:
+/// clone its dependencies and build caches copy-on-write from a checkout
+/// with the same lockfile, and give it its own block of ports (its terminal
+/// gets them as PORT / HERMES_PORT_BASE / HERMES_PORT_COUNT). Called by the
+/// frontend right after the worktree is made, while the "diskGuard" feature
+/// flag is on. Preparing twice returns what the first call recorded.
+#[tauri::command]
+pub async fn git_prepare_worktree(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    project_id: String,
+) -> Result<fast_setup::WorktreeSetup, String> {
+    if let Some(done) = recorded_setup(&state, &session_id, &project_id)? {
+        return Ok(done);
+    }
+    let (row, root_path) = {
+        let db = state
+            .db
+            .lock()
+            .map_err(|e| format!("DB lock error: {}", e))?;
+        let row = db
+            .get_worktree_by_session_and_project(&session_id, &project_id)?
+            .ok_or_else(|| format!("No worktree for session '{}'", session_id))?;
+        let project = db
+            .get_project(&project_id)
+            .map_err(|e| format!("Failed to look up project: {}", e))?
+            .ok_or_else(|| format!("Project '{}' not found", project_id))?;
+        (row, project.path)
+    };
+
+    // Ports: the first free block no other worktree recorded, looked for
+    // while the dependencies are cloned. The unique index settles a race
+    // with another prepare; the loser looks again.
+    let pick_ports = |skip: HashSet<u16>| {
+        let taken = state
+            .db
+            .lock()
+            .map_err(|e| format!("DB lock error: {}", e))
+            .and_then(|db| db.taken_port_bases());
+        async move {
+            let mut taken = taken?;
+            taken.extend(skip);
+            tokio::task::spawn_blocking(move || {
+                fast_setup::pick_port_block(&taken, &fast_setup::port_is_free)
+            })
+            .await
+            .map_err(|e| e.to_string())
+        }
+    };
+
+    // Dependencies: only into a worktree folder Hermes made. The project
+    // folder is the source, never a target.
+    let started = std::time::Instant::now();
+    let clone_dependencies = async {
+        if row.is_main_worktree {
+            return Ok(Vec::new());
+        }
+        match checked_worktree_folder(&app, &row.worktree_path) {
+            Ok(wt) => tokio::task::spawn_blocking(move || {
+                fast_setup::prepare_dependencies(Path::new(&root_path), &wt)
+            })
+            .await
+            .map_err(|e| e.to_string()),
+            Err(e) => {
+                log::info!("[fast-worktrees] dependencies left alone: {}", e);
+                Ok(Vec::new())
+            }
+        }
+    };
+    let (dependencies, first_ports) = tokio::join!(clone_dependencies, pick_ports(HashSet::new()));
+    let dependencies = dependencies?;
+    let millis = started.elapsed().as_millis() as u64;
+
+    let mut skip: HashSet<u16> = HashSet::new();
+    let mut next_ports = Some(first_ports);
+    for _attempt in 0..5 {
+        let ports = match next_ports.take() {
+            Some(first) => first?,
+            None => pick_ports(skip.clone()).await?,
+        };
+        let setup = fast_setup::WorktreeSetup {
+            ports,
+            dependencies: dependencies.clone(),
+            millis,
+        };
+        let report = serde_json::to_string(&setup).map_err(|e| e.to_string())?;
+        let saved = state
+            .db
+            .lock()
+            .map_err(|e| format!("DB lock error: {}", e))?
+            .set_worktree_setup(&session_id, &project_id, ports.map(|p| p.base), &report);
+        match saved {
+            Ok(()) => {
+                log::info!(
+                    "[fast-worktrees] session {} prepared in {} ms: ports {:?}, {}",
+                    session_id,
+                    millis,
+                    ports.map(|p| p.base),
+                    setup
+                        .dependencies
+                        .iter()
+                        .map(|d| format!("{} {:?}", d.folder, d.status))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                return Ok(setup);
+            }
+            Err(e) if e.contains("UNIQUE") => {
+                if let Some(p) = ports {
+                    skip.insert(p.base);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err("Could not record a port block for this worktree".into())
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
@@ -4260,5 +4942,670 @@ mod tests {
             .get_worktree_by_session_and_project("sess1", "proj1")
             .unwrap();
         assert!(wt.is_some(), "Valid worktree record should NOT be deleted");
+    }
+
+    // ── Reusing another session's checkout (F09) ───────────────────────
+
+    /// A second session that reuses the first session's worktree must be
+    /// counted as sharing it, however git spells the path, so closing the
+    /// second session never deletes the first one's checkout. Uses a
+    /// symlinked app-data folder so git's resolved spelling differs from
+    /// the one Hermes stores on every Unix, like /var vs /private/var on macOS.
+    #[cfg(unix)]
+    #[test]
+    fn reusing_another_sessions_worktree_keeps_it_on_close() {
+        let repo_dir = create_test_repo();
+        let repo_path = repo_dir.path().to_str().unwrap();
+        let real = tempfile::TempDir::new().unwrap();
+        let holder = tempfile::TempDir::new().unwrap();
+        let app_data = holder.path().join("app-data");
+        std::os::unix::fs::symlink(real.path(), &app_data).unwrap();
+
+        let a =
+            worktree::create_worktree(&app_data, repo_path, "sess-a", "hermes/task-a", true, None)
+                .unwrap();
+        let db = test_db();
+        db.insert_session_worktree(
+            "row-a",
+            "sess-a",
+            "proj",
+            &a.worktree_path,
+            Some("hermes/task-a"),
+            false,
+        )
+        .unwrap();
+
+        let raw = worktree::attach_existing_worktree(repo_path, "hermes/task-a").unwrap();
+        assert_ne!(
+            raw.worktree_path, a.worktree_path,
+            "git spells the checkout differently"
+        );
+        assert!(!raw.is_main_worktree);
+
+        // Attach records the owner's spelling.
+        let stored = known_spelling_of_checkout(&db, repo_path, &raw.worktree_path).unwrap();
+        assert_eq!(stored.as_deref(), Some(a.worktree_path.as_str()));
+
+        // Even a row written with git's spelling is the same checkout.
+        db.insert_session_worktree(
+            "row-e",
+            "sess-e",
+            "proj",
+            &raw.worktree_path,
+            Some("hermes/task-a"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            db.count_sessions_for_worktree_path(&a.worktree_path)
+                .unwrap(),
+            2
+        );
+        let row_e = db
+            .get_worktree_by_session_and_project("sess-e", "proj")
+            .unwrap()
+            .unwrap();
+        assert!(checkout_is_shared(&db, &row_e));
+
+        // Closing the reusing session leaves A's checkout and row alone.
+        let needs_disk = crate::pty::commands::drain_session_db_state(&db, "sess-e");
+        assert!(
+            needs_disk.is_empty(),
+            "must not remove a checkout another session uses"
+        );
+        assert!(std::path::Path::new(&a.worktree_path).is_dir());
+        assert_eq!(db.get_session_worktrees("sess-a").unwrap().len(), 1);
+        assert!(db.get_session_worktrees("sess-e").unwrap().is_empty());
+
+        // With E gone, A owns it alone again: closing A removes it.
+        let row_a = db
+            .get_worktree_by_session_and_project("sess-a", "proj")
+            .unwrap()
+            .unwrap();
+        assert!(!checkout_is_shared(&db, &row_a));
+        assert_eq!(
+            crate::pty::commands::drain_session_db_state(&db, "sess-a").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn known_spelling_of_checkout_falls_back_to_project_folder() {
+        let repo_dir = create_test_repo();
+        let repo_path = repo_dir.path().to_str().unwrap();
+        let db = test_db();
+        let with_slash = format!("{}/", repo_path);
+        assert_eq!(
+            known_spelling_of_checkout(&db, repo_path, &with_slash)
+                .unwrap()
+                .as_deref(),
+            Some(repo_path)
+        );
+        let other = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            known_spelling_of_checkout(&db, repo_path, other.path().to_str().unwrap()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn session_worktree_info_reports_sharing_in_camel_case() {
+        let db = test_db();
+        db.insert_session_worktree("r1", "s1", "p", "/tmp/hermes-test/wt", Some("b"), false)
+            .unwrap();
+        let row = db
+            .get_worktree_by_session_and_project("s1", "p")
+            .unwrap()
+            .unwrap();
+        let alone = SessionWorktreeInfo::describe(&db, row.clone());
+        let json = serde_json::to_value(&alone).unwrap();
+        assert_eq!(json["sharedWithOtherSessions"], false);
+        assert_eq!(json["worktreePath"], "/tmp/hermes-test/wt");
+        assert_eq!(json["isMainWorktree"], false);
+        // Not under hermes-worktrees/: a checkout Hermes did not make.
+        assert_eq!(json["ownedBySession"], false);
+
+        // Same folder, spelled with a trailing separator.
+        db.insert_session_worktree("r2", "s2", "p", "/tmp/hermes-test/wt/", Some("b"), false)
+            .unwrap();
+        assert!(checkout_is_shared(&db, &row));
+    }
+
+    #[test]
+    fn session_owns_only_its_own_unshared_hermes_worktree() {
+        let db = test_db();
+        let own = "/data/hermes-worktrees/abc/s1_hermes-task";
+        db.insert_session_worktree("r1", "s1", "p", own, Some("hermes/task"), false)
+            .unwrap();
+        db.insert_session_worktree("r2", "s2", "p", "/work/repo", Some("main"), true)
+            .unwrap();
+        db.insert_session_worktree(
+            "r3",
+            "s3",
+            "p",
+            "/work/repo-external",
+            Some("external"),
+            false,
+        )
+        .unwrap();
+        let info = |s: &str| {
+            SessionWorktreeInfo::describe(
+                &db,
+                db.get_worktree_by_session_and_project(s, "p")
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+        assert!(info("s1").owned_by_session, "its own hermes worktree");
+        assert!(!info("s2").owned_by_session, "the project folder");
+        let external = info("s3");
+        assert!(
+            !external.owned_by_session && !external.shared_with_other_sessions,
+            "a worktree made outside Hermes: not shared, not ours"
+        );
+
+        // Once another session reuses s1's worktree it is shared, so not owned alone.
+        db.insert_session_worktree("r4", "s4", "p", own, Some("hermes/task"), false)
+            .unwrap();
+        let shared = info("s1");
+        assert!(shared.shared_with_other_sessions && !shared.owned_by_session);
+    }
+
+    #[test]
+    fn worktree_setup_is_recorded_per_link_and_frees_its_ports_with_it() {
+        let db = test_db();
+        db.insert_session_worktree("r1", "s1", "p", "/tmp/hermes-test/wt1", Some("a"), false)
+            .unwrap();
+        db.insert_session_worktree("r2", "s2", "p", "/tmp/hermes-test/wt2", Some("b"), false)
+            .unwrap();
+        assert_eq!(db.get_worktree_setup("s1", "p").unwrap(), (None, None));
+
+        let setup = fast_setup::WorktreeSetup {
+            ports: Some(fast_setup::PortBlock {
+                base: 21_000,
+                count: 10,
+            }),
+            dependencies: Vec::new(),
+            millis: 3,
+        };
+        let json = serde_json::to_string(&setup).unwrap();
+        db.set_worktree_setup("s1", "p", Some(21_000), &json)
+            .unwrap();
+        let (base, report) = db.get_worktree_setup("s1", "p").unwrap();
+        assert_eq!(
+            fast_setup::WorktreeSetup::from_record(base, report.as_deref()),
+            Some(setup)
+        );
+        assert!(
+            db.set_worktree_setup("s2", "p", Some(21_000), &json)
+                .is_err(),
+            "a block is never recorded twice"
+        );
+        assert!(db
+            .set_worktree_setup("nobody", "p", Some(21_010), &json)
+            .is_err());
+        assert_eq!(
+            db.taken_port_bases().unwrap(),
+            [21_000].into_iter().collect()
+        );
+
+        // Closing the session drops its link, and with it the block.
+        db.delete_worktrees_for_session("s1").unwrap();
+        assert!(db.taken_port_bases().unwrap().is_empty());
+        db.set_worktree_setup("s2", "p", Some(21_000), &json)
+            .unwrap();
+    }
+
+    // ── Pure pieces of the git commands ────────────────────────────────
+
+    /// git in `dir` with a test identity, asserting success; trimmed stdout.
+    fn git_ok(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "protocol.file.allow=always",
+                "-c",
+                "core.autocrlf=false",
+            ])
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn unstaging_refuses_a_path_outside_the_project_but_takes_everything() {
+        let repo = create_test_repo();
+        let root = repo.path().to_str().unwrap();
+        assert!(check_unstage_paths(root, &[".".into()]).is_ok());
+        assert!(check_unstage_paths(root, &["README.md".into()]).is_ok());
+        assert!(check_unstage_paths(root, &["../outside.txt".into()]).is_err());
+        assert!(check_unstage_paths(root, &[".".into(), "../../etc/passwd".into()]).is_err());
+    }
+
+    #[test]
+    fn the_author_override_needs_both_a_name_and_an_email() {
+        let dir = create_test_repo();
+        let repo = Repository::open(dir.path()).unwrap();
+        let s = |v: &str| Some(v.to_string());
+        let (ann, mail, empty) = (s("Ann"), s("ann@example.com"), s(""));
+        assert_eq!(
+            commit_author(&repo, &ann, &mail).unwrap(),
+            Some(("Ann", "ann@example.com"))
+        );
+        assert_eq!(commit_author(&repo, &empty, &mail).unwrap(), None);
+        assert_eq!(commit_author(&repo, &ann, &empty).unwrap(), None);
+        assert_eq!(commit_author(&repo, &None, &mail).unwrap(), None);
+        assert_eq!(commit_author(&repo, &None, &None).unwrap(), None);
+    }
+
+    #[test]
+    fn without_an_override_a_repository_with_no_identity_is_refused() {
+        let dir = create_test_repo();
+        git_ok(dir.path(), &["config", "user.name", ""]);
+        git_ok(dir.path(), &["config", "user.email", ""]);
+        let repo = Repository::open(dir.path()).unwrap();
+        let err = commit_author(&repo, &None, &None).unwrap_err();
+        assert!(err.starts_with("Git user not configured"), "{err}");
+        let (ann, mail) = (Some("Ann".to_string()), Some("ann@example.com".to_string()));
+        assert_eq!(
+            commit_author(&repo, &ann, &mail).unwrap(),
+            Some(("Ann", "ann@example.com"))
+        );
+    }
+
+    #[test]
+    fn a_new_branch_is_cut_from_the_base_else_the_checked_out_branch() {
+        let dir = create_test_repo();
+        let root = dir.path().to_str().unwrap();
+        let current = git_ok(dir.path(), &["branch", "--show-current"]);
+        assert_eq!(
+            cut_from_branch(root, true, None, Some("develop")).as_deref(),
+            Some("develop")
+        );
+        assert_eq!(cut_from_branch(root, true, None, None), Some(current));
+        // No branch is made: nothing is cut.
+        assert_eq!(cut_from_branch(root, false, None, Some("develop")), None);
+        assert_eq!(cut_from_branch(root, false, None, None), None);
+        assert_eq!(
+            cut_from_branch(root, true, Some("origin/x"), Some("develop")),
+            None
+        );
+        git_ok(dir.path(), &["checkout", "-q", "--detach"]);
+        assert_eq!(cut_from_branch(root, true, None, None), None);
+    }
+
+    #[test]
+    fn a_branch_is_never_recorded_as_its_own_base() {
+        assert_eq!(base_to_record(Some("main"), "main"), None);
+        assert_eq!(base_to_record(Some("main"), "hermes/x"), Some("main"));
+        assert_eq!(base_to_record(None, "hermes/x"), None);
+    }
+
+    #[test]
+    fn a_branch_in_use_error_says_who_holds_it() {
+        let db = test_db();
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().to_str().unwrap().to_string();
+        db.insert_project("p1", &root, "P", "[]", "[]").unwrap();
+        let held = "/nowhere/hermes-worktrees/abc/held";
+        db.insert_session_worktree("w1", "s1", "p1", held, Some("feat"), false)
+            .unwrap();
+        let db = std::sync::Mutex::new(db);
+        let read = |err: String| -> serde_json::Value {
+            let json = err
+                .strip_prefix(worktree::BRANCH_IN_USE_PREFIX)
+                .unwrap_or_else(|| panic!("{err}"));
+            serde_json::from_str(json).unwrap()
+        };
+
+        assert_eq!(
+            describe_branch_in_use(&db, &root, "git failed".into()),
+            "git failed"
+        );
+
+        let v = read(describe_branch_in_use(
+            &db,
+            &root,
+            worktree::branch_in_use_error("feat", held),
+        ));
+        assert_eq!(v["branch"], "feat");
+        assert_eq!(v["path"], held);
+        assert_eq!(v["sessionId"], "s1");
+        assert_eq!(v["projectFolder"], false);
+        assert_eq!(v["leftover"], false);
+
+        // Ours, and no session uses it: a leftover.
+        let v = read(describe_branch_in_use(
+            &db,
+            &root,
+            worktree::branch_in_use_error("old", "/nowhere/hermes-worktrees/abc/left"),
+        ));
+        assert_eq!(v["sessionId"], serde_json::Value::Null);
+        assert_eq!(v["leftover"], true);
+
+        // The project folder itself, or a checkout outside Hermes: not ours.
+        let v = read(describe_branch_in_use(
+            &db,
+            &root,
+            worktree::branch_in_use_error("main", &root),
+        ));
+        assert_eq!(v["projectFolder"], true);
+        assert_eq!(v["leftover"], false);
+        let v = read(describe_branch_in_use(
+            &db,
+            &root,
+            worktree::branch_in_use_error("main", "/elsewhere/checkout"),
+        ));
+        assert_eq!(v["projectFolder"], false);
+        assert_eq!(v["leftover"], false);
+    }
+
+    /// A project repository (`p1` in the returned database) and a linked
+    /// worktree of it on branch `task` inside a `hermes-worktrees` folder.
+    fn project_with_leftover() -> (
+        tempfile::TempDir,
+        std::sync::Mutex<Database>,
+        String,
+        String,
+    ) {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        git_ok(&root, &["init", "-q", "-b", "main"]);
+        git_ok(&root, &["config", "user.email", "test@example.com"]);
+        git_ok(&root, &["config", "user.name", "Test"]);
+        git_ok(&root, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("README.md"), "# readme\n").unwrap();
+        git_ok(&root, &["add", "."]);
+        git_ok(&root, &["commit", "-q", "-m", "init"]);
+        let wt = t.path().join("hermes-worktrees").join("abc").join("wt");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git_ok(
+            &root,
+            &["worktree", "add", "-q", "-b", "task", wt.to_str().unwrap()],
+        );
+        let db = test_db();
+        let root_s = root.to_str().unwrap().to_string();
+        db.insert_project("p1", &root_s, "P", "[]", "[]").unwrap();
+        (
+            t,
+            std::sync::Mutex::new(db),
+            root_s,
+            wt.to_str().unwrap().to_string(),
+        )
+    }
+
+    #[test]
+    fn only_an_unused_worktree_of_ours_of_this_project_counts_as_kept() {
+        let (t, db, root, wt) = project_with_leftover();
+        assert_eq!(unused_instance_worktree(&db, "p1", &wt).unwrap(), root);
+        assert!(unused_instance_worktree(&db, "nope", &wt).is_err());
+
+        // A checkout outside Hermes' worktrees folder.
+        let outside = t.path().join("plain").join("wt");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        git_ok(
+            Path::new(&root),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "other",
+                outside.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            unused_instance_worktree(&db, "p1", outside.to_str().unwrap()).unwrap_err(),
+            "That checkout was not made by this Hermes"
+        );
+
+        // Ours, but a worktree of another repository.
+        let stranger = t.path().join("stranger");
+        std::fs::create_dir_all(&stranger).unwrap();
+        git_ok(&stranger, &["init", "-q", "-b", "main"]);
+        std::fs::write(stranger.join("x.txt"), "x\n").unwrap();
+        git_ok(&stranger, &["add", "."]);
+        git_ok(&stranger, &["commit", "-q", "-m", "x"]);
+        let foreign = t
+            .path()
+            .join("hermes-worktrees")
+            .join("abc")
+            .join("foreign");
+        git_ok(
+            &stranger,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "f",
+                foreign.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            unused_instance_worktree(&db, "p1", foreign.to_str().unwrap()).unwrap_err(),
+            "That checkout does not belong to this project"
+        );
+
+        // A session still works in it.
+        db.lock()
+            .unwrap()
+            .insert_session_worktree("w1", "s1", "p1", &wt, Some("task"), false)
+            .unwrap();
+        assert_eq!(
+            unused_instance_worktree(&db, "p1", &wt).unwrap_err(),
+            "A session still works in that checkout"
+        );
+    }
+
+    #[test]
+    fn a_kept_worktree_commits_its_work_and_nothing_to_commit_is_no_outcome() {
+        let (_t, db, _root, wt) = project_with_leftover();
+        let commit = |expected: Option<&str>| {
+            commit_kept_worktree(
+                &db,
+                "p1",
+                &wt,
+                "Keep work",
+                worktree::CommitTarget::Session,
+                expected,
+            )
+        };
+        assert!(commit(Some("task")).unwrap().is_none());
+        std::fs::write(Path::new(&wt).join("work.txt"), "work\n").unwrap();
+        // Switched to another branch: refused, not "nothing to commit".
+        assert!(commit(Some("elsewhere"))
+            .unwrap_err()
+            .contains("nothing was committed"));
+        let out = commit(Some("task")).unwrap().expect("a commit");
+        assert_eq!(out.branch, "task");
+        assert_eq!(out.files, 1);
+        assert_eq!(
+            git_ok(Path::new(&wt), &["log", "-1", "--format=%s"]),
+            "Keep work"
+        );
+    }
+
+    #[test]
+    fn a_kept_detached_head_is_saved_on_an_archive_branch() {
+        let (_t, db, _root, wt) = project_with_leftover();
+        let w = Path::new(&wt);
+        git_ok(w, &["checkout", "-q", "--detach"]);
+        std::fs::write(w.join("fix.txt"), "fix\n").unwrap();
+        git_ok(w, &["add", "."]);
+        git_ok(w, &["commit", "-q", "-m", "fix"]);
+        // Nothing uncommitted: the message has nothing to commit.
+        let name =
+            save_kept_detached_head(&db, "p1", &wt, Some("hermes/bisect"), Some("Keep")).unwrap();
+        assert_eq!(name, "hermes-archive/bisect-detached");
+        assert_eq!(git_ok(w, &["branch", "--show-current"]), name);
+        assert_eq!(git_ok(w, &["log", "-1", "--format=%s"]), "fix");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_kept_detached_head_whose_commit_a_hook_refuses_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_t, db, root, wt) = project_with_leftover();
+        let w = Path::new(&wt);
+        git_ok(w, &["checkout", "-q", "--detach"]);
+        std::fs::write(w.join("dirty.txt"), "dirty\n").unwrap();
+        let hook = Path::new(&root).join(".git/hooks/pre-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\necho 'no' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err =
+            save_kept_detached_head(&db, "p1", &wt, Some("hermes/x"), Some("Keep")).unwrap_err();
+        assert!(err.starts_with(safety::HOOK_REFUSED_PREFIX), "{err}");
+    }
+
+    #[test]
+    fn keeping_a_worktree_drops_only_the_sessions_link() {
+        let (_t, db, _root, wt) = project_with_leftover();
+        assert!(keep_worktree(&db, "s1", "p1").is_err());
+        db.lock()
+            .unwrap()
+            .insert_session_worktree("w1", "s1", "p1", &wt, Some("task"), false)
+            .unwrap();
+        assert_eq!(keep_worktree(&db, "s1", "p1").unwrap(), wt);
+        assert!(db
+            .lock()
+            .unwrap()
+            .get_all_session_worktrees()
+            .unwrap()
+            .is_empty());
+        assert!(Path::new(&wt).exists());
+    }
+
+    #[test]
+    fn a_clean_leftover_is_removed_and_one_with_work_is_kept() {
+        // Clean: removed.
+        let (_t, db, _root, wt) = project_with_leftover();
+        remove_leftover_worktree(&db, "p1", &wt, None, None).unwrap();
+        assert!(!Path::new(&wt).exists());
+
+        // Only clutter a tool dropped there: still removed.
+        let (_t, db, _root, wt) = project_with_leftover();
+        std::fs::write(Path::new(&wt).join(".DS_Store"), "x").unwrap();
+        remove_leftover_worktree(&db, "p1", &wt, None, None).unwrap();
+        assert!(!Path::new(&wt).exists());
+
+        // Uncommitted work: kept.
+        let (_t, db, _root, wt) = project_with_leftover();
+        std::fs::write(Path::new(&wt).join("work.txt"), "work\n").unwrap();
+        let err = remove_leftover_worktree(&db, "p1", &wt, None, None).unwrap_err();
+        assert!(err.contains("has work in it"), "{err}");
+        assert!(Path::new(&wt).join("work.txt").exists());
+        // ...unless that work was just archived.
+        remove_leftover_worktree(&db, "p1", &wt, Some("s1"), Some(true)).unwrap();
+        assert!(!Path::new(&wt).exists());
+
+        // Commits on no branch: kept.
+        let (_t, db, _root, wt) = project_with_leftover();
+        let w = Path::new(&wt);
+        git_ok(w, &["checkout", "-q", "--detach"]);
+        std::fs::write(w.join("fix.txt"), "fix\n").unwrap();
+        git_ok(w, &["add", "."]);
+        git_ok(w, &["commit", "-q", "-m", "fix"]);
+        let err = remove_leftover_worktree(&db, "p1", &wt, None, None).unwrap_err();
+        assert!(err.contains("on no branch"), "{err}");
+        assert!(w.exists());
+
+        // Not ours to remove.
+        let (_t, db, _root, wt) = project_with_leftover();
+        db.lock()
+            .unwrap()
+            .insert_session_worktree("w1", "s1", "p1", &wt, Some("task"), false)
+            .unwrap();
+        assert!(remove_leftover_worktree(&db, "p1", &wt, None, None)
+            .unwrap_err()
+            .ends_with("; it was not removed"));
+        assert!(Path::new(&wt).exists());
+    }
+
+    /// A superproject with a submodule `vendor/lib` (committed).
+    fn superproject() -> (tempfile::TempDir, std::path::PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let lib = t.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        git_ok(&lib, &["init", "-q", "-b", "main"]);
+        std::fs::write(lib.join("lib.txt"), "v1\n").unwrap();
+        git_ok(&lib, &["add", "."]);
+        git_ok(&lib, &["commit", "-q", "-m", "lib"]);
+        let sup = t.path().join("sup");
+        std::fs::create_dir_all(&sup).unwrap();
+        git_ok(&sup, &["init", "-q", "-b", "main"]);
+        std::fs::write(sup.join("README.md"), "sup\n").unwrap();
+        git_ok(&sup, &["add", "."]);
+        git_ok(&sup, &["commit", "-q", "-m", "init"]);
+        git_ok(
+            &sup,
+            &[
+                "submodule",
+                "add",
+                "-q",
+                lib.to_str().unwrap(),
+                "vendor/lib",
+            ],
+        );
+        git_ok(&sup, &["commit", "-q", "-m", "vendor"]);
+        (t, sup)
+    }
+
+    #[test]
+    fn edits_only_inside_a_submodule_are_not_a_file_to_commit() {
+        let (_t, sup) = superproject();
+        std::fs::write(sup.join("vendor/lib/lib.txt"), "dirty\n").unwrap();
+        std::fs::write(sup.join("README.md"), "edited\n").unwrap();
+        let ch = worktree_changes_at(sup.to_str().unwrap()).unwrap();
+        let files: Vec<&str> = ch.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(files, vec!["README.md"]);
+        assert!(ch.has_changes);
+        assert_eq!(
+            ch.head.unwrap().dirty_submodules,
+            vec!["vendor/lib".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_submodule_whose_recorded_commit_moved_is_a_file_to_commit() {
+        let (_t, sup) = superproject();
+        let sub = sup.join("vendor/lib");
+        std::fs::write(sub.join("lib.txt"), "v2\n").unwrap();
+        git_ok(&sub, &["commit", "-q", "-am", "v2"]);
+        std::fs::write(sub.join("lib.txt"), "dirty\n").unwrap();
+        let ch = worktree_changes_at(sup.to_str().unwrap()).unwrap();
+        let files: Vec<&str> = ch.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(files, vec!["vendor/lib"]);
+        assert_eq!(
+            ch.head.unwrap().dirty_submodules,
+            vec!["vendor/lib".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_clean_checkout_has_no_changes() {
+        let (_t, sup) = superproject();
+        let ch = worktree_changes_at(sup.to_str().unwrap()).unwrap();
+        assert!(ch.files.is_empty());
+        assert!(!ch.has_changes);
     }
 }

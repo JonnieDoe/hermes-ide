@@ -2,14 +2,16 @@ import { useState, useEffect, useCallback } from "react";
 import "../styles/components/WhatsNewDialog.css";
 import {
   changelog,
-  type ChangelogEntry,
   type ChangelogPreviewKind,
   type ChangelogSection,
 } from "../data/changelog";
 import { getSetting, setSetting } from "../api/settings";
-
-const SETTING_LAST_SEEN = "last_seen_version";
-const SETTING_SUPPRESS = "suppress_whats_new";
+import {
+  WHATS_NEW_LAST_SEEN_SETTING as SETTING_LAST_SEEN,
+  WHATS_NEW_PREVIEW_STORAGE_KEY,
+  WHATS_NEW_SUPPRESS_SETTING as SETTING_SUPPRESS,
+} from "./startupDialogSettings";
+import { Button, Checkbox } from "./ui";
 
 interface WhatsNewDialogProps {
   /** Current app version (from __APP_VERSION__) */
@@ -23,7 +25,7 @@ export function WhatsNewDialog({ version }: WhatsNewDialogProps) {
   // for the DevTools snippet that activates this path.
   const previewVersion =
     typeof window !== "undefined"
-      ? window.localStorage.getItem("hermesPreviewWhatsNew") ?? null
+      ? window.localStorage.getItem(WHATS_NEW_PREVIEW_STORAGE_KEY) ?? null
       : null;
   const effectiveVersion =
     previewVersion && changelog[previewVersion] ? previewVersion : version;
@@ -119,18 +121,16 @@ export function WhatsNewDialog({ version }: WhatsNewDialogProps) {
           ) : null}
         </div>
         <div className="whatsnew-footer">
-          <label className="whatsnew-suppress">
-            <input
-              type="checkbox"
-              checked={suppress}
-              onChange={(e) => setSuppress(e.target.checked)}
-            />
-            Don&rsquo;t show after updates
-          </label>
+          <Checkbox
+            className="whatsnew-suppress"
+            checked={suppress}
+            onChange={setSuppress}
+            label={<>Don&rsquo;t show after updates</>}
+          />
           <div className="whatsnew-spacer" />
-          <button className="whatsnew-btn whatsnew-btn-primary" onClick={handleDismiss}>
+          <Button variant="primary" className="whatsnew-btn-primary" onClick={handleDismiss}>
             Got it
-          </button>
+          </Button>
         </div>
       </div>
     </div>
@@ -353,6 +353,3 @@ function SectionPreview({ kind }: { kind: ChangelogPreviewKind }) {
     </div>
   );
 }
-
-// Re-export for tests
-export type { ChangelogEntry };

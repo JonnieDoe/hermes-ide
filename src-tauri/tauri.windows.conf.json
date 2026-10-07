@@ -7,5 +7,12 @@
         "hiddenTitle": false
       }
     ]
+  },
+  "bundle": {
+    "resources": [
+      "bridge/runtime",
+      "library",
+      "helpers/hi.exe"
+    ]
   }
 }

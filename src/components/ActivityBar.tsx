@@ -1,12 +1,21 @@
 import { type ReactNode, useRef, useState, useEffect } from "react";
 import { Blocks, Settings } from "lucide-react";
 import "../styles/components/ActivityBar.css";
+import { Counter } from "./ui/Badge";
 
 export interface ActivityBarTab {
   id: string;
   label: string;
   icon: ReactNode;
   badge?: number;
+  /** neutral (a plain count) by default; attention (brass) only when the count needs you. */
+  badgeTone?: "neutral" | "attention";
+}
+
+/** A tab's count: the control set's Counter, neutral unless it needs you. */
+function TabBadge({ tab }: { tab: ActivityBarTab }) {
+  if (tab.badge == null || tab.badge <= 0) return null;
+  return <Counter className="activity-bar-badge" value={tab.badge} tone={tab.badgeTone ?? "neutral"} />;
 }
 
 interface ActivityBarAction {
@@ -149,24 +158,25 @@ export function ActivityBar({ side, tabs, activeTabId, onTabClick, onReorder, to
         <button
           className={`activity-bar-action activity-bar-expandable activity-bar-expand-${side}`}
           onClick={topAction.onClick}
+          aria-label={topAction.label}
         >
           <span className="activity-bar-icon-wrap">{topAction.icon}</span>
-          <span className="activity-bar-label">{topAction.label}</span>
+          <span className="activity-bar-label" aria-hidden="true">{topAction.label}</span>
         </button>
       )}
       {pinnedTabs && pinnedTabs.map((tab) => (
         <button
           key={tab.id}
+          data-tab-id={tab.id}
           className={`activity-bar-tab activity-bar-expandable activity-bar-expand-${side}${activeTabId === tab.id ? " activity-bar-tab-active" : ""}`}
           onClick={() => onTabClick(tab.id)}
+          aria-label={tab.label}
         >
           <span className="activity-bar-icon-wrap">
             {tab.icon}
-            {tab.badge != null && tab.badge > 0 && (
-              <span className="activity-bar-badge">{tab.badge}</span>
-            )}
+            <TabBadge tab={tab} />
           </span>
-          <span className="activity-bar-label">{tab.label}</span>
+          <span className="activity-bar-label" aria-hidden="true">{tab.label}</span>
         </button>
       ))}
       {(topAction || (pinnedTabs && pinnedTabs.length > 0)) && (
@@ -183,14 +193,13 @@ export function ActivityBar({ side, tabs, activeTabId, onTabClick, onReorder, to
               className={`activity-bar-tab activity-bar-expandable activity-bar-expand-${side}${activeTabId === tab.id ? " activity-bar-tab-active" : ""}${dragId === tab.id ? " activity-bar-tab-dragging" : ""}`}
               onMouseDown={(e) => handleMouseDown(e, tab.id)}
               onClick={onReorder ? undefined : () => onTabClick(tab.id)}
+              aria-label={tab.label}
             >
               <span className="activity-bar-icon-wrap">
                 {tab.icon}
-                {tab.badge != null && tab.badge > 0 && (
-                  <span className="activity-bar-badge">{tab.badge}</span>
-                )}
+                <TabBadge tab={tab} />
               </span>
-              <span className="activity-bar-label">{tab.label}</span>
+              <span className="activity-bar-label" aria-hidden="true">{tab.label}</span>
             </button>
           </div>
         ))}
@@ -206,9 +215,10 @@ export function ActivityBar({ side, tabs, activeTabId, onTabClick, onReorder, to
               key={i}
               className={`activity-bar-action activity-bar-expandable activity-bar-expand-${side}`}
               onClick={action.onClick}
+              aria-label={action.label}
             >
               <span className="activity-bar-icon-wrap">{action.icon}</span>
-              <span className="activity-bar-label">{action.label}</span>
+              <span className="activity-bar-label" aria-hidden="true">{action.label}</span>
             </button>
           ))}
         </>
@@ -242,6 +252,16 @@ export const ContextIcon = (
   </svg>
 );
 
+export const TrackIcon = (
+  <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+    {/* Three phases on a line, the middle one a gate (diamond) */}
+    <line x1="2.5" y1="9" x2="15.5" y2="9" opacity="0.5" />
+    <circle cx="4" cy="9" r="1.5" fill="currentColor" stroke="none" />
+    <path d="M9 6.2 L11.8 9 L9 11.8 L6.2 9 Z" />
+    <circle cx="14" cy="9" r="1.5" />
+  </svg>
+);
+
 export const UsageIcon = (
   <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
     <path d="M2.5 14.5 L2.5 9.5 L5.5 9.5 L5.5 14.5 Z" />
@@ -251,44 +271,17 @@ export const UsageIcon = (
   </svg>
 );
 
-export const ProcessesIcon = (
-  <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-    <rect x="2" y="2" width="6" height="6" rx="1" />
-    <rect x="10" y="2" width="6" height="6" rx="1" />
-    <rect x="2" y="10" width="6" height="6" rx="1" />
-    <rect x="10" y="10" width="6" height="6" rx="1" />
-  </svg>
-);
-
-export const GitIcon = (
-  <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-    <circle cx="5" cy="5" r="2" />
-    <circle cx="13" cy="5" r="2" />
-    <circle cx="9" cy="14" r="2" />
-    <line x1="5" y1="7" x2="5" y2="10" />
-    <line x1="13" y1="7" x2="13" y2="10" />
-    <path d="M5 10 C5 12 9 12 9 12" />
-    <path d="M13 10 C13 12 9 12 9 12" />
-  </svg>
-);
-
-export const FilesIcon = (
-  <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M2 5C2 3.9 2.9 3 4 3H7L9 5H14C15.1 5 16 5.9 16 7V13C16 14.1 15.1 15 14 15H4C2.9 15 2 14.1 2 13V5Z" />
-  </svg>
-);
-
-export const SearchIcon = (
-  <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-    <circle cx="7.5" cy="7.5" r="5" />
-    <line x1="11" y1="11" x2="15.5" y2="15.5" />
-  </svg>
-);
-
 export const PlusIcon = (
   <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
     <line x1="8" y1="3" x2="8" y2="13" />
     <line x1="3" y1="8" x2="13" y2="8" />
+  </svg>
+);
+
+export const LibraryIcon = (
+  <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round">
+    {/* Two books and a leaning third: the prompt library */}
+    <path d="M2.5 3h3.5v12h-3.5zM7 3h3.5v12h-3.5zM11.8 4.2l2.8-.6 1.4 10.8-2.8.6z" />
   </svg>
 );
 

@@ -4,16 +4,12 @@ use std::path::Path;
 
 use super::worktree;
 
-const JOURNAL_FILENAME: &str = "worktree-journal.log";
+pub const JOURNAL_FILENAME: &str = "worktree-journal.log";
 
 /// Build the path to the journal file for a given repo.
-/// Stored in `{base_dir}/{repo_hash}/worktree-journal.log`.
-pub fn journal_path(
-    app_data_dir: &Path,
-    repo_path: &str,
-    custom_base: Option<&Path>,
-) -> std::path::PathBuf {
-    let dir = worktree::worktree_dir(app_data_dir, repo_path, custom_base);
+/// Stored in `{app_data_dir}/hermes-worktrees/{repo_hash}/worktree-journal.log`.
+pub fn journal_path(app_data_dir: &Path, repo_path: &str) -> std::path::PathBuf {
+    let dir = worktree::worktree_dir(app_data_dir, repo_path);
     dir.join(JOURNAL_FILENAME)
 }
 
@@ -27,9 +23,8 @@ pub fn log_operation(
     project_id: &str,
     branch: &str,
     worktree_path: &str,
-    custom_base: Option<&Path>,
 ) -> Result<(), String> {
-    let path = journal_path(app_data_dir, repo_path, custom_base);
+    let path = journal_path(app_data_dir, repo_path);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             let msg = format!("Failed to create journal directory {:?}: {}", parent, e);
@@ -65,7 +60,6 @@ pub fn log_completed(
     action: &str,
     session_id: &str,
     project_id: &str,
-    custom_base: Option<&Path>,
 ) -> Result<(), String> {
     log_operation(
         app_data_dir,
@@ -75,22 +69,22 @@ pub fn log_completed(
         project_id,
         "",
         "",
-        custom_base,
     )
 }
 
 /// Check for incomplete operations on startup
-pub fn get_incomplete_operations(
-    app_data_dir: &Path,
-    repo_path: &str,
-    custom_base: Option<&Path>,
-) -> Vec<JournalEntry> {
-    let path = journal_path(app_data_dir, repo_path, custom_base);
+pub fn get_incomplete_operations(app_data_dir: &Path, repo_path: &str) -> Vec<JournalEntry> {
+    incomplete_operations_in(&journal_path(app_data_dir, repo_path))
+}
+
+/// Incomplete operations recorded in one journal file. Unlike
+/// `get_incomplete_operations` this never creates a folder.
+pub fn incomplete_operations_in(path: &Path) -> Vec<JournalEntry> {
     if !path.exists() {
         return Vec::new();
     }
 
-    let content = match read_to_string(&path) {
+    let content = match read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
@@ -134,8 +128,8 @@ pub fn get_incomplete_operations(
     pending.into_values().collect()
 }
 
-pub fn clear_journal(app_data_dir: &Path, repo_path: &str, custom_base: Option<&Path>) {
-    let path = journal_path(app_data_dir, repo_path, custom_base);
+pub fn clear_journal(app_data_dir: &Path, repo_path: &str) {
+    let path = journal_path(app_data_dir, repo_path);
     let _ = std::fs::remove_file(&path);
 }
 

@@ -1,0 +1,205 @@
+#!/usr/bin/env node
+// A stand-in for src-tauri/bridge/hermes-claude-bridge.mjs, for real-app
+// scenarios. The test app starts it through HERMES_BRIDGE_PATH exactly as it
+// starts the real bridge (`node <bridge> --working-dir <dir> ... <claude flags>`),
+// and it speaks the same NDJSON on stdin / stdout. No network, no account.
+//
+// Behaviour is read from a plan file on every user message, so a scenario can
+// change what the running process (or the next one) does without relaunching
+// the app:
+//
+//   HERMES_FAKE_BRIDGE_PLAN  path to a JSON file: { "mode": "<mode>" }
+//   HERMES_FAKE_BRIDGE_LOG   path of an NDJSON log this process appends to:
+//                            {"event":"start"|"input"|"exit", "pid", ...};
+//                            a user message's "input" entry lists its content
+//                            blocks (an image as media type, size and sha256)
+//   HERMES_FAKE_MCP_SERVERS  comma-separated MCP server names the init
+//                            message reports as connected
+//   CLAUDE_CONFIG_DIR        when set, the conversation is also written where
+//                            Claude Code keeps it:
+//                            <dir>/projects/<working dir as a folder name>/<id>.jsonl
+//                            (one line per user message and per reply, in
+//                            Claude Code's record shape). Never written
+//                            without it, so a test never touches ~/.claude.
+//
+// Modes, applied to each user message:
+//   ok          replies "fake reply: <text>" and stays up for more messages
+//   crash       prints a line on stderr and exits with code 3
+//   signed-out  answers the way Claude does without a login
+//               (assistant error "authentication_failed", then an error
+//               result "Not logged in · Please run /login") and exits 0
+//   garbage     prints a line that is not JSON and stays up
+//   compact     compacts the context (a compact_boundary event), then
+//               replies like ok
+//
+// The replies are synthetic; nothing here was recorded from a real account.
+
+import { createHash } from "node:crypto";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { createInterface } from "node:readline";
+
+const argv = process.argv.slice(2);
+const flag = (name) => {
+  const i = argv.indexOf(name);
+  return i >= 0 ? argv[i + 1] : undefined;
+};
+const sessionId = flag("--session-id") || flag("--resume") || "fake-session";
+const cwd = flag("--working-dir") || process.cwd();
+
+/** Claude Code's project folder name: every character that is not an ASCII letter or digit becomes "-". */
+const projectFolder = (dir) => dir.replace(/[^A-Za-z0-9]/g, "-");
+
+/** Appends one record to the conversation's transcript, as Claude Code does (only with CLAUDE_CONFIG_DIR). */
+function transcript(record) {
+  const config = process.env.CLAUDE_CONFIG_DIR;
+  if (!config) return;
+  const dir = join(config, "projects", projectFolder(cwd));
+  mkdirSync(dir, { recursive: true });
+  appendFileSync(join(dir, `${sessionId}.jsonl`), JSON.stringify({ ...record, sessionId, cwd, timestamp: new Date().toISOString(), isSidechain: false }) + "\n");
+}
+
+function log(entry) {
+  const file = process.env.HERMES_FAKE_BRIDGE_LOG;
+  if (!file) return;
+  appendFileSync(file, JSON.stringify({ ...entry, pid: process.pid, t: Date.now() }) + "\n");
+}
+
+function readMode() {
+  const file = process.env.HERMES_FAKE_BRIDGE_PLAN;
+  if (!file) return "ok";
+  try {
+    return JSON.parse(readFileSync(file, "utf8")).mode || "ok";
+  } catch {
+    return "ok";
+  }
+}
+
+log({ event: "start", mode: readMode(), argv });
+
+const out = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
+const finish = (code) => {
+  log({ event: "exit", code });
+  process.exit(code);
+};
+
+let turn = 0;
+const init = () =>
+  out({
+    type: "system",
+    subtype: "init",
+    cwd,
+    session_id: sessionId,
+    tools: [],
+    mcp_servers: (process.env.HERMES_FAKE_MCP_SERVERS || "")
+      .split(",")
+      .filter(Boolean)
+      .map((name) => ({ name, status: "connected" })),
+    model: "fake-model",
+    permissionMode: "default",
+    slash_commands: [],
+    apiKeySource: "none",
+    claude_code_version: "0.0.0-fake",
+    uuid: `fake-init-${process.pid}`,
+  });
+
+function onUserMessage(text) {
+  const mode = readMode();
+  turn += 1;
+  if (mode === "crash") {
+    process.stderr.write("fake-bridge: simulated crash\n");
+    finish(3);
+    return;
+  }
+  if (turn === 1) init();
+  if (mode === "signed-out") {
+    const msg = "Not logged in · Please run /login";
+    out({
+      type: "assistant",
+      error: "authentication_failed",
+      message: {
+        id: `fake-msg-${process.pid}-${turn}`,
+        type: "message",
+        role: "assistant",
+        model: "fake-model",
+        content: [{ type: "text", text: msg }],
+      },
+      parent_tool_use_id: null,
+      session_id: sessionId,
+    });
+    out({ type: "result", subtype: "success", is_error: true, result: msg, session_id: sessionId, num_turns: 1 });
+    finish(0);
+    return;
+  }
+  if (mode === "garbage") {
+    process.stdout.write("fake-bridge: this line is not JSON {\n");
+    return;
+  }
+  if (mode === "compact") {
+    // What Claude Code streams when it compacts the context (/compact, or
+    // automatically near the window's end), before the turn's reply.
+    out({
+      type: "system",
+      subtype: "compact_boundary",
+      session_id: sessionId,
+      uuid: `fake-compact-${process.pid}-${turn}`,
+      compact_metadata: { trigger: "manual", pre_tokens: 150000 },
+    });
+  }
+  const reply = `fake reply: ${text}`;
+  const message = {
+    id: `fake-msg-${process.pid}-${turn}`,
+    type: "message",
+    role: "assistant",
+    model: "fake-model",
+    content: [{ type: "text", text: reply }],
+  };
+  out({ type: "assistant", message, parent_tool_use_id: null, session_id: sessionId });
+  transcript({ type: "assistant", uuid: `fake-a-${process.pid}-${turn}`, message: { ...message, stop_reason: "end_turn" } });
+  out({ type: "result", subtype: "success", is_error: false, result: reply, session_id: sessionId, num_turns: turn });
+}
+
+/**
+ * What one content block of a user message carried, for the log: its type,
+ * and for an image the media type, byte count and a hash of the decoded
+ * bytes (so a scenario can check the pixels arrived unchanged without
+ * logging them).
+ */
+function describeBlock(b) {
+  if (b?.type === "image") {
+    const bytes = Buffer.from(String(b.source?.data ?? ""), "base64");
+    return {
+      type: "image",
+      source_type: b.source?.type,
+      media_type: b.source?.media_type,
+      bytes: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+  }
+  if (b?.type === "text") return { type: "text", text: b.text };
+  return { type: b?.type ?? null };
+}
+
+const rl = createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  let msg;
+  try {
+    msg = JSON.parse(line);
+  } catch {
+    return;
+  }
+  const content = msg.message?.content;
+  log({ event: "input", type: msg.type, ...(msg.type === "user" && Array.isArray(content) ? { blocks: content.map(describeBlock) } : {}) });
+  if (msg.type !== "user") return;
+  const text = typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content.filter((b) => b?.type === "text").map((b) => b.text).join(" ")
+      : "";
+  // Claude Code keeps a typed prompt as a plain string.
+  transcript({ type: "user", uuid: `fake-u-${process.pid}-${turn + 1}`, message: { role: "user", content: text } });
+  onUserMessage(text);
+});
+rl.on("close", () => finish(0));
+process.on("SIGTERM", () => finish(143));
+process.on("SIGINT", () => finish(130));

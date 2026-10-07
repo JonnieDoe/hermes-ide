@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
+import { isFeatureFlagEnabled } from "../featureFlags";
 import type { SessionData, SessionHistoryEntry, SessionMode, TmuxSessionEntry, TmuxWindowEntry, PortForward } from "../types/session";
+import type { AgentLaunchOptions } from "../agent/capabilities/types";
 
 export interface RemoteGitInfo {
   branch: string | null;
@@ -18,28 +20,99 @@ export function createSession(opts: {
   permissionMode?: string | null;
   customPrefix?: string | null;
   customSuffix?: string | null;
+  /** Custom agent only: the name shown for the session. */
+  agentName?: string | null;
+  /** Custom agent only: the command typed to start it. */
+  agentCommand?: string | null;
   channels?: string[] | null;
   sshHost?: string | null;
   sshPort?: number | null;
   sshUser?: string | null;
   tmuxSession?: string | null;
   sshIdentityFile?: string | null;
+  sshJumpHost?: string | null;
   initialRows?: number | null;
   initialCols?: number | null;
-  worktreeBasePath?: string | null;
   /** "terminal" (default) spawns a PTY; "agent" spawns the Claude subprocess
    *  via `agent::spawn_agent_session` instead. */
   mode?: SessionMode | null;
+  /** Feature flag `launchHelper`: start the agent through the bundled `hi`
+   *  helper (shell-neutral launch, resume on restore, startup-prompt guess). */
+  launchHelper?: boolean;
+  /** The `launchHelper` flag itself is on: a launch the helper cannot carry
+   *  (no runnable helper in this build) is refused with an error on the
+   *  session instead of typed into the shell. */
+  launchHelperRequired?: boolean;
+  /** A restored session's saved conversation id to resume (helper only). */
+  vendorSessionId?: string | null;
+  /** Feature flag `featureTracks`: put the bundled `hi` helper on the
+   *  terminal's PATH so `hi phase`, `hi status` and friends work. */
+  featureTracks?: boolean;
+  /** Feature flag `sessionHost`: open the terminal in the background session
+   *  host (it survives quit, update and crash) and reattach to a program the
+   *  host still has under this session id. */
+  sessionHost?: boolean;
+  /** Task launcher (F15): the agent's first prompt (helper only). */
+  initialPrompt?: string | null;
+  /** A library persona for the agent's system prompt, for agents with a proven flag (helper only). */
+  systemPrompt?: string | null;
+  /** N19 handoff: the first prompt, passed as a launch argument (helper only). */
+  seedPrompt?: string | null;
+  /** N19 handoff: the session this one continues or duplicates. */
+  parentSessionId?: string | null;
+  /** 2.0 launch contract: model, effort and account (helper launch only). */
+  agentLaunch?: AgentLaunchOptions | null;
 }): Promise<SessionData> {
   return invoke<SessionData>("create_session", opts);
+}
+
+/** What the backend knows about the session host (N20). */
+export interface SessionHostStatus {
+  supported: boolean;
+  running: boolean;
+  pid: number | null;
+  exe: string | null;
+  host_version: string | null;
+  app_version: string;
+  socket: string;
+  bin_dir: string;
+  sessions: { id: string; pid: number; alive: boolean; attached: boolean }[];
+  hosted_session_ids: string[];
+  /** Hosted sessions with an agent at work: the ones a quit asks about. */
+  working_session_ids: string[];
+  quit_decision: boolean | null;
+}
+
+/** Whether the session host is running (and which sessions it hosts). */
+export function sessionHostStatus(): Promise<SessionHostStatus> {
+  return invoke<SessionHostStatus>("session_host_status");
+}
+
+/** The answer to "keep running or stop?": the backend acts on it and quits. */
+export function sessionHostQuit(keepRunning: boolean): Promise<void> {
+  return invoke("session_host_quit", { keepRunning });
+}
+
+/** How many tasks wait in the queue: a quit then asks first (and says they start next time). */
+export function sessionHostSetQueued(count: number): Promise<void> {
+  return invoke("session_host_set_queued", { count });
+}
+
+/**
+ * Whether a quit has to ask first: the flag is on, a hosted session has an
+ * agent at work, and nobody has answered yet.
+ */
+export function quitMustAsk(status: Pick<SessionHostStatus, "working_session_ids" | "quit_decision">): boolean {
+  return status.working_session_ids.length > 0 && status.quit_decision === null;
 }
 
 export function sshListTmuxSessions(
   host: string,
   port?: number,
   user?: string,
+  jumpHost?: string | null,
 ): Promise<TmuxSessionEntry[]> {
-  return invoke<TmuxSessionEntry[]>("ssh_list_tmux_sessions", { host, port, user });
+  return invoke<TmuxSessionEntry[]>("ssh_list_tmux_sessions", { host, port, user, jumpHost });
 }
 
 export function sshListTmuxWindows(
@@ -47,8 +120,9 @@ export function sshListTmuxWindows(
   tmuxSession: string,
   port?: number,
   user?: string,
+  jumpHost?: string | null,
 ): Promise<TmuxWindowEntry[]> {
-  return invoke<TmuxWindowEntry[]>("ssh_list_tmux_windows", { host, port, user, tmuxSession });
+  return invoke<TmuxWindowEntry[]>("ssh_list_tmux_windows", { host, port, user, jumpHost, tmuxSession });
 }
 
 export function sshTmuxSelectWindow(
@@ -57,8 +131,9 @@ export function sshTmuxSelectWindow(
   windowIndex: number,
   port?: number,
   user?: string,
+  jumpHost?: string | null,
 ): Promise<void> {
-  return invoke("ssh_tmux_select_window", { host, port, user, tmuxSession, windowIndex });
+  return invoke("ssh_tmux_select_window", { host, port, user, jumpHost, tmuxSession, windowIndex });
 }
 
 export function sshTmuxRenameWindow(
@@ -68,8 +143,9 @@ export function sshTmuxRenameWindow(
   newName: string,
   port?: number,
   user?: string,
+  jumpHost?: string | null,
 ): Promise<void> {
-  return invoke("ssh_tmux_rename_window", { host, port, user, tmuxSession, windowIndex, newName });
+  return invoke("ssh_tmux_rename_window", { host, port, user, jumpHost, tmuxSession, windowIndex, newName });
 }
 
 export function sshTmuxNewWindow(
@@ -77,13 +153,15 @@ export function sshTmuxNewWindow(
   tmuxSession: string,
   port?: number,
   user?: string,
+  jumpHost?: string | null,
   windowName?: string,
 ): Promise<void> {
-  return invoke("ssh_tmux_new_window", { host, port, user, tmuxSession, windowName });
+  return invoke("ssh_tmux_new_window", { host, port, user, jumpHost, tmuxSession, windowName });
 }
 
 export function checkAiProviders(): Promise<Record<string, boolean>> {
-  return invoke<Record<string, boolean>>("check_ai_providers");
+  // Beta-channel agents are only looked for when the UI shows them.
+  return invoke<Record<string, boolean>>("check_ai_providers", { includeBeta: isFeatureFlagEnabled("agentCatalog") });
 }
 
 export function closeSession(sessionId: string): Promise<void> {
@@ -130,8 +208,26 @@ export function removeWorkspacePath(sessionId: string, path: string): Promise<vo
   return invoke("remove_workspace_path", { sessionId, path });
 }
 
+/** Writes still on their way to each session's terminal, newest last. */
+const pendingWrites = new Map<string, Promise<void>>();
+
+/**
+ * Send bytes to a session's terminal. Writes to one session go out one after
+ * the other: each keystroke is its own call, and two calls in flight at once
+ * can reach the backend in either order (seen on Windows as swapped
+ * characters in a fast-typed command line).
+ */
 export function writeToSession(sessionId: string, data: string): Promise<void> {
-  return invoke("write_to_session", { sessionId, data });
+  const before = pendingWrites.get(sessionId);
+  const send = () => invoke<void>("write_to_session", { sessionId, data });
+  // Nothing in flight: send now (no extra tick for a single keystroke).
+  const write = before ? before.catch(() => {}).then(send) : send();
+  pendingWrites.set(sessionId, write);
+  const forget = () => {
+    if (pendingWrites.get(sessionId) === write) pendingWrites.delete(sessionId);
+  };
+  write.then(forget, forget);
+  return write;
 }
 
 export function saveAllSnapshots(): Promise<void> {

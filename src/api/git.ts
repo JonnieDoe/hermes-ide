@@ -5,9 +5,11 @@ import type {
   GitStashEntry, GitLogResult, GitCommitDetail, MergeStatus, ConflictContent, ConflictStrategy,
   SearchResponse,
   SessionWorktree, WorktreeInfo, BranchAvailability, WorktreeCreateResult,
-  WorktreeChanges,
+  WorktreeChanges, CommitOutcome, WorktreeSetup,
   WorktreeOverviewEntry, OrphanWorktree, CleanupResult,
+  DiskStatus, WorktreeUsage, ReclaimResult, OrphanFolder, SweepResult,
 } from "../types/git";
+import { isFeatureFlagEnabled } from "../featureFlags";
 
 export function gitStatus(sessionId: string): Promise<GitSessionStatus> {
   return invoke<GitSessionStatus>("git_status", { sessionId });
@@ -242,16 +244,105 @@ export async function createWorktree(
   branchName: string,
   createBranch: boolean = false,
   fromRemote?: string,
-  worktreeBasePath?: string,
+  baseBranch?: string,
 ): Promise<WorktreeCreateResult> {
-  return invoke<WorktreeCreateResult>("git_create_worktree", {
+  const result = await invoke<WorktreeCreateResult>("git_create_worktree", {
     sessionId,
     projectId,
     branchName,
     createBranch,
     fromRemote: fromRemote ?? null,
-    worktreeBasePath: worktreeBasePath ?? null,
+    // Disk guard: refuse under 10 GB free (only while the flag is on).
+    ...(isFeatureFlagEnabled("diskGuard") ? { enforceDiskGuard: true } : {}),
+    // Omitted unless set: the backend then cuts a new branch from HEAD.
+    ...(baseBranch ? { baseBranch } : {}),
   });
+  await prepareWorktreeIfEnabled(sessionId, projectId);
+  return result;
+}
+
+/** Link a session to the checkout that already has `branchName` (the user chose "reuse"). */
+export async function attachWorktree(
+  sessionId: string,
+  projectId: string,
+  branchName: string,
+): Promise<WorktreeCreateResult> {
+  const result = await invoke<WorktreeCreateResult>("git_attach_worktree", { sessionId, projectId, branchName });
+  await prepareWorktreeIfEnabled(sessionId, projectId);
+  return result;
+}
+
+/**
+ * Fast worktrees (behind the "diskGuard" flag): before the session's terminal
+ * starts, clone the worktree's dependencies copy-on-write from a checkout
+ * with the same lockfile and give it its own block of ports. A failure here
+ * never stops the session: it starts without them.
+ */
+async function prepareWorktreeIfEnabled(
+  sessionId: string,
+  projectId: string,
+): Promise<WorktreeSetup | null> {
+  if (!isFeatureFlagEnabled("diskGuard")) return null;
+  try {
+    return await invoke<WorktreeSetup>("git_prepare_worktree", { sessionId, projectId });
+  } catch (err) {
+    console.warn(`[git] could not prepare the worktree for project ${projectId}:`, err);
+    return null;
+  }
+}
+
+/** Drop a session's link to a worktree without touching the disk. */
+export async function detachWorktree(sessionId: string, projectId: string): Promise<void> {
+  return invoke<void>("git_detach_worktree", { sessionId, projectId });
+}
+
+/** Unlink the session from its worktree so closing it leaves the folder on disk. Returns the folder. */
+export async function keepWorktree(sessionId: string, projectId: string): Promise<string> {
+  return invoke<string>("git_keep_worktree", { sessionId, projectId });
+}
+
+/**
+ * Close flow, after the session was stopped: commit the work of its kept
+ * (unlinked) worktree on `expectedBranch` or a new hermes-archive/ branch.
+ * Null when there was nothing left to commit.
+ */
+export async function commitKeptWorktree(
+  projectId: string,
+  worktreePath: string,
+  message: string,
+  target: "session" | "archive",
+  expectedBranch: string | null,
+): Promise<CommitOutcome | null> {
+  return invoke<CommitOutcome | null>("git_commit_kept_worktree", { projectId, worktreePath, message, target, expectedBranch });
+}
+
+/**
+ * Close flow, after the session was stopped: keep a detached HEAD's commits
+ * (and, with a message, the uncommitted changes) on a new
+ * hermes-archive/<branch>-detached branch. Returns it.
+ */
+export async function saveKeptDetachedHead(
+  projectId: string,
+  worktreePath: string,
+  recordedBranch: string | null,
+  message: string | null,
+): Promise<string> {
+  return invoke<string>("git_save_kept_detached_head", { projectId, worktreePath, recordedBranch, message });
+}
+
+/**
+ * Remove a worktree this Hermes made that no session uses: a leftover of a
+ * failed launch (Branch In Use → Remove it and retry), or a closed
+ * session's folder once its work is saved. Refuses one with unsaved work.
+ */
+export async function removeLeftoverWorktree(
+  projectId: string,
+  worktreePath: string,
+  sessionId?: string | null,
+  /** Its uncommitted work was just archived on a hermes-archive/ branch. */
+  archived = false,
+): Promise<void> {
+  return invoke<void>("git_remove_leftover_worktree", { projectId, worktreePath, sessionId: sessionId ?? null, archived });
 }
 
 export async function removeWorktree(
@@ -324,4 +415,28 @@ export async function worktreeDiskUsage(worktreePath: string): Promise<number> {
 
 export async function cleanupOrphanWorktrees(paths: string[]): Promise<CleanupResult[]> {
   return invoke<CleanupResult[]>("git_cleanup_orphan_worktrees", { paths });
+}
+
+// ─── Disk guard & worktree hygiene (feature flag "diskGuard") ────────
+
+export function getDiskStatus(): Promise<DiskStatus> {
+  return invoke<DiskStatus>("git_disk_status");
+}
+
+export function getWorktreeUsage(worktreePath: string): Promise<WorktreeUsage> {
+  return invoke<WorktreeUsage>("git_worktree_usage", { worktreePath });
+}
+
+/** Removes node_modules, target and dist folders that git ignores and tracks nothing in. */
+export function reclaimBuildOutput(worktreePath: string): Promise<ReclaimResult> {
+  return invoke<ReclaimResult>("git_reclaim_build_output", { worktreePath });
+}
+
+/** Worktree folders no session owns, across every repo. */
+export function listOrphanFolders(): Promise<OrphanFolder[]> {
+  return invoke<OrphanFolder[]>("git_list_orphan_folders");
+}
+
+export function sweepOrphanFolders(paths: string[]): Promise<SweepResult[]> {
+  return invoke<SweepResult[]>("git_sweep_orphan_folders", { paths });
 }

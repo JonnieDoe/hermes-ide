@@ -4,6 +4,8 @@ import { ActionTemplate, ActionEvent } from "../state/SessionContext";
 import { sendShortcutCommand } from "../terminal/TerminalPool";
 import { useSession } from "../state/SessionContext";
 import { CommandsPopover } from "./CommandsPopover";
+import { useI18n } from "../i18n/I18nProvider";
+import { shortcutLabel } from "../utils/keymap";
 
 // Default actions per AI provider — shown immediately before agent detection
 const DEFAULT_ACTIONS: Record<string, ActionTemplate[]> = {
@@ -79,9 +81,19 @@ const DEFAULT_ACTIONS: Record<string, ActionTemplate[]> = {
     { command: "/theme", label: "Theme", description: "Choose syntax highlighting theme", category: "Setup" },
     { command: "/logout", label: "Logout", description: "Log out of Codex", category: "Setup" },
   ],
+  // GitHub Copilot CLI (`copilot`), which replaced the retired `gh copilot` extension.
   copilot: [
-    { command: "gh copilot suggest", label: "Suggest", description: "Get command suggestions", category: "AI" },
-    { command: "gh copilot explain", label: "Explain", description: "Explain a command", category: "AI" },
+    { command: "/diff", label: "Diff", description: "Review the changes made in the current directory", category: "Code" },
+    { command: "/review", label: "Review", description: "Run code review on your changes", category: "Code" },
+    { command: "/compact", label: "Compact", description: "Summarize conversation to save context", category: "Context" },
+    { command: "/clear", label: "Clear", description: "Abandon this session and start fresh", category: "Context" },
+    { command: "/context", label: "Context", description: "Show context window token usage", category: "Context" },
+    { command: "/plan", label: "Plan", description: "Create an implementation plan before coding", category: "Context" },
+    { command: "/usage", label: "Usage", description: "Show session usage metrics", category: "Info" },
+    { command: "/help", label: "Help", description: "Show available commands", category: "Info" },
+    { command: "/model", label: "Model", description: "Select the AI model for this session", category: "Setup" },
+    { command: "/mcp", label: "MCP", description: "Manage MCP server configuration", category: "Setup" },
+    { command: "/login", label: "Login", description: "Log in to Copilot", category: "Setup" },
   ],
 };
 
@@ -91,7 +103,7 @@ const PINNED_DEFAULTS: Record<string, string[]> = {
   gemini: ["/clear", "/help", "/stats", "/tools"],
   aider: ["/add", "/run", "/test", "/commit", "/undo"],
   codex: ["/compact", "/clear", "/diff", "/review", "/status"],
-  copilot: ["gh copilot suggest", "gh copilot explain"],
+  copilot: ["/compact", "/clear", "/diff", "/review", "/usage"],
 };
 
 const MAX_QUICK_ACTIONS = 5;
@@ -108,6 +120,7 @@ interface ProviderActionsBarProps {
 
 export function ProviderActionsBar({ sessionId, actions, recentActions, aiProvider }: ProviderActionsBarProps) {
   const { dispatch } = useSession();
+  const { t } = useI18n();
   const [popoverOpen, setPopoverOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
 
@@ -172,29 +185,31 @@ export function ProviderActionsBar({ sessionId, actions, recentActions, aiProvid
       {/* Compose button */}
       <button
         className="pab-compose-btn"
-        title="Open Prompt Composer"
+        title={t("composer.openPromptBuilderTitle", { shortcut: shortcutLabel("view.prompt-composer") })}
         onClick={handleOpenComposer}
       >
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M12 20h9" />
-          <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+          <path d="M4 6h16M4 12h16M4 18h9" />
         </svg>
-        Compose
+        {t("palette.promptComposer")}
       </button>
 
       <div className="pab-divider" />
 
-      {/* Quick action pills */}
-      {quickActions.map((action) => (
-        <button
-          key={action.command}
-          className="pab-action"
-          title={action.description}
-          onClick={() => handleExecute(action.command)}
-        >
-          {action.command}
-        </button>
-      ))}
+      {/* Quick action pills: the ones that do not fit wrap out of sight, so
+          the Commands trigger (which lists them all) stays in the window. */}
+      <div className="pab-actions">
+        {quickActions.map((action) => (
+          <button
+            key={action.command}
+            className="pab-action"
+            title={action.description}
+            onClick={() => handleExecute(action.command)}
+          >
+            {action.command}
+          </button>
+        ))}
+      </div>
 
       {/* Spacer pushes dropdown trigger to the right */}
       {showDropdown && <div className="pab-spacer" />}

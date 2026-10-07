@@ -12,22 +12,36 @@ on:
       - "SPONSORS.md"
       - "scripts/release-*.sh"
       - "scripts/generate-changelog.sh"
+  # No paths-ignore on pull_request / merge_group: the required `gate` check
+  # must always report, or a docs-only PR would wait on it forever. The
+  # `changes` job decides which jobs run; the gate knows which may be skipped.
   pull_request:
     branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "LICENSE"
-      - ".github/RELEASE_TEMPLATE.md"
-      - ".github/dependabot.yml"
-      - ".github/FUNDING.yml"
-      - "SPONSORS.md"
-      - "scripts/release-*.sh"
-      - "scripts/generate-changelog.sh"
+  merge_group:
+  # Nightly: every job on main, including the real key presses of F05 and
+  # terminal-echo 20 times in a row on each OS (see REPEAT).
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      repeat:
+        description: "How many times to run terminal-echo on each OS"
+        required: false
+        default: "20"
+      fleet_repeat:
+        description: "How many times to run the fleet performance scenario (F24) on each OS"
+        required: false
+        default: "1"
+      scenario_repeat:
+        description: "Run more scenarios several times on each OS, as FILE=N or FILE=N,FILE=N (for example F21-review-desk.mjs=5); empty for none"
+        required: false
+        default: ""
 
-# Cancel in-progress runs for the same branch/PR — no point running stale commits
+# Superseded PR pushes are cancelled. Runs on main and in the merge queue are
+# never cancelled: each of those commits must finish its checks.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -36,21 +50,37 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
+  # How many times terminal-echo runs on each OS. The nightly run gives it
+  # the "20 in a row" the acceptance criteria ask for, which measures the
+  # flake rate; pull requests, the merge queue and pushes to main run it
+  # once, like every other scenario. A manual run can choose the count.
+  REPEAT: ${{ github.event_name == 'workflow_dispatch' && inputs.repeat || github.event_name == 'schedule' && '20' || '1' }}
+  # The fleet scenario (F24) measures memory and speed against per-OS
+  # budgets; a manual run can repeat it to show a measurement is stable.
+  FLEET_REPEAT: ${{ github.event_name == 'workflow_dispatch' && inputs.fleet_repeat || '1' }}
+  # A manual run can repeat any other scenario too, to show a fix for a flaky
+  # one holds (FILE=N; the shard that holds FILE runs it N times).
+  SCENARIO_REPEAT: ${{ github.event_name == 'workflow_dispatch' && inputs.scenario_repeat || '' }}
 
 jobs:
   # ── Detect what changed to skip irrelevant jobs ──────────────────────
   changes:
     name: Detect Changes
     runs-on: ubuntu-24.04
+    # Only pull requests are filtered by path. Pushes to main and merge-queue
+    # commits run every job.
     outputs:
-      frontend: ${{ steps.filter.outputs.frontend }}
-      rust: ${{ steps.filter.outputs.rust }}
-      ci: ${{ steps.filter.outputs.ci }}
+      frontend: ${{ github.event_name != 'pull_request' || steps.filter.outputs.frontend == 'true' }}
+      rust: ${{ github.event_name != 'pull_request' || steps.filter.outputs.rust == 'true' }}
+      ci: ${{ github.event_name != 'pull_request' || steps.filter.outputs.ci == 'true' }}
+      workflows: ${{ github.event_name != 'pull_request' || steps.filter.outputs.workflows == 'true' }}
+      packaging: ${{ github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 1
-      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        if: github.event_name == 'pull_request'
         id: filter
         with:
           filters: |
@@ -58,13 +88,99 @@ jobs:
               - 'src/**'
               - 'package.json'
               - 'package-lock.json'
+              - 'patches/**'
               - 'tsconfig.json'
               - 'vite.config.ts'
               - 'index.html'
+              - 'eslint.config.js'
+              - 'eslint-rules/**'
+              - 'knip.json'
+              # Scripts whose unit tests live in src/__tests__
+              - 'scripts/privacy-check.mjs'
+              - 'scripts/mutation-score.mjs'
+              - '.github/privacy-allowlist.json'
+              - 'bundle-budget.json'
+              - 'scripts/bundle-budget.mjs'
+              - 'scripts/generate-shortcuts.mjs'
+              - 'scripts/check-readme-claims.mjs'
+              - 'docs/readme-claims.yml'
+              - 'scripts/pack-bridge-runtime*.mjs'
+              - 'scripts/ci/**'
+              - '.stylelintrc.json'
+              - 'scripts/lint-css*.mjs'
+              - 'scripts/contrast-audit*.mjs'
+              - 'scripts/check-controls*.mjs'
+              - 'scripts/check-controls-baseline.json'
             rust:
               - 'src-tauri/**'
+              - 'rust-toolchain.toml'
+              - 'package.json'
+              - 'package-lock.json'
             ci:
               - '.github/workflows/ci.yml'
+              - 'scripts/ci-gate.mjs'
+              - 'scripts/stage-bridge-deps.mjs'
+              - 'scripts/pack-bridge-runtime.mjs'
+              - 'scripts/ci/**'
+              - 'e2e/**'
+            workflows:
+              - '.github/workflows/**'
+            # What the installer jobs build or install from: the app, its
+            # bundled runtime, the installer scripts and their scenarios.
+            packaging:
+              - 'src-tauri/**'
+              - 'rust-toolchain.toml'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'scripts/stage-bridge-deps.mjs'
+              - 'scripts/pack-bridge-runtime.mjs'
+              - 'scripts/ci/**'
+              - 'e2e/app/build-appimage.mjs'
+              - 'e2e/app/harness.mjs'
+              - 'e2e/app/run.mjs'
+              - 'e2e/app/scenarios/F25-appimage-update.mjs'
+              - 'e2e/app/scenarios/F25-winget-install.mjs'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/release.yml'
+
+  # ── Dev and test builds never run as the installed app ───────────────
+  instance-identifiers:
+    name: Instance Identifiers
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 22
+      - name: Dev and e2e configs never use the production identifier
+        run: node scripts/check-instance-identifiers.mjs
+
+  # ── Workflow files: syntax, expressions, action inputs ───────────────
+  # Shell snippets are not linted (shellcheck off): this job is about the
+  # workflow files themselves, so an edit to any of them is checked.
+  actionlint:
+    name: Workflow Lint
+    needs: changes
+    if: needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 1
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/actionlint.tgz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C "$RUNNER_TEMP" actionlint
+      - name: Lint every workflow
+        run: '"$RUNNER_TEMP/actionlint" -color -shellcheck= -pyflakes='
 
   # ── Frontend: TypeScript + Tests (merged into one job) ───────────────
   frontend:
@@ -73,18 +189,48 @@ jobs:
     if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
-          fetch-depth: 1
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+          # Two commits: HEAD^1 is the base the stylesheet lint compares
+          # against (a PR's merge commit, a merge-group commit, or the
+          # previous commit on main).
+          fetch-depth: 2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - run: npm ci
       - name: Type check
         run: npx tsc --noEmit
+      - name: Lint
+        run: npx eslint .
+      # Design-system rules (.stylelintrc.json): every line of src/styles/ui
+      # and of new stylesheets, and the added lines of the older ones — no
+      # new raw px, raw colours, hand-rolled shadows or outline:none.
+      - name: Stylesheet lint (new and changed lines)
+        run: node scripts/lint-css.mjs --base HEAD^1
+      # Buttons, selects and checkboxes come from the control set
+      # (src/components/ui); a file may not gain a bespoke one. The terminal
+      # and the editor are allowed; the rest of today's are the baseline in
+      # scripts/check-controls-baseline.json, which may only shrink.
+      - name: Controls come from the control set
+        run: node scripts/check-controls.mjs
+      # Every theme's control colours meet the contrast rules (also run by
+      # the unit tests; this prints the failing pairs by name).
+      - name: Theme contrast
+        run: node scripts/contrast-audit.mjs
+      # Unused files, exports and dependencies (config: knip.json).
+      - name: Unused code (knip)
+        run: npx knip
       - name: Unit tests
         run: npx vitest run
+      # Fails when the JavaScript the window must load before it can draw
+      # grows past bundle-budget.json. New views and heavy libraries belong
+      # behind React.lazy / import() so they load when first used.
+      - name: Build the frontend
+        run: npx vite build
+      - name: Startup JS budget
+        run: node scripts/bundle-budget.mjs
 
   # ── Rust Formatting ──────────────────────────────────────────────────
   rust-fmt:
@@ -93,7 +239,7 @@ jobs:
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -101,6 +247,12 @@ jobs:
           components: rustfmt
       - name: Check formatting
         run: cd src-tauri && cargo fmt --check
+      - name: Check formatting (hi helper)
+        run: cd src-tauri/hi && cargo fmt --check
+      - name: Check formatting (track crate)
+        run: cd src-tauri/track && cargo fmt --check
+      - name: Check formatting (session host)
+        run: cd src-tauri/pty-host && cargo fmt --check
 
   # ── Rust Clippy ──────────────────────────────────────────────────────
   rust-clippy:
@@ -109,22 +261,31 @@ jobs:
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 1
       - name: Cache apt packages
-        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
         with:
           packages: libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
           version: 1.0
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+      # The cache action ignores apt failures (e.g. mirror 404s) and can
+      # save/restore an empty cache, leaving clippy without glib/gtk.
+      - name: Ensure system libraries are installed
+        run: |
+          if ! pkg-config --exists glib-2.0 gtk+-3.0 webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4.1; then
+            echo "apt cache incomplete, installing packages directly"
+            sudo apt-get update
+            sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          fi
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           components: clippy
-      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           workspaces: src-tauri
           shared-key: ci-clippy
@@ -134,9 +295,680 @@ jobs:
       - name: Install npm deps + stage bridge runtime
         run: npm ci
       - name: Run clippy
-        run: cd src-tauri && cargo clippy -- -D warnings
+        run: cd src-tauri && cargo clippy --locked --all-targets -- -D warnings
+      - name: Run clippy (hi helper)
+        run: cd src-tauri/hi && cargo clippy --locked --all-targets -- -D warnings
+      - name: Run clippy (track crate)
+        run: cd src-tauri/track && cargo clippy --locked --all-targets -- -D warnings
+      - name: Run clippy (session host)
+        run: cd src-tauri/pty-host && cargo clippy --locked --all-targets -- -D warnings
+
+  # ── Rust Tests (all three OSes) ──────────────────────────────────────
+  rust-test:
+    name: Rust Tests (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 1
+      - name: Cache apt packages
+        if: runner.os == 'Linux'
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          version: 1.0
+      - name: Ensure system libraries are installed
+        if: runner.os == 'Linux'
+        run: |
+          if ! pkg-config --exists glib-2.0 gtk+-3.0 webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4.1; then
+            echo "apt cache incomplete, installing packages directly"
+            sudo apt-get update
+            sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          fi
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          workspaces: src-tauri
+          shared-key: ci-test-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Stages bridge runtime deps; the Tauri build script checks them.
+      - name: Install npm deps + stage bridge runtime
+        run: npm ci
+      - name: Build PTY helper (needed by tests on macOS)
+        if: runner.os == 'macOS'
+        working-directory: src-tauri/pty-setup
+        run: cargo build --target-dir ../target
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test --locked
+      # The prompt library's search budget: a synthetic one-million-row index,
+      # 300 mixed queries, p95 at most 50 ms (src-tauri/src/library/bench.rs).
+      # Optimised, as the app ships; Linux only (one runner is enough to catch
+      # a query plan that stops scaling).
+      - name: Library search budget (1M rows)
+        if: runner.os == 'Linux'
+        working-directory: src-tauri
+        run: cargo test --locked --release --lib library::bench -- --ignored --nocapture
+      # The launch helper that ships next to the app (src-tauri/hi): its tests
+      # run the built binary the way a Hermes terminal does, on every OS.
+      - name: Test the hi helper
+        working-directory: src-tauri/hi
+        run: cargo test --locked
+      # Feature Tracks (src-tauri/track): the files, phases, gates and land,
+      # shared by the app and hi; its tests run git in a temporary repository.
+      - name: Test the track crate
+        working-directory: src-tauri/track
+        run: cargo test --locked
+      # The session host (src-tauri/pty-host, N20): its tests run the built
+      # host and talk to it over its socket (Unix only; the Windows binary
+      # is a stub that says so).
+      - name: Test the session host
+        working-directory: src-tauri/pty-host
+        run: cargo test --locked
+
+  # ── Real-app scenarios (all three OSes) ──────────────────────────────
+  # One job per OS builds the test app (the app plus its test-only
+  # automation bridge) and uploads it; five shard jobs per OS download that
+  # one build and each run the scenarios a stable hash of the file name puts
+  # on their shard (e2e/app/ci-plan.mjs), hands-free through e2e/app/run.mjs
+  # (which skips scenarios the ledger limits to other platforms). Every job
+  # uploads its evidence for the acceptance gate. See e2e/app/harness.mjs.
+  e2e-build:
+    name: Build test app on ${{ matrix.name }}
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: linux
+          - os: windows-2022
+            name: windows
+          - os: macos-15
+            name: macos
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 1
+
+      # Where the test app and the evidence go on this runner.
+      - name: Choose the output folder
+        shell: bash
+        run: echo "HERMES_E2E_OUT=$RUNNER_TEMP/hermes-e2e" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Cache apt packages (Linux)
+        if: runner.os == 'Linux'
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xvfb xdotool
+          version: 1.0
+
+      # The cache action ignores apt failures and can restore an empty cache.
+      - name: Ensure system libraries are installed (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          if ! pkg-config --exists glib-2.0 gtk+-3.0 webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4.1 || ! command -v xvfb-run >/dev/null || ! command -v xdotool >/dev/null; then
+            echo "apt cache incomplete, installing packages directly"
+            sudo apt-get update
+            sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xvfb xdotool
+          fi
+
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - uses: swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          workspaces: src-tauri
+          shared-key: e2e-${{ matrix.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - run: npm ci
+
+      # The prompt library the app bundles (scripts/fetch-prompt-library.mjs
+      # checks every object again when it reuses the cache).
+      - name: Cache the bundled prompt library
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/hermes-library
+          key: hermes-library-${{ hashFiles('prompt-library.lock.json') }}
+
+      - name: Build the test app
+        shell: bash
+        run: node e2e/app/build.mjs
+
+      # A tarball keeps the executable bits that an artifact alone drops.
+      - name: Pack the test app
+        shell: bash
+        run: |
+          cd "$HERMES_E2E_OUT"
+          tar -czf e2e-app.tgz bin
+          ls -l e2e-app.tgz
+
+      - name: Upload the test app
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-app-${{ matrix.name }}
+          path: ${{ runner.temp }}/hermes-e2e/e2e-app.tgz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      # Scenarios that need the Rust toolchain and this job's warm target
+      # folder rather than the app (ci-plan.mjs, set "build").
+      - name: Run build-toolchain scenarios
+        shell: bash
+        env:
+          CI: "true"
+        run: |
+          export CARGO_TERM_COLOR=never
+          node e2e/app/run.mjs --ci-set build --keep-going
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-evidence-${{ matrix.name }}-build
+          path: ${{ runner.temp }}/hermes-e2e/evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  e2e-app:
+    name: Real app on ${{ matrix.platform.name }} (${{ matrix.shard }}/5)
+    needs: [changes, e2e-build]
+    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os: ubuntu-24.04
+            name: linux
+          - os: windows-2022
+            name: windows
+          - os: macos-15
+            name: macos
+        # Keep in step with the "/5" in SHARD below (and the job name).
+        shard: [1, 2, 3, 4, 5]
+    runs-on: ${{ matrix.platform.os }}
+    # Nightly and manual runs repeat terminal-echo (REPEAT, 20 by default) on
+    # the shard that holds it, which then needs well over the 60 minutes a
+    # pull request's single run fits in. (A Linux shard's single run takes
+    # about 50 minutes on a slow runner: 45 cut the last steps off. The 2.0
+    # QA scenarios took three Linux shards past 90: five shards, the longest
+    # about 60 minutes.)
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 120 || 75 }}
+    env:
+      SHARD: ${{ matrix.shard }}/5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 1
+
+      - name: Choose the output folder
+        shell: bash
+        run: echo "HERMES_E2E_OUT=$RUNNER_TEMP/hermes-e2e" >> "$GITHUB_ENV"
+
+      # Scenarios use Node's standard library only, so the repository's
+      # packages are not installed here.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src-tauri/bridge/package-lock.json
+
+      # The test app is a debug build: it runs the agent bridge from this
+      # checkout, and its self-test (N05) checks the bridge's modules exist.
+      - name: Stage the agent bridge's modules
+        shell: bash
+        run: node scripts/stage-bridge-deps.mjs
+
+      - name: Cache apt packages (Linux)
+        if: runner.os == 'Linux'
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          packages: libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xvfb xdotool
+          version: 1.0
+
+      - name: Ensure system libraries are installed (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          if ! pkg-config --exists glib-2.0 gtk+-3.0 webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4.1 || ! command -v xvfb-run >/dev/null || ! command -v xdotool >/dev/null; then
+            echo "apt cache incomplete, installing packages directly"
+            sudo apt-get update
+            sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xvfb xdotool
+          fi
+
+      # F21-review-no-repo-locale runs git under a German locale; the runner
+      # image only has C and en_US.
+      - name: German locale for the locale scenario (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo locale-gen de_DE.UTF-8
+          locale -a
+
+      - name: Download the test app
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: e2e-app-${{ matrix.platform.name }}
+          path: ${{ runner.temp }}/hermes-e2e
+
+      - name: Unpack the test app
+        shell: bash
+        run: |
+          cd "$HERMES_E2E_OUT"
+          tar -xzf e2e-app.tgz
+          ls -l bin
+
+      # One run.mjs invocation per shard: its exit code is this shard's
+      # result, and its closing summary names every scenario that failed.
+      # terminal-echo runs REPEAT times (once per change, 20 times nightly).
+      - name: Run scenarios (Linux, virtual display)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CI: "true"
+          # WebKitGTK on a runner without a GPU: draw on the CPU.
+          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+          WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+          # No accessibility bus on a bare runner: do not look for one.
+          NO_AT_BRIDGE: "1"
+          GTK_A11Y: "none"
+        # A session bus of its own: without one every app start waited about
+        # 30 s on Linux before its window came up.
+        run: |
+          dbus-run-session -- xvfb-run -a -s "-screen 0 1600x1000x24" node e2e/app/run.mjs --ci-set shards --shard "$SHARD" --keep-going --repeat-scenario "terminal-echo.mjs=$REPEAT" --repeat-scenario "F24-fleet-perf.mjs=$FLEET_REPEAT" ${SCENARIO_REPEAT:+--repeat-scenario "$SCENARIO_REPEAT"}
+
+      - name: Run scenarios
+        if: runner.os != 'Linux'
+        shell: bash
+        env:
+          CI: "true"
+        run: |
+          node e2e/app/run.mjs --ci-set shards --shard "$SHARD" --keep-going --repeat-scenario "terminal-echo.mjs=$REPEAT" --repeat-scenario "F24-fleet-perf.mjs=$FLEET_REPEAT" ${SCENARIO_REPEAT:+--repeat-scenario "$SCENARIO_REPEAT"}
+
+      # F05: a focused terminal keeps Ctrl+letter. UI-focus-ring: Tab in
+      # Settings draws the focus ring for real. Real OS key presses
+      # (xdotool / SendInput) go through the native menu and the webview.
+      # Each runs on the shard the hash puts it on (ci-plan.mjs "keys").
+      - name: Terminal keys with real key presses (Linux, virtual display)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        shell: bash
+        env:
+          CI: "true"
+          HERMES_E2E_OS_KEYS: "1"
+          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+          WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+        run: |
+          dbus-run-session -- xvfb-run -a -s "-screen 0 1600x1000x24" node e2e/app/run.mjs --ci-set keys --shard "$SHARD" ${SCENARIO_REPEAT:+--repeat-scenario "$SCENARIO_REPEAT"}
+
+      - name: Terminal keys with real key presses (Windows)
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        shell: bash
+        env:
+          CI: "true"
+          HERMES_E2E_OS_KEYS: "1"
+        run: |
+          node e2e/app/run.mjs --ci-set keys --shard "$SHARD" ${SCENARIO_REPEAT:+--repeat-scenario "$SCENARIO_REPEAT"}
+
+      - name: Terminal keys (macOS)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        shell: bash
+        env:
+          CI: "true"
+        run: |
+          node e2e/app/run.mjs --ci-set keys --shard "$SHARD" ${SCENARIO_REPEAT:+--repeat-scenario "$SCENARIO_REPEAT"}
+
+      # N17: fast worktrees. Copy-on-write clones need one volume that can
+      # share blocks for both the repo and the app's data: the temp folder on
+      # macOS (APFS), an XFS image on Linux, a ReFS disk on Windows. Both are
+      # sparse and 20 GB, above the 10 GB the disk guard (same flag) needs.
+      # The N17 scenarios run on the shard the hash puts them on (ci-plan.mjs).
+      - name: Copy-on-write volume for fast worktrees (Linux, XFS)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          command -v mkfs.xfs >/dev/null || { sudo apt-get update && sudo apt-get install -y xfsprogs; }
+          truncate -s 20G "$RUNNER_TEMP/cow.img"
+          mkfs.xfs -q -m reflink=1 "$RUNNER_TEMP/cow.img"
+          sudo mkdir -p /mnt/hermes-cow
+          sudo mount -o loop "$RUNNER_TEMP/cow.img" /mnt/hermes-cow
+          sudo chown "$(id -u):$(id -g)" /mnt/hermes-cow
+          echo "HERMES_E2E_COW_DIR=/mnt/hermes-cow" >> "$GITHUB_ENV"
+
+      - name: Copy-on-write volume for fast worktrees (Windows, ReFS)
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $vhd = Join-Path $env:RUNNER_TEMP "cow.vhdx"
+          $script = Join-Path $env:RUNNER_TEMP "cow-diskpart.txt"
+          @(
+            "create vdisk file=`"$vhd`" maximum=20480 type=expandable",
+            "select vdisk file=`"$vhd`"",
+            "attach vdisk",
+            "create partition primary",
+            "format fs=refs quick label=HermesCow",
+            "assign letter=R"
+          ) | Set-Content -Path $script -Encoding ascii
+          diskpart /s $script
+          if ($LASTEXITCODE -ne 0) { throw "diskpart failed with $LASTEXITCODE" }
+          New-Item -ItemType Directory -Path R:\cow -Force | Out-Null
+          fsutil fsinfo volumeinfo R:
+          "HERMES_E2E_COW_DIR=R:\cow" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Fast worktrees (Linux, virtual display)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        shell: bash
+        env:
+          CI: "true"
+          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+          WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+          NO_AT_BRIDGE: "1"
+          GTK_A11Y: "none"
+        run: |
+          dbus-run-session -- xvfb-run -a -s "-screen 0 1600x1000x24" node e2e/app/run.mjs --ci-set cow --shard "$SHARD" --keep-going ${SCENARIO_REPEAT:+--repeat-scenario "$SCENARIO_REPEAT"}
+
+      - name: Fast worktrees
+        if: ${{ !cancelled() && runner.os != 'Linux' }}
+        shell: bash
+        env:
+          CI: "true"
+        run: |
+          node e2e/app/run.mjs --ci-set cow --shard "$SHARD" --keep-going ${SCENARIO_REPEAT:+--repeat-scenario "$SCENARIO_REPEAT"}
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-evidence-${{ matrix.platform.name }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/hermes-e2e/evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ── Installers: AppImage self-update (Linux), winget (Windows) ───────
+  # F25. Linux builds two real AppImages of the test app (0.9.0 and 0.9.1,
+  # signed with a throwaway updater key), installs the old one, and lets it
+  # update itself through the UI; a sabotaged run (wrong signature) must
+  # fail. Windows installs the newest release through the winget manifests
+  # the release workflow generates. Evidence joins the acceptance gate.
+  # Two full AppImage builds are slow, so on pull requests this runs only
+  # when something that goes into an installer changed (`packaging`).
+  e2e-installers:
+    name: Installers on ${{ matrix.name }}
+    needs: changes
+    if: needs.changes.outputs.packaging == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The release builds Linux installers on 22.04 (glibc floor).
+          - os: ubuntu-22.04
+            name: linux
+          # Newer image: ships winget (ensure-winget.ps1 installs it otherwise).
+          - os: windows-2025
+            name: windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 1
+
+      - name: Choose the output folder
+        shell: bash
+        run: echo "HERMES_E2E_OUT=$RUNNER_TEMP/hermes-e2e" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install system libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xvfb libfuse2 file
+
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        if: runner.os == 'Linux'
+
+      - uses: swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        if: runner.os == 'Linux'
+        with:
+          workspaces: src-tauri
+          shared-key: e2e-appimage
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install npm deps + stage bridge runtime (Linux)
+        if: runner.os == 'Linux'
+        run: npm ci
+
+      - name: Build the old and new test AppImages
+        if: runner.os == 'Linux'
+        run: node e2e/app/build-appimage.mjs
+
+      - name: AppImage installs, self-tests and updates itself (virtual display)
+        if: runner.os == 'Linux'
+        env:
+          CI: "true"
+          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+          WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+          NO_AT_BRIDGE: "1"
+          GTK_A11Y: "none"
+        run: dbus-run-session -- xvfb-run -a -s "-screen 0 1600x1000x24" node e2e/app/run.mjs F25-appimage-update.mjs
+
+      # Negative control: the same scenario, served an update signed for
+      # another file, must FAIL. Its evidence stays out of the gate's results.
+      - name: Negative control — a wrongly signed update fails the scenario
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        env:
+          CI: "true"
+          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+          WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+          NO_AT_BRIDGE: "1"
+          GTK_A11Y: "none"
+          HERMES_E2E_F25_SABOTAGE: "1"
+        run: |
+          export HERMES_E2E_EVIDENCE="$RUNNER_TEMP/hermes-e2e/negative-control/F25-appimage-update"
+          if dbus-run-session -- xvfb-run -a -s "-screen 0 1600x1000x24" node e2e/app/scenarios/F25-appimage-update.mjs; then
+            echo "::error::the sabotaged update was installed — the scenario cannot tell a bad update from a good one"; exit 1
+          fi
+          grep -q "the update downloaded and its signature verified (error)" "$HERMES_E2E_EVIDENCE/scenario.log"
+          grep -q '"status": "fail"' "$HERMES_E2E_EVIDENCE/result.json"
+          echo "negative control: the scenario failed on the wrongly signed update, as it must"
+
+      - name: Make sure winget is available (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/ci/ensure-winget.ps1
+
+      # The installers are unsigned (no Windows signing identity yet). winget
+      # marks its download as coming from the internet, and Windows then
+      # checks an unsigned program before starting it (SmartScreen, and the
+      # "publisher could not be verified" prompt). On a runner nobody can
+      # answer, so the checks are switched off there. A person installing an
+      # unsigned build sees those prompts; code signing (F25-1) removes them.
+      - name: Let unsigned installers start on the runner (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\System" /v EnableSmartScreen /t REG_DWORD /d 0 /f
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" /v SmartScreenEnabled /t REG_SZ /d Off /f
+          reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Associations" /v LowRiskFileTypes /t REG_SZ /d ".exe;.msi" /f
+          reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3" /v 1806 /t REG_DWORD /d 0 /f
+          echo "SEE_MASK_NOZONECHECKS=1" >> $env:GITHUB_ENV
+
+      - name: winget installs Hermes from the generated manifests (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          CI: "true"
+          GH_TOKEN: ${{ github.token }}
+        run: node e2e/app/run.mjs F25-winget-install.mjs
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-evidence-installers-${{ matrix.name }}
+          path: ${{ runner.temp }}/hermes-e2e/evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload negative-control evidence
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: f25-negative-control-${{ matrix.name }}
+          path: ${{ runner.temp }}/hermes-e2e/negative-control
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ── Acceptance ledger ────────────────────────────────────────────────
+  # Every feature marked shipped in e2e/acceptance.yml needs a green
+  # scenario on every OS it must run on. Runs even when a scenario runner
+  # failed, so the report says which feature lost its proof.
+  acceptance:
+    name: Acceptance gate
+    needs: [changes, e2e-build, e2e-app, e2e-installers]
+    if: >-
+      always()
+      && needs.changes.result == 'success'
+      && (needs.changes.outputs.frontend == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 22
+
+      - name: Download the evidence of every runner
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: e2e-evidence-*
+          path: ${{ runner.temp }}/evidence
+
+      # A pull request that does not touch packaging skips the installer job
+      # (see `changes`), so its scenarios are not applicable to that run.
+      # Anywhere else (main, the merge queue, the nightly) the installers
+      # always run and their results are required.
+      - name: Every shipped feature has a green scenario on every OS
+        env:
+          EVENT: ${{ github.event_name }}
+          INSTALLERS: ${{ needs.e2e-installers.result }}
+          EVIDENCE: ${{ runner.temp }}/evidence
+        shell: bash
+        run: |
+          skipped=()
+          if [ "$EVENT" = "pull_request" ] && [ "$INSTALLERS" = "skipped" ]; then
+            skipped+=(--skipped-job e2e-installers)
+          fi
+          node e2e/acceptance-check.mjs --results "$EVIDENCE" "${skipped[@]}"
+
+  # ── Privacy: this repository is public ───────────────────────────────
+  # Runs on every change. Fails on secrets (gitleaks over the new commits)
+  # and on added personal home paths, non-synthetic email addresses, or new
+  # binary/data files outside the asset directories
+  # (scripts/privacy-check.mjs, allowlist in .github/privacy-allowlist.json).
+  privacy:
+    name: Privacy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 22
+      - name: Work out which commits to check
+        id: range
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          MQ_BASE: ${{ github.event.merge_group.base_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          case "$EVENT" in
+            pull_request) base="$PR_BASE" ;;
+            merge_group)  base="$MQ_BASE" ;;
+            *)            base="$PUSH_BEFORE" ;;
+          esac
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "::warning::base commit '$base' is not available; checking only the last commit"
+            base="$(git rev-parse HEAD~1)"
+          fi
+          echo "Checking $base..$(git rev-parse HEAD)"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+      - name: Secrets in the new commits (gitleaks)
+        env:
+          BASE: ${{ steps.range.outputs.base }}
+        run: |
+          "$RUNNER_TEMP/gitleaks" git --log-opts="$BASE..HEAD" --redact --no-banner --exit-code 1 .
+      - name: Personal paths, email addresses and data files
+        env:
+          BASE: ${{ steps.range.outputs.base }}
+        run: node scripts/privacy-check.mjs --base "$BASE"
+
+  # ── Gate: the one required check ─────────────────────────────────────
+  # Always runs. Fails when any job it needs failed, was cancelled, or was
+  # skipped although its inputs changed. Make only this check required.
+  gate:
+    name: gate
+    if: always()
+    needs: [changes, frontend, rust-fmt, rust-clippy, rust-test, e2e-build, e2e-app, e2e-installers, acceptance, privacy, instance-identifiers, actionlint]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            scripts/ci-gate.mjs
+            .github/workflows/ci.yml
+          sparse-checkout-cone-mode: false
+      - name: Every job is gated, with the skip rules the gate expects
+        run: node scripts/ci-gate.mjs --workflow .github/workflows/ci.yml
+      - name: Check every required job
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: node scripts/ci-gate.mjs
 
   # ── Rust Security Audit (main only) ─────────────────────────────────
+  # Not in the gate (see UNGATED in scripts/ci-gate.mjs): it runs after merge,
+  # and a newly published advisory must not block unrelated pull requests.
   rust-audit:
     name: Rust Security Audit
     needs: changes
@@ -148,13 +980,13 @@ jobs:
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
       - name: Cache cargo-audit binary
         id: cache-audit
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-audit
           key: cargo-audit-${{ runner.os }}-${{ runner.arch }}

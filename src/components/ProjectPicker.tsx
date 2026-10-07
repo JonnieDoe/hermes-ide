@@ -1,8 +1,11 @@
 import "../styles/components/ProjectPicker.css";
+import { Button, CloseButton, IconButton, Input } from "./ui";
+import { translate } from "../i18n/registry";
+import { CloseGlyph } from "./ui/icons";
 import { useState, useEffect, useRef, useMemo } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useSessionProjects } from "../hooks/useSessionProjects";
-import { getProjectsOrdered, createProject, deleteProject, nudgeProjectContext, setProjectWorktreePath } from "../api/projects";
+import { getProjectsOrdered, createProject, deleteProject, nudgeProjectContext } from "../api/projects";
 import type { ProjectOrdered } from "../types/project";
 import { LANG_COLORS } from "../utils/langColors";
 
@@ -14,7 +17,6 @@ interface ProjectPickerProps {
 export function ProjectPicker({ sessionId, onClose }: ProjectPickerProps) {
   const { projects: attachedProjects, attach, detach } = useSessionProjects(sessionId);
   const [allProjects, setAllProjects] = useState<ProjectOrdered[]>([]);
-  const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [scanPath, setScanPath] = useState("");
   const [scanning, setScanning] = useState(false);
@@ -137,14 +139,13 @@ export function ProjectPicker({ sessionId, onClose }: ProjectPickerProps) {
           <span className="project-picker-count">
             {attachedProjects.length} attached
           </span>
-          <button className="close-btn settings-close" onClick={handleClose} aria-label="Close">
-            &times;
-          </button>
+          <CloseButton className="project-picker-close" onClick={handleClose} label={translate("common.close")} />
         </div>
 
-        <input
+        <Input
           ref={inputRef}
-          className="command-palette-input"
+          className="project-picker-filter"
+          aria-label="Filter projects"
           placeholder="Filter projects..."
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -184,30 +185,6 @@ export function ProjectPicker({ sessionId, onClose }: ProjectPickerProps) {
                   </span>
                 </div>
                 <div className="project-picker-path">{shortPath(project.path)}</div>
-                {editingProjectId === project.id ? (
-                  <div className="project-picker-edit-worktree" onClick={(e) => e.stopPropagation()}>
-                    <input
-                      className="project-picker-worktree-input"
-                      placeholder="Custom worktree base path..."
-                      defaultValue={project.worktree_base_path || ""}
-                      onBlur={(e) => {
-                        const newPath = e.target.value.trim() || null;
-                        if (newPath !== project.worktree_base_path) {
-                          setProjectWorktreePath(project.id, newPath).catch(console.error);
-                          setAllProjects(prev => prev.map(p => p.id === project.id ? { ...p, worktree_base_path: newPath } : p));
-                        }
-                        setEditingProjectId(null);
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") e.currentTarget.blur();
-                        if (e.key === "Escape") setEditingProjectId(null);
-                      }}
-                      autoFocus
-                    />
-                  </div>
-                ) : project.worktree_base_path ? (
-                  <div className="project-picker-worktree-label">WT: {shortPath(project.worktree_base_path)}</div>
-                ) : null}
                 {"path_exists" in project && !project.path_exists && (
                   <div className="project-picker-missing-label">Folder not found</div>
                 )}
@@ -229,64 +206,55 @@ export function ProjectPicker({ sessionId, onClose }: ProjectPickerProps) {
                   ))}
                 </div>
               </div>
-              <button
-                className="project-picker-settings-btn"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setEditingProjectId(project.id);
-                }}
-                title="Project settings"
-              >
-                <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5">
-                  <path d="M8 10a2 2 0 100-4 2 2 0 000 4z" />
-                  <path d="M2.5 8a5.5 5.5 0 1111 0 5.5 5.5 0 01-11 0z" />
-                </svg>
-              </button>
-              <button
+              <IconButton
+                size="sm"
                 className="project-picker-delete"
+                label={`Delete project ${project.name}`}
+                title="Delete project"
+                icon={<CloseGlyph />}
                 onClick={(e) => {
                   e.stopPropagation();
                   deleteProject(project.id).then(() => {
                     setAllProjects((prev) => prev.filter((r) => r.id !== project.id));
                   }).catch(console.error);
                 }}
-                title="Delete project"
-              >
-                x
-              </button>
+              />
             </div>
           ))}
         </div>
 
         <div className="project-picker-footer">
-          <input
-            className="workspace-scan-input"
+          <Input
+            code
+            className="project-picker-scan-input"
+            aria-label="Folder to scan"
             placeholder="Path or browse..."
             value={scanPath}
             onChange={(e) => setScanPath(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter") handleScanNew(); }}
           />
-          <button
-            className="workspace-scan-btn"
+          <Button
+            className="project-picker-browse"
             onClick={handleBrowse}
             disabled={scanning}
             title="Browse for folder"
           >
             {scanning ? "..." : "Browse"}
-          </button>
-          <button
-            className="workspace-scan-btn"
+          </Button>
+          <Button
+            className="project-picker-scan"
             onClick={handleScanNew}
             disabled={scanning || !scanPath.trim()}
           >
             Scan
-          </button>
-          <button
+          </Button>
+          <Button
+            variant="primary"
             className="project-picker-done"
             onClick={handleClose}
           >
             Done
-          </button>
+          </Button>
         </div>
       </div>
     </div>

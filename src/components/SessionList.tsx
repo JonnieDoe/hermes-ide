@@ -1,19 +1,39 @@
 import "../styles/components/SessionList.css";
 import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import { SessionData } from "../state/SessionContext";
+import { rememberUserLabel } from "../attention/userLabels";
 import { updateSessionGroup, updateSessionLabel, updateSessionDescription, updateSessionColor, sshListTmuxWindows, sshTmuxSelectWindow, sshTmuxNewWindow, sshTmuxRenameWindow } from "../api/sessions";
+import { deleteSessionData } from "../api/context";
 import type { TmuxWindowEntry } from "../types/session";
 import { encodeSessionDrag, setDraggedSession, getDraggedSession } from "./SplitPane";
 // Note: HTML5 drag events don't fire in Tauri (dragDropEnabled: true intercepts them).
 // We use getCurrentWebview().onDragDropEvent() with position-based hit testing instead.
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useContextMenu, buildSessionMenuItems, buildEmptyAreaMenuItems } from "../hooks/useContextMenu";
-import { fmt } from "../utils/platform";
+import { shortcutLabel } from "../utils/keymap";
 import { isHermesWorktreePath } from "../utils/worktree";
 import { useSessionGitSummary } from "../hooks/useSessionGitSummary";
 import { useRemoteSshInfo } from "../hooks/useRemoteSshInfo";
 import { PortForwardsPanel } from "./PortForwardsPanel";
 import type { PluginSessionActionContribution } from "../plugins/types";
+import { useI18n } from "../i18n/I18nProvider";
+import { useSessionModel } from "../agent/useSessionModel";
+import { agentDisplayName } from "../catalog/agentCatalog";
+import { AgentStatusTag } from "./AgentStatusTag";
+import { isAgentStatusEnabled } from "../agent/status/flag";
+import { useSessionEvents } from "../agent/contract/sessionEventStore";
+import { isFeatureFlagEnabled } from "../featureFlags";
+import { ProjectSpend, SessionOverlapBadge, SessionSpendChip } from "../fleet/FleetRowBadges";
+import { spendMember } from "../fleet/useReportedTotals";
+import { TaskQueueSection } from "../fleet/TaskQueueSection";
+import { SessionLimitTag } from "./SessionLimitTag";
+import { HandoffDialog } from "./HandoffDialog";
+import { canHandOff, nestUnderParents, type HandoffKind } from "../limits/handoff";
+import { SessionContextGauge, SessionMemoryTag } from "./SessionFleetTags";
+import { Badge, Counter } from "./ui/Badge";
+import { Button, CloseButton, IconButton } from "./ui/Button";
+import { Chip } from "./ui/Chip";
+import { ListRow } from "./ui/ListRow";
 
 export const SESSION_COLORS = [
   "#58a6ff", "#3fb950", "#bc8cff", "#f78166",
@@ -22,9 +42,112 @@ export const SESSION_COLORS = [
 ];
 
 /** Returns the close-button tooltip text, mode-conditional.
- *  Exported as a tiny pure function so unit tests can cover both branches. */
-export function sessionCloseTitle(mode: "agent" | "terminal" | undefined): string {
-  return mode === "agent" ? "End conversation" : "Close session";
+ *  Exported as a tiny pure function so unit tests can cover both branches.
+ *  Takes the i18n `t` so the labels track the active language pack. */
+export function sessionCloseTitle(
+  mode: "agent" | "terminal" | undefined,
+  t: (key: string) => string,
+): string {
+  return mode === "agent" ? t("close.agent.confirm") : t("close.terminal.confirm");
+}
+
+/** The row's × names the session it closes ("Close session api: fix login"), so a
+ *  screen reader tells the rows' buttons apart. */
+export function sessionCloseLabel(
+  mode: "agent" | "terminal" | undefined,
+  label: string,
+  t: (key: string, values?: Record<string, string | number>) => string,
+): string {
+  const name = label.trim();
+  if (!name) return sessionCloseTitle(mode, t);
+  return mode === "agent" ? t("close.agent.named", { label: name }) : t("close.terminal.named", { label: name });
+}
+
+/** A line cut short at the right carries all of its text as its tooltip (read when the pointer arrives). */
+export function fillCutLineTitle(e: { currentTarget: HTMLElement }): void {
+  const el = e.currentTarget;
+  const cut = el.scrollWidth > el.clientWidth + 1 || [...el.children].some((c) => c.scrollWidth > c.clientWidth + 1);
+  if (cut) el.title = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+  else el.removeAttribute("title");
+}
+
+/** "Delete Session Data" confirm + call, pulled out of the context-menu
+ *  handler so the confirm-gating logic is unit-testable without rendering
+ *  the whole session list. Deletes only on an explicit yes. */
+export function confirmAndDeleteSessionData(
+  sessionId: string,
+  message: string,
+  confirm: (message: string) => boolean,
+  deleteSessionData: (sessionId: string) => Promise<void>,
+): void {
+  if (!confirm(message)) return;
+  deleteSessionData(sessionId).catch(console.error);
+}
+
+/** Session-card agent tag (#317): terminal mode shows the detected agent plus
+ *  its model ("Claude Code · opus"), or the name given to a Custom agent;
+ *  agent mode shows the active model. */
+export function SessionAgentTag({ session }: { session: SessionData }) {
+  const model = useSessionModel(session);
+  const name = agentDisplayName(session) ?? undefined;
+  const label = name && model ? `${name} · ${model}` : name ?? model;
+  return label ? <span className="session-agent-tag">{label}</span> : null;
+}
+
+/** F08: read-only model / permission-mode chips for terminal sessions,
+ *  sourced only from the agent's own signals (the C0 `identity`
+ *  SessionEvent — docs/adr/004-2.0-contracts.md #2), never a heuristic.
+ *  Hidden field-by-field when the agent hasn't reported it: an unknown
+ *  model or permission mode shows nothing, it never guesses. Terminal-mode
+ *  only — agent mode already shows its model in the composer header. */
+export function SessionIdentityChips({ session }: { session: SessionData }) {
+  const { t } = useI18n();
+  const { identity } = useSessionEvents(session.id);
+  if (session.mode !== "terminal") return null;
+  // 2.0: until the agent reports the model it runs, the model it was
+  // launched with, marked "requested" (a CLI can still pick another).
+  const launch = session.agent_launch && !session.agent_launch.login ? session.agent_launch : null;
+  const requested = !identity.model && launch?.modelId ? (launch.effort ? `${launch.modelId} · ${launch.effort}` : launch.modelId) : null;
+  if (!identity.model && !requested && !identity.permissionMode) return null;
+  // Its own row, not squeezed into the meta row next to the phase tag and
+  // age: a real model id ("vendor-model-4-5-20250929") needs the row's
+  // full width to stay readable at the default sidebar width.
+  return (
+    <div className="session-item-identity-row" data-testid="session-identity-row">
+      {identity.model && (
+        <Chip
+          size="sm"
+          className="session-model-chip"
+          data-testid="session-model-chip"
+          data-source="reported"
+          title={t("sessions.modelChipLabel", { model: identity.model })}
+        >
+          {identity.model}
+        </Chip>
+      )}
+      {requested && (
+        <Chip
+          size="sm"
+          className="session-model-chip session-model-chip-requested"
+          data-testid="session-model-chip"
+          data-source="requested"
+          title={t("sessions.modelRequestedTitle", { model: requested })}
+        >
+          {t("sessions.modelRequested", { model: requested })}
+        </Chip>
+      )}
+      {identity.permissionMode && (
+        <Chip
+          size="sm"
+          className="session-permission-chip"
+          data-testid="session-permission-chip"
+          title={t("sessions.permissionModeChipLabel", { mode: identity.permissionMode })}
+        >
+          {identity.permissionMode}
+        </Chip>
+      )}
+    </div>
+  );
 }
 
 export type SessionView = "git" | "files" | "search" | null;
@@ -41,6 +164,8 @@ interface SessionListProps {
   onViewChange: (view: SessionView) => void;
   /** Number of git changes for the active session */
   gitBadge?: number;
+  /** F21: the git button opens the Review Desk when its flag is on. */
+  gitViewTitle?: string;
   pluginSessionActions?: (PluginSessionActionContribution & { pluginId: string; badge?: { text?: string; count?: number } })[];
   activePluginPanel?: string | null;
   onPluginActionClick?: (actionId: string, panelId: string) => void;
@@ -183,7 +308,7 @@ function TmuxWindowTabs({ session }: { session: SessionData }) {
 
     let cancelled = false;
     const refresh = () => {
-      sshListTmuxWindows(info.host, info.tmux_session!, info.port, info.user)
+      sshListTmuxWindows(info.host, info.tmux_session!, info.port, info.user, info.jump_host)
         .then((w) => { if (!cancelled) setWindows(w); })
         .catch(() => {});
     };
@@ -192,20 +317,20 @@ function TmuxWindowTabs({ session }: { session: SessionData }) {
     refresh();
     const interval = setInterval(refresh, 5000);
     return () => { cancelled = true; clearInterval(interval); };
-  }, [info?.host, info?.port, info?.user, info?.tmux_session, session.phase]);
+  }, [info?.host, info?.port, info?.user, info?.jump_host, info?.tmux_session, session.phase]);
 
   if (!info?.tmux_session || session.phase === "destroyed" || windows.length === 0) return null;
 
   const handleSelectWindow = (index: number) => {
     // Optimistic: mark the clicked window as active immediately
     setWindows((prev) => prev.map((w) => ({ ...w, active: w.index === index })));
-    sshTmuxSelectWindow(info.host, info.tmux_session!, index, info.port, info.user)
+    sshTmuxSelectWindow(info.host, info.tmux_session!, index, info.port, info.user, info.jump_host)
       .then(() => refreshRef.current?.())
       .catch((err) => { console.warn("[TmuxWindows] select failed:", err); refreshRef.current?.(); });
   };
 
   const handleNewWindow = () => {
-    sshTmuxNewWindow(info.host, info.tmux_session!, info.port, info.user)
+    sshTmuxNewWindow(info.host, info.tmux_session!, info.port, info.user, info.jump_host)
       .then(() => refreshRef.current?.())
       .catch((err) => console.warn("[TmuxWindows] new window failed:", err));
   };
@@ -215,7 +340,7 @@ function TmuxWindowTabs({ session }: { session: SessionData }) {
     // Optimistic update
     setWindows((prev) => prev.map((w) => w.index === index ? { ...w, name: name.trim() } : w));
     setRenamingIndex(null);
-    sshTmuxRenameWindow(info.host, info.tmux_session!, index, name.trim(), info.port, info.user)
+    sshTmuxRenameWindow(info.host, info.tmux_session!, index, name.trim(), info.port, info.user, info.jump_host)
       .then(() => refreshRef.current?.())
       .catch((err) => { console.warn("[TmuxWindows] rename failed:", err); refreshRef.current?.(); });
   };
@@ -295,6 +420,7 @@ function InlineNameEditor({ sessionId, label, triggerEdit, onTriggered }: { sess
   const commit = useCallback(() => {
     setEditing(false);
     if (value.trim() && value.trim() !== label) {
+      rememberUserLabel(sessionId, value.trim());
       updateSessionLabel(sessionId, value.trim()).catch(console.error);
     }
   }, [sessionId, label, value]);
@@ -334,6 +460,7 @@ function InlineNameEditor({ sessionId, label, triggerEdit, onTriggered }: { sess
 
 /** Inline editable description — click to edit, shows placeholder when empty on active session. */
 function InlineDescriptionEditor({ sessionId, description, isActive }: { sessionId: string; description: string; isActive: boolean }) {
+  const { t } = useI18n();
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState(description);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -362,7 +489,7 @@ function InlineDescriptionEditor({ sessionId, description, isActive }: { session
         className="session-item-description-input"
         value={value}
         autoFocus
-        placeholder="Add description..."
+        placeholder={t("sessions.addDescription")}
         maxLength={120}
         rows={1}
         onChange={(e) => {
@@ -401,7 +528,7 @@ function InlineDescriptionEditor({ sessionId, description, isActive }: { session
         className="session-item-description session-item-description-placeholder"
         onClick={(e) => { e.stopPropagation(); setEditing(true); setValue(""); }}
       >
-        Add description...
+        {t("sessions.addDescription")}
       </div>
     );
   }
@@ -558,7 +685,10 @@ function InlineProjectNameEditor({
   );
 }
 
-export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNewSession, onReconnect, activeView, onViewChange, gitBadge, pluginSessionActions, activePluginPanel, onPluginActionClick }: SessionListProps) {
+export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNewSession, onReconnect, activeView, onViewChange, gitBadge, gitViewTitle, pluginSessionActions, activePluginPanel, onPluginActionClick }: SessionListProps) {
+  const { t } = useI18n();
+  // Flags are read once at startup, so this never changes while mounted.
+  const agentStatus = isAgentStatusEnabled();
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
   const [renameSessionId, setRenameSessionId] = useState<string | null>(null);
   const [newGroupSessionId, setNewGroupSessionId] = useState<string | null>(null);
@@ -576,6 +706,10 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
 
   // Track which session was right-clicked for action handlers
   const contextSessionRef = useRef<string | null>(null);
+  // N19: the handoff dialog (continue / duplicate in another agent). It
+  // passes the task as a launch argument, so it needs the launch helper.
+  const handoffEnabled = isFeatureFlagEnabled("launchHelper");
+  const [handoff, setHandoff] = useState<{ sessionId: string; kind: HandoffKind } | null>(null);
 
   const { grouped, allGroups } = useMemo(() => {
     const map = new Map<string | null, SessionData[]>();
@@ -585,9 +719,10 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
       list.push(session);
       map.set(group, list);
     }
-    // Sort within each group: destroyed at bottom
+    // Sort within each group: destroyed at bottom; a handed-off session
+    // (N19) right under the session it came from.
     for (const [key, list] of map) {
-      map.set(key, sortSessions(list));
+      map.set(key, nestUnderParents(sortSessions(list)));
     }
     // Include empty projects (no sessions yet)
     for (const ep of emptyProjects) {
@@ -674,11 +809,15 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
       handleMoveToProject(sid, null);
     } else if (actionId === "session.close") {
       onClose(sid);
+    } else if (actionId === "session.delete-data") {
+      confirmAndDeleteSessionData(sid, t("session.deleteData.confirm"), window.confirm.bind(window), deleteSessionData);
+    } else if (actionId === "session.handoff-continue" || actionId === "session.handoff-duplicate") {
+      setHandoff({ sessionId: sid, kind: actionId === "session.handoff-continue" ? "continue" : "duplicate" });
     } else if (actionId.startsWith("session.set-group.")) {
       const group = actionId.replace("session.set-group.", "");
       handleMoveToProject(sid, group);
     }
-  }, [onClose, handleMoveToProject]);
+  }, [onClose, handleMoveToProject, t]);
 
   const { showMenu } = useContextMenu(handleContextAction);
 
@@ -697,9 +836,12 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
     const items = buildSessionMenuItems(
       { id: session.id, group: session.group || null, phase: session.phase },
       allGroups,
+      handoffEnabled && canHandOff(session)
+        ? { continueLabel: t("handoff.continueMenu"), duplicateLabel: t("handoff.duplicateMenu") }
+        : undefined,
     );
     showMenu(e, items);
-  }, [sessions, allGroups, showMenu]);
+  }, [sessions, allGroups, showMenu, handoffEnabled, t]);
 
   const handleEmptyAreaContextMenu = useCallback((e: React.MouseEvent) => {
     showEmptyMenu(e, buildEmptyAreaMenuItems("sidebar"));
@@ -851,16 +993,32 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
     onViewChange(activeView === view ? null : view);
   }, [activeView, onViewChange]);
 
+  // 2.0 fleet controls (flag, read once at startup): the spend from the
+  // sessions' usage events (the agent's own cost, or Hermes's estimate from
+  // its transcript, marked), "n/a" otherwise, overlap badges and the task
+  // queue. With it on, the project headers add up those same numbers, never
+  // the terminal analyzer's.
+  const fleetOn = isFeatureFlagEnabled("fleetControls");
+  const labelOf = (id: string) => sessions.find((s) => s.id === id)?.label ?? id;
+
   const renderSession = (session: SessionData) => {
     const isActive = session.id === activeSessionId;
     const shouldTriggerRename = renameSessionId === session.id;
     const isLinkedWorktree = isHermesWorktreePath(session.working_directory);
+    const nested = !!session.parent_session_id && sessions.some((s) => s.id === session.parent_session_id);
     return (
-      <div key={session.id} className={`session-item-wrapper${isActive ? " session-item-wrapper-active" : ""}`}>
+      <ListRow
+        key={session.id}
+        current={isActive}
+        className={`session-item-wrapper${isActive ? " session-item-wrapper-active" : ""}${nested ? " session-item-wrapper-nested" : ""}`}
+        data-parent-session-id={nested ? session.parent_session_id ?? undefined : undefined}
+      >
         <SessionItemBranchAccent sessionId={session.id} isDestroyed={session.phase === "destroyed"} workingDirectory={session.working_directory} />
         <div
           className={`session-item ${isActive ? "session-item-active" : ""} ${session.phase === "destroyed" ? "session-item-destroyed" : ""}`}
           data-phase={session.phase}
+          data-session-item-id={session.id}
+          data-startup={session.agent_startup?.state ?? undefined}
           draggable={session.phase !== "destroyed"}
           onDragStart={(e) => handleDragStart(e, session)}
           onClick={() => onSelect(session.id)}
@@ -890,25 +1048,53 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
           <div className="session-item-info">
             <InlineNameEditor sessionId={session.id} label={session.label} triggerEdit={shouldTriggerRename} onTriggered={() => setRenameSessionId(null)} />
             <InlineDescriptionEditor sessionId={session.id} description={session.description} isActive={isActive} />
-            <div className="session-item-meta">
+            {/* One line: status, memory and age first, the spend last, so a
+                narrow sidebar cuts the spend (with an ellipsis) before the
+                rest; the line's tooltip then has all of it. */}
+            <div className="session-item-meta" onMouseEnter={fillCutLineTitle}>
               {session.ssh_info && (
-                <span className="session-ssh-tag">SSH{session.ssh_info.tmux_session ? ` · ${session.ssh_info.tmux_session}` : ""}</span>
+                <Badge tone="info" className="session-ssh-tag">SSH{session.ssh_info.tmux_session ? ` · ${session.ssh_info.tmux_session}` : ""}</Badge>
               )}
-              {session.detected_agent && (
-                <span className="session-agent-tag">{session.detected_agent.name}</span>
+              <SessionAgentTag session={session} />
+              {fleetOn && session.phase !== "destroyed" && <SessionOverlapBadge sessionId={session.id} labelOf={labelOf} />}
+              {agentStatus && session.phase !== "disconnected" ? (
+                <AgentStatusTag sessionId={session.id} />
+              ) : (
+                <>
+                  {session.agent_startup?.state === "waiting_at_startup_prompt" && (
+                    <span
+                      className="session-startup-tag"
+                      data-startup={session.agent_startup.state}
+                      title={session.agent_startup.detail ?? undefined}
+                    >
+                      {t("sessions.startupPrompt")}
+                    </span>
+                  )}
+                  <span className="session-phase-tag" data-phase={session.phase}>
+                    {session.phase === "busy" ? t("sessions.working") : session.phase === "needs_input" ? t("sessions.needsInput") : session.phase === "shell_ready" ? t("sessions.ready") : session.phase === "creating" ? t("sessions.starting") : session.phase === "disconnected" ? t("sessions.disconnected") : session.phase}
+                  </span>
+                </>
               )}
-              <span className="session-phase-tag" data-phase={session.phase}>
-                {session.phase === "busy" ? "working" : session.phase === "needs_input" ? "needs input" : session.phase === "shell_ready" ? "ready" : session.phase === "creating" ? "starting" : session.phase === "disconnected" ? "disconnected" : session.phase}
-              </span>
+              <SessionLimitTag
+                sessionId={session.id}
+                withStatusTag={agentStatus && session.phase !== "disconnected"}
+                onHandOff={handoffEnabled && !session.ssh_info ? () => setHandoff({ sessionId: session.id, kind: "continue" }) : undefined}
+              />
+              <SessionContextGauge sessionId={session.id} />
+              <SessionMemoryTag sessionId={session.id} />
               <span className="session-age">{timeAgo(session.last_activity_at)}</span>
+              {fleetOn && session.phase !== "destroyed" && <SessionSpendChip session={session} />}
             </div>
+            <SessionIdentityChips session={session} />
             {session.phase === "disconnected" && session.ssh_info && onReconnect && (
-              <button
+              <Button
+                variant="secondary"
+                size="sm"
                 className="session-item-reconnect-btn"
                 onClick={(e) => { e.stopPropagation(); onReconnect(session); }}
               >
-                Reconnect
-              </button>
+                {t("sessions.reconnect")}
+              </Button>
             )}
             <SessionItemGitInfo sessionId={session.id} isDestroyed={session.phase === "destroyed" || session.phase === "disconnected"} workingDirectory={session.working_directory} isSsh={!!session.ssh_info} />
             {/* Inline project tag */}
@@ -937,11 +1123,11 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
               </div>
             )}
           </div>
-          <button
+          <CloseButton
             className="session-item-close"
+            label={sessionCloseLabel(session.mode, session.label, t)}
             onClick={(e) => { e.stopPropagation(); onClose(session.id); }}
-            title={sessionCloseTitle(session.mode)}
-          >&times;</button>
+          />
         </div>
         {/* Tmux window tabs for SSH+tmux sessions */}
         {session.ssh_info?.tmux_session && isActive && (
@@ -954,7 +1140,7 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
               className={`session-move-project-option ${!session.group ? "active" : ""}`}
               onClick={() => { handleMoveToProject(session.id, null); setMoveSessionId(null); }}
             >
-              No Project
+              {t("sessions.noProject")}
             </button>
             {allGroups.map((g) => (
               <button
@@ -973,13 +1159,13 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
                 className="session-move-project-option session-move-project-new"
                 onClick={() => { setShowMoveNewInput(true); setMoveNewName(""); }}
               >
-                + New Project
+                {t("sessions.newProject")}
               </button>
             ) : (
               <input
                 className="session-move-project-input"
                 autoFocus
-                placeholder="Project name..."
+                placeholder={t("sessions.projectName")}
                 value={moveNewName}
                 onChange={(e) => setMoveNewName(e.target.value)}
                 onKeyDown={(e) => {
@@ -1008,7 +1194,7 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
         {isActive && session.phase !== "destroyed" && session.phase !== "disconnected" && session.mode !== "agent" && (
           <div className="session-subviews">
             {([
-              { id: "git" as const, title: "Git", badge: gitBadge, icon: (
+              { id: "git" as const, title: gitViewTitle ?? "Git", badge: gitBadge, icon: (
                 <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
                   <path d="M9.5 3.25a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.493 2.493 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628A2.25 2.25 0 0 1 9.5 3.25Z" />
                 </svg>
@@ -1032,41 +1218,50 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
               if (item.id === "files" && session.mode === "agent") return false;
               return true;
             }).map((item) => (
-              <button
+              <IconButton
                 key={item.id}
+                size="sm"
                 className={`session-subview-btn${activeView === item.id ? " session-subview-active" : ""}`}
+                pressed={activeView === item.id}
+                label={item.title}
                 onClick={() => toggleView(item.id)}
-                title={item.title}
-              >
-                {item.icon}
-                {item.badge != null && item.badge > 0 && (
-                  <span className="session-subview-badge">{item.badge}</span>
-                )}
-              </button>
+                icon={
+                  <>
+                    {item.icon}
+                    {item.badge != null && item.badge > 0 && <Counter className="session-subview-badge" value={item.badge} />}
+                  </>
+                }
+              />
             ))}
             {session.ssh_info && (
-              <button
+              <IconButton
+                size="sm"
                 className={`session-subview-btn${portsSessionId === session.id ? " session-subview-active" : ""}`}
+                pressed={portsSessionId === session.id}
+                label="Port Forwards"
                 onClick={() => setPortsSessionId(portsSessionId === session.id ? null : session.id)}
-                title="Port Forwards"
-              >
-                <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-                  <path d="M1.5 2.75a.75.75 0 0 0 0 1.5h12a.75.75 0 0 0 0-1.5h-12Zm0 5a.75.75 0 0 0 0 1.5h12a.75.75 0 0 0 0-1.5h-12Zm0 5a.75.75 0 0 0 0 1.5h12a.75.75 0 0 0 0-1.5h-12Z" />
-                </svg>
-              </button>
+                icon={
+                  <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+                    <path d="M1.5 2.75a.75.75 0 0 0 0 1.5h12a.75.75 0 0 0 0-1.5h-12Zm0 5a.75.75 0 0 0 0 1.5h12a.75.75 0 0 0 0-1.5h-12Zm0 5a.75.75 0 0 0 0 1.5h12a.75.75 0 0 0 0-1.5h-12Z" />
+                  </svg>
+                }
+              />
             )}
             {pluginSessionActions?.map((action) => (
-              <button
+              <IconButton
                 key={action.id}
+                size="sm"
                 className={`session-subview-btn${activePluginPanel === action.panelId ? " session-subview-active" : ""}`}
+                pressed={activePluginPanel === action.panelId}
+                label={action.name}
                 onClick={() => onPluginActionClick?.(action.id, action.panelId)}
-                title={action.name}
-              >
-                <span dangerouslySetInnerHTML={{ __html: action.icon }} />
-                {action.badge?.count ? (
-                  <span className="session-subview-badge">{action.badge.count}</span>
-                ) : null}
-              </button>
+                icon={
+                  <>
+                    <span dangerouslySetInnerHTML={{ __html: action.icon }} />
+                    {action.badge?.count ? <Counter className="session-subview-badge" value={action.badge.count} /> : null}
+                  </>
+                }
+              />
             ))}
           </div>
         )}
@@ -1074,7 +1269,7 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
         {portsSessionId === session.id && session.ssh_info && (
           <PortForwardsPanel sessionId={session.id} onClose={() => setPortsSessionId(null)} />
         )}
-      </div>
+      </ListRow>
     );
   };
 
@@ -1082,18 +1277,19 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
   return (
     <div className="session-list">
       <div className="session-list-header">
-        <span className="session-list-title">SESSIONS</span>
+        <span className="session-list-title">{t("sessions.title")}</span>
       </div>
       <div className="session-list-body" onContextMenu={handleEmptyAreaContextMenu}>
+        {fleetOn && <TaskQueueSection />}
         {sessions.length === 0 && (
-          <div className="session-list-empty">No active sessions<br/><span className="text-muted">Press {fmt("{mod}N")} to create one</span></div>
+          <div className="session-list-empty">{t("sessions.noActive")}<br/><span className="text-muted">{t("sessions.createHint", { shortcut: shortcutLabel("file.new-session") })}</span></div>
         )}
 
         {/* Projects (groups) first */}
         {allGroups.map((group) => {
           const groupSessions = grouped.get(group) || [];
           const isCollapsed = collapsedGroups.has(group);
-          const groupCost = groupSessions.reduce((sum, s) => sum + sessionCost(s), 0);
+          const groupCost = fleetOn ? 0 : groupSessions.reduce((sum, s) => sum + sessionCost(s), 0);
           const groupColor = groupSessions.find((s) => s.phase !== "destroyed" && s.color)?.color || groupSessions.find((s) => s.color)?.color || emptyProjectColors[group] || "";
 
           return (
@@ -1130,8 +1326,10 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
                   <span className="project-header-count">{groupSessions.length}</span>
                 </div>
                 <div className="project-header-right">
-                  {groupCost > 0 && (
-                    <span className="project-header-cost">{formatCost(groupCost)}</span>
+                  {fleetOn ? (
+                    <ProjectSpend sessions={groupSessions.map(spendMember)} />
+                  ) : (
+                    groupCost > 0 && <span className="project-header-cost">{formatCost(groupCost)}</span>
                   )}
                   <button
                     className="project-header-add-btn"
@@ -1166,7 +1364,7 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
         >
           {((grouped.get(null) || []).length > 0 || (isDraggingSession && allGroups.length > 0)) && (
             <div className="ungrouped-divider">
-              <span>{dropTarget === "__ungrouped__" ? "Drop here to remove from project" : "Ungrouped"}</span>
+              <span>{dropTarget === "__ungrouped__" ? t("sessions.dropRemoveProject") : t("sessions.ungrouped")}</span>
             </div>
           )}
           {(grouped.get(null) || []).map((session) => {
@@ -1181,7 +1379,7 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
           <div className="session-list-new-project-input">
             <input
               autoFocus
-              placeholder="Project name..."
+              placeholder={t("sessions.projectName")}
               value={newGroupName}
               onChange={(e) => setNewGroupName(e.target.value)}
               onKeyDown={(e) => {
@@ -1215,10 +1413,18 @@ export function SessionList({ sessions, activeSessionId, onSelect, onClose, onNe
             <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" width="12" height="12">
               <path d="M2 5C2 3.9 2.9 3 4 3H7L9 5H14C15.1 5 16 5.9 16 7V13C16 14.1 15.1 15 14 15H4C2.9 15 2 14.1 2 13V5Z" />
             </svg>
-            New Project
+            {t("sessions.newProject")}
           </button>
         )}
       </div>
+      {handoff && sessions.find((s) => s.id === handoff.sessionId) && (
+        <HandoffDialog
+          key={`${handoff.sessionId}:${handoff.kind}`}
+          session={sessions.find((s) => s.id === handoff.sessionId)!}
+          initialKind={handoff.kind}
+          onClose={() => setHandoff(null)}
+        />
+      )}
     </div>
   );
 }

@@ -278,6 +278,8 @@ const commands: CommandEntry[] = [
   { command: "pbpaste", description: "Paste from clipboard (macOS)", category: "system", contexts: [] },
   { command: "open .", description: "Open current dir in Finder", category: "system", contexts: [] },
   { command: "code .", description: "Open in VS Code", category: "system", contexts: [] },
+  { command: "code tunnel", description: "Create a VS Code tunnel", category: "system", contexts: [] },
+  { command: "code tunnel --accept-server-license-terms", description: "Create a VS Code tunnel (auto-accept license)", category: "system", contexts: [] },
 
   // ─── Homebrew ───────────────────────────────────────────────
   { command: "brew install", description: "Install package", category: "brew", contexts: [] },
@@ -376,8 +378,6 @@ const commands: CommandEntry[] = [
   { command: "gh auth login", description: "Authenticate with GitHub", category: "gh", contexts: [] },
   { command: "gh auth status", description: "Show auth status", category: "gh", contexts: [] },
   { command: "gh api", description: "Make GitHub API request", category: "gh", contexts: ["git"] },
-  { command: "gh copilot suggest", description: "Get AI command suggestion", category: "gh", contexts: [] },
-  { command: "gh copilot explain", description: "Explain a command with AI", category: "gh", contexts: [] },
 
   // ─── GitLab CLI ─────────────────────────────────────────────
   { command: "glab mr create", description: "Create merge request", category: "glab", contexts: ["git"] },

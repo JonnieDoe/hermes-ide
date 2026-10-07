@@ -1,0 +1,2342 @@
+//! `hi` — the small helper Hermes ships next to its main binary and puts on
+//! PATH inside every Hermes terminal.
+//!
+//! ```text
+//! hi run <session-id | launch-file>    start the agent a launch file describes
+//! hi signal [--agent A] [--event E]    append one line to $HERMES_SIGNAL_FILE
+//!           [--argv-json <json>]       (payload from the last argument, as
+//!                                       Codex's notify program gets it)
+//! hi check [--json] [--feature <slug>] run the repository's Done-When checks
+//!          [--stop-hook]               (as an agent's Stop hook: block the
+//!                                       stop while they fail, see below)
+//! hi feature new <slug> ...             Feature Tracks (F28): see track_cmd.rs
+//! hi feature check                      (the track files' caps and front matter)
+//! hi phase [name|done|skip]
+//! hi approve | land | status
+//! hi --version
+//! ```
+//!
+//! Hermes types only `hi run <session-id>` into the shell. Everything that
+//! would otherwise need shell quoting — paths with spaces, prompts, flags —
+//! lives in the launch file Hermes wrote, so the same typed line works in
+//! zsh, bash, fish, PowerShell and cmd.
+//!
+//! `hi run` stays the parent of the agent so it can notice a resume that
+//! fails right away because the vendor does not know the conversation, and
+//! start a fresh one instead, saying so in one visible line. Only the way the
+//! catalog says the vendor reports a missing conversation counts (its exit
+//! code, and the text Hermes saw it print); an agent that ends early for any
+//! other reason (Ctrl-C at its trust prompt, a signal, a crash) keeps its
+//! conversation for the next launch. Ctrl-C is left
+//! to the agent: `hi` ignores it and only reports the agent's exit status —
+//! to the shell, and to Hermes as a `hermes.exited` spool line, so Hermes
+//! knows the agent is gone even when it ended without running any hook
+//! (a declined trust prompt, Ctrl-C at a prompt, a command not found).
+//!
+//! Every spool line carries the launch's nonce (`HERMES_SIGNAL_NONCE`, set
+//! by Hermes per launch); Hermes ignores lines without the current one.
+//!
+//! `hi signal` is what agents call from their hooks. It reads the hook's JSON
+//! from stdin, keeps a few small fields and appends one line to the spool
+//! file Hermes watches. It prints nothing and always exits 0, so a hook can
+//! never break an agent.
+//!
+//! `hi check` runs the `done_when` commands of the checkout it is in
+//! (`.hermes/features/<slug>/feature.md`, else `.hermes/worktree.toml`; see
+//! `done_when.rs`) and says which failed: exit 0 when they pass or there are
+//! none, 1 when one fails, 3 when a file cannot be read. Hermes injects
+//! `hi check --stop-hook` as Claude's per-launch Stop hook: while the checks
+//! fail it exits 2 with the failures on stderr, which sends Claude back to
+//! work with them, at most three times per turn and within a time budget;
+//! then it lets Claude stop and reports the result, which Hermes shows as
+//! `check_failed`.
+
+mod track_cmd;
+
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod done_when;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The launch-file format this build understands.
+const SPEC_VERSION: u64 = 1;
+/// Environment variable Hermes sets in every terminal: the folder that holds
+/// one sub-folder per session with its `launch.json`.
+const LAUNCH_DIR_ENV: &str = "HERMES_LAUNCH_DIR";
+const SIGNAL_FILE_ENV: &str = "HERMES_SIGNAL_FILE";
+const SESSION_ID_ENV: &str = "HERMES_SESSION_ID";
+const AGENT_ENV: &str = "HERMES_AGENT";
+const NONCE_ENV: &str = "HERMES_SIGNAL_NONCE";
+const LAUNCH_FILE_NAME: &str = "launch.json";
+const EXIT_USAGE: i32 = 2;
+const EXIT_NOT_FOUND: i32 = 127;
+const MAX_STDIN_BYTES: usize = 64 * 1024;
+const MAX_FIELD_CHARS: usize = 1024;
+
+// ─── Launch file ─────────────────────────────────────────────────────
+
+/// What Hermes writes for one launch. Field names are the wire format.
+#[derive(Debug, Clone)]
+pub struct LaunchSpec {
+    pub session_id: String,
+    pub agent: String,
+    pub cwd: Option<String>,
+    pub env: BTreeMap<String, String>,
+    pub program: String,
+    pub args: Vec<String>,
+    pub fallback: Option<Fallback>,
+    /// Hermes may stop this launch: the agent's CLI refused it (a model it
+    /// does not know, no sign-in) within its first seconds.
+    pub stop: Option<StopSpec>,
+    /// Clear the screen before the agent starts: a relaunch after a refused
+    /// launch, so a terminal that repaints its screen cannot replay the
+    /// old refusal.
+    pub clear_screen: bool,
+}
+
+/// How Hermes asks `hi` to stop a launch the agent's CLI refused. Hermes
+/// matches the CLI's output against the catalog's error signatures and, on
+/// a match, writes `file` with the launch's nonce on the first line and the
+/// CLI's own words on the second. Only within `window_ms` of the start.
+#[derive(Debug, Clone)]
+pub struct StopSpec {
+    pub file: PathBuf,
+    pub window_ms: u64,
+}
+
+/// What to run instead when the main command finds no conversation to resume.
+#[derive(Debug, Clone)]
+pub struct Fallback {
+    pub program: String,
+    pub args: Vec<String>,
+    /// A failure later than this is the agent's own business, not a failed
+    /// resume: the user may have quit it or it may have hit an error later.
+    pub after_ms: u64,
+    /// The vendor session id the fallback pre-assigns, reported to Hermes.
+    pub vendor_session_id: Option<String>,
+    /// The one line shown before the fallback starts.
+    pub message: Option<String>,
+    /// How the vendor says the conversation does not exist. Without it the
+    /// fallback never runs: an early exit alone proves nothing.
+    pub not_found: Option<NotFound>,
+}
+
+/// The vendor's own "no such conversation", from the agent catalog.
+#[derive(Debug, Clone, Default)]
+pub struct NotFound {
+    /// Exit codes that can mean it; empty means any code but an interrupt.
+    pub exit_codes: Vec<i32>,
+    /// Hermes writes this file (holding the launch's nonce) when it saw the
+    /// vendor print its "not found" text in the terminal. When set, the
+    /// fallback also needs that file.
+    pub evidence_file: Option<PathBuf>,
+    /// How long to wait for the evidence after the agent exited: Hermes reads
+    /// the terminal output on its own thread.
+    pub evidence_wait_ms: u64,
+}
+
+const DEFAULT_EVIDENCE_WAIT_MS: u64 = 2000;
+
+fn field_str(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key).and_then(|x| x.as_str()).map(str::to_string)
+}
+
+fn field_args(v: &serde_json::Value, key: &str) -> Result<Vec<String>, String> {
+    match v.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|a| {
+                a.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("{key}: every entry must be a string"))
+            })
+            .collect(),
+        Some(_) => Err(format!("{key}: must be a list of strings")),
+    }
+}
+
+fn field_codes(v: &serde_json::Value, key: &str) -> Result<Vec<i32>, String> {
+    match v.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|c| {
+                c.as_i64()
+                    .and_then(|c| i32::try_from(c).ok())
+                    .ok_or_else(|| format!("{key}: every entry must be an integer"))
+            })
+            .collect(),
+        Some(_) => Err(format!("{key}: must be a list of integers")),
+    }
+}
+
+impl LaunchSpec {
+    pub fn parse(text: &str) -> Result<LaunchSpec, String> {
+        let v: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| format!("not valid JSON: {e}"))?;
+        let version = v.get("v").and_then(|x| x.as_u64()).unwrap_or(0);
+        if version != SPEC_VERSION {
+            return Err(format!(
+                "launch file version {version} is not supported by this hi ({SPEC_VERSION}); update Hermes and hi together"
+            ));
+        }
+        let program = field_str(&v, "program").filter(|p| !p.is_empty());
+        let Some(program) = program else {
+            return Err("program is missing".to_string());
+        };
+        let mut env = BTreeMap::new();
+        if let Some(map) = v.get("env").and_then(|e| e.as_object()) {
+            for (k, val) in map {
+                if let Some(s) = val.as_str() {
+                    env.insert(k.clone(), s.to_string());
+                }
+            }
+        }
+        let fallback = match v.get("fallback") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(f) => {
+                let program = field_str(f, "program")
+                    .filter(|p| !p.is_empty())
+                    .ok_or_else(|| "fallback.program is missing".to_string())?;
+                let not_found = match f.get("not_found") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(n) => Some(NotFound {
+                        exit_codes: field_codes(n, "exit_codes")?,
+                        evidence_file: field_str(n, "evidence_file")
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from),
+                        evidence_wait_ms: n
+                            .get("evidence_wait_ms")
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(DEFAULT_EVIDENCE_WAIT_MS),
+                    }),
+                };
+                Some(Fallback {
+                    program,
+                    args: field_args(f, "args")?,
+                    after_ms: f.get("after_ms").and_then(|x| x.as_u64()).unwrap_or(3000),
+                    vendor_session_id: field_str(f, "vendor_session_id"),
+                    message: field_str(f, "message"),
+                    not_found,
+                })
+            }
+        };
+        let stop = v.get("stop").and_then(|st| {
+            let file = field_str(st, "file").filter(|f| !f.is_empty())?;
+            Some(StopSpec {
+                file: PathBuf::from(file),
+                window_ms: st
+                    .get("window_ms")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(90_000),
+            })
+        });
+        Ok(LaunchSpec {
+            session_id: field_str(&v, "session_id").unwrap_or_default(),
+            agent: field_str(&v, "agent").unwrap_or_default(),
+            cwd: field_str(&v, "cwd").filter(|c| !c.is_empty()),
+            env,
+            program,
+            args: field_args(&v, "args")?,
+            fallback,
+            stop,
+            clear_screen: v
+                .get("clear_screen")
+                .and_then(|c| c.as_bool())
+                .unwrap_or(false),
+        })
+    }
+}
+
+/// Where the launch file for `arg` is: `arg` itself when it is a file,
+/// otherwise `<launch dir>/<arg>/launch.json`.
+pub fn locate_spec(arg: &str, launch_dir: Option<&Path>) -> Result<PathBuf, String> {
+    let direct = Path::new(arg);
+    if direct.is_file() {
+        return Ok(direct.to_path_buf());
+    }
+    if arg.is_empty() || arg.contains(['/', '\\']) || arg.contains("..") {
+        return Err(format!("hi: no launch file at {arg}"));
+    }
+    match launch_dir {
+        Some(dir) => {
+            let candidate = dir.join(arg).join(LAUNCH_FILE_NAME);
+            if candidate.is_file() {
+                Ok(candidate)
+            } else {
+                Err(format!(
+                    "hi: no launch file for session {arg} (looked in {})",
+                    dir.display()
+                ))
+            }
+        }
+        None => Err(format!(
+            "hi: no launch file for {arg} and {LAUNCH_DIR_ENV} is not set; run this inside a Hermes terminal"
+        )),
+    }
+}
+
+// ─── Finding the program ─────────────────────────────────────────────
+
+/// Resolve a program name the way the shell would: a name with a path
+/// separator is used as given; a bare name is searched on PATH, trying the
+/// PATHEXT extensions on Windows (so an npm-installed `claude.cmd` is found).
+pub fn resolve_program(
+    program: &str,
+    path: Option<&OsStr>,
+    pathext: Option<&OsStr>,
+) -> Option<PathBuf> {
+    let direct = Path::new(program);
+    if program.contains(['/', '\\']) {
+        return if direct.is_file() {
+            Some(direct.to_path_buf())
+        } else {
+            None
+        };
+    }
+    let exts: Vec<String> = if cfg!(windows) {
+        let raw = pathext
+            .map(|p| p.to_string_lossy().to_string())
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+        raw.split(';')
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let has_ext = direct.extension().is_some();
+    for dir in std::env::split_paths(path.unwrap_or_default()) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let plain = dir.join(program);
+        if is_executable(&plain) {
+            return Some(plain);
+        }
+        if !has_ext || cfg!(windows) {
+            for ext in &exts {
+                let with_ext = dir.join(format!("{program}{ext}"));
+                if is_executable(&with_ext) {
+                    return Some(with_ext);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.is_file()
+            && std::fs::metadata(path)
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+// ─── Running ─────────────────────────────────────────────────────────
+
+/// How the agent process ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// It exited with this code.
+    Code(i32),
+    /// A signal ended it (Unix).
+    Signal(i32),
+}
+
+impl Ended {
+    fn of(status: ExitStatus) -> Ended {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(sig) = status.signal() {
+                return Ended::Signal(sig);
+            }
+        }
+        Ended::Code(status.code().unwrap_or(1))
+    }
+
+    /// The status a shell would report.
+    pub fn code(self) -> i32 {
+        match self {
+            Ended::Code(c) => c,
+            Ended::Signal(s) => 128 + s,
+        }
+    }
+
+    /// Ended by the user or the system rather than by the agent deciding to
+    /// exit: a signal, a shell-style `128 + signal` code (130 is Ctrl-C), or
+    /// Windows' STATUS_CONTROL_C_EXIT.
+    pub fn is_interrupt(self) -> bool {
+        const STATUS_CONTROL_C_EXIT: i32 = 0xC000_013Au32 as i32;
+        match self {
+            Ended::Signal(_) => true,
+            Ended::Code(c) => (129..=128 + 64).contains(&c) || c == STATUS_CONTROL_C_EXIT,
+        }
+    }
+}
+
+/// What an ended resume means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeVerdict {
+    /// The conversation stays: the agent ran, was interrupted, or ended in a
+    /// way that does not say the conversation is missing.
+    Keep,
+    /// The exit fits; the fallback also needs Hermes to have seen the
+    /// vendor's "not found" text.
+    NeedsEvidence,
+    /// The vendor said the conversation does not exist: start fresh.
+    FallBack,
+}
+
+/// Whether a resume that just ended failed because the vendor does not know
+/// the conversation. Never for an interrupt (Ctrl-C at a trust prompt, a
+/// signal), never after the window, and never unless the catalog says how
+/// the vendor reports a missing conversation.
+pub fn resume_verdict(
+    ended: Ended,
+    elapsed: Duration,
+    fallback: Option<&Fallback>,
+) -> ResumeVerdict {
+    let Some(f) = fallback else {
+        return ResumeVerdict::Keep;
+    };
+    let Some(nf) = &f.not_found else {
+        return ResumeVerdict::Keep;
+    };
+    if elapsed > Duration::from_millis(f.after_ms) || ended.is_interrupt() {
+        return ResumeVerdict::Keep;
+    }
+    let Ended::Code(code) = ended else {
+        return ResumeVerdict::Keep;
+    };
+    let code_fits = nf.exit_codes.is_empty() || nf.exit_codes.contains(&code);
+    if !code_fits {
+        ResumeVerdict::Keep
+    } else if nf.evidence_file.is_some() {
+        ResumeVerdict::NeedsEvidence
+    } else {
+        ResumeVerdict::FallBack
+    }
+}
+
+/// Whether Hermes wrote the "not found" evidence for this launch: the file
+/// holds the launch's nonce (a file from another launch does not count).
+pub fn evidence_present(file: &Path, nonce: Option<&str>) -> bool {
+    match std::fs::read_to_string(file) {
+        Ok(text) => {
+            let text = text.trim();
+            match nonce {
+                Some(n) => text == n,
+                None => !text.is_empty(),
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// Wait up to `wait` for the evidence; Hermes reads the terminal output on
+/// its own thread, so it can land a moment after the agent exited.
+fn wait_for_evidence(file: &Path, nonce: Option<&str>, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        if evidence_present(file, nonce) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Whether Hermes asked to stop this launch: the stop file's first line is
+/// the launch's nonce. Returns the CLI's words Hermes matched (the second
+/// line, possibly empty).
+pub fn stop_requested(file: &Path, nonce: Option<&str>) -> Option<String> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let mut lines = text.lines();
+    let first = lines.next()?.trim();
+    let ok = match nonce {
+        Some(n) => first == n,
+        None => !first.is_empty(),
+    };
+    if !ok {
+        return None;
+    }
+    let message: String = lines
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(600)
+        .collect();
+    Some(message)
+}
+
+/// Sequences that give the terminal back after a full-screen agent was
+/// stopped mid-draw: main screen (without moving the cursor), cursor shown, colours reset, mouse
+/// reporting, bracketed paste and the kitty keyboard protocol off, normal
+/// keypad.
+pub const TERMINAL_RESET: &str =
+    "\x1b[?1047l\x1b[?25h\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[<u\x1b>";
+
+/// An invisible marker (an OSC sequence terminals ignore) that says where
+/// this launch's output starts; Hermes matches the agent's refusal only after
+/// it. Mirror of `agent_caps::watch::launch_marker` in the app.
+pub fn launch_marker(nonce: &str) -> String {
+    format!("\x1b]777;hermes-launch;{nonce}\x07")
+}
+
+/// The lines `hi` prints after stopping a refused launch.
+pub fn stopped_text(agent: &str, vendor_message: &str) -> String {
+    let who = if agent.is_empty() { "the agent" } else { agent };
+    let mut out = String::from(TERMINAL_RESET);
+    out.push_str("\r\n");
+    if !vendor_message.trim().is_empty() {
+        out.push_str(vendor_message.trim());
+        out.push_str("\r\n");
+    }
+    out.push_str(&format!(
+        "hermes: {who} refused this launch; Hermes stopped it. Nothing more will run.\r\n"
+    ));
+    out
+}
+
+/// The agent's descendants (Unix, from `ps`), deepest first, so a CLI that
+/// is a wrapper around another process leaves nothing behind.
+#[cfg(unix)]
+fn descendants(root: u32) -> Vec<u32> {
+    let Ok(out) = Command::new("ps").args(["-A", "-o", "pid=,ppid="]).output() else {
+        return Vec::new();
+    };
+    let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        })
+        .collect();
+    let mut found = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(p) = frontier.pop() {
+        for (pid, ppid) in &pairs {
+            if *ppid == p && !found.contains(pid) {
+                found.push(*pid);
+                frontier.push(*pid);
+            }
+        }
+    }
+    found.reverse();
+    found
+}
+
+/// Stop the agent: SIGTERM to it and everything it started, then SIGKILL
+/// after two seconds (Unix); TerminateProcess (Windows).
+fn stop_child(child: &mut std::process::Child) -> std::io::Result<ExitStatus> {
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        let tree = descendants(pid);
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+            for p in &tree {
+                libc::kill(*p as i32, libc::SIGTERM);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                for p in &tree {
+                    unsafe {
+                        libc::kill(*p as i32, libc::SIGKILL);
+                    }
+                }
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                for p in &tree {
+                    unsafe {
+                        libc::kill(*p as i32, libc::SIGKILL);
+                    }
+                }
+                let _ = child.kill();
+                return child.wait();
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // A .cmd shim (an npm-installed CLI) runs the agent as its child:
+        // end the whole tree, then the shim itself.
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = child.kill();
+        child.wait()
+    }
+}
+
+/// The terminal's settings before the agent ran (Unix), restored after a
+/// stopped agent left it in raw mode.
+#[cfg(unix)]
+struct SavedTty(Option<libc::termios>);
+
+#[cfg(unix)]
+impl SavedTty {
+    fn save() -> Self {
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut t) == 0 {
+                SavedTty(Some(t))
+            } else {
+                SavedTty(None)
+            }
+        }
+    }
+    fn restore(&self) {
+        if let Some(t) = &self.0 {
+            unsafe {
+                libc::tcsetattr(0, libc::TCSANOW, t);
+            }
+        }
+    }
+}
+
+/// What `run_child` watches for besides the agent's exit.
+pub struct StopWatch<'a> {
+    pub file: &'a Path,
+    pub nonce: Option<&'a str>,
+    pub window: Duration,
+}
+
+/// Leave Ctrl-C to the agent: `hi` only reports how the agent ended.
+fn ignore_interrupts() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+    }
+    #[cfg(windows)]
+    unsafe {
+        // A handler that says "handled" keeps hi alive; the agent, on the
+        // same console, still receives the event. (Passing a null handler
+        // would set an "ignore" flag that children inherit — not wanted.)
+        SetConsoleCtrlHandler(Some(swallow_ctrl_event), 1);
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn SetConsoleCtrlHandler(
+        handler: Option<unsafe extern "system" fn(ctrl_type: u32) -> i32>,
+        add: i32,
+    ) -> i32;
+    fn GetStdHandle(std_handle: u32) -> isize;
+    fn GetConsoleMode(handle: isize, mode: *mut u32) -> i32;
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn swallow_ctrl_event(_ctrl_type: u32) -> i32 {
+    1
+}
+
+/// Run the agent to its end. With `running_after`, call it once when the
+/// agent is still running after that long.
+/// Whether Windows runs this program through `cmd.exe` (a `.bat` or `.cmd`
+/// file, like the shims npm installs for `codex` or `gemini`).
+pub fn is_batch_file(program: &Path) -> bool {
+    program
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("bat") || e.eq_ignore_ascii_case("cmd"))
+}
+
+/// The arguments as a batch file can take them. `cmd.exe` has no way to
+/// pass a line break inside an argument (the standard library refuses to
+/// start the program rather than let it split the line), so a multi-line
+/// first prompt — a handoff's task and file list — reaches a batch shim
+/// with each line break as one space. Nothing else changes, and programs
+/// that are not batch files get the arguments untouched.
+pub fn args_for(program: &Path, args: &[String]) -> Vec<String> {
+    if !is_batch_file(program) {
+        return args.to_vec();
+    }
+    args.iter()
+        .map(|a| {
+            if a.contains(['\r', '\n']) {
+                a.replace("\r\n", " ").replace(['\r', '\n'], " ")
+            } else {
+                a.clone()
+            }
+        })
+        .collect()
+}
+
+fn run_child(
+    resolved: &Path,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+    running_after: Option<(Duration, &dyn Fn())>,
+    stop: Option<&StopWatch<'_>>,
+) -> std::io::Result<(ExitStatus, Option<String>)> {
+    let mut cmd = Command::new(resolved);
+    cmd.args(args_for(resolved, args));
+    cmd.envs(env);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // The child must get the default Ctrl-C behaviour back.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(unix)]
+    let tty = SavedTty::save();
+    let mut child = cmd.spawn()?;
+    let started = Instant::now();
+    let mut running_after = running_after;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok((status, None));
+        }
+        if let Some((after, on_running)) = running_after {
+            if started.elapsed() >= after {
+                on_running();
+                running_after = None;
+            }
+        }
+        let watching = stop.filter(|s| started.elapsed() < s.window);
+        if let Some(s) = watching {
+            if let Some(message) = stop_requested(s.file, s.nonce) {
+                let status = stop_child(&mut child)?;
+                #[cfg(unix)]
+                tty.restore();
+                return Ok((status, Some(message)));
+            }
+        }
+        if running_after.is_none() && watching.is_none() {
+            return Ok((child.wait()?, None));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn append_signal(file: &Path, line: &serde_json::Value) -> std::io::Result<()> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)?;
+    let mut text = serde_json::to_string(line).unwrap_or_default();
+    text.push('\n');
+    f.write_all(text.as_bytes())
+}
+
+/// Where `hi run` reports to Hermes: the session's spool file, with the
+/// session, agent and nonce every line carries. Silent when the launch file
+/// names no spool (a launch file run by hand).
+struct Reporter {
+    file: Option<PathBuf>,
+    session: String,
+    agent: String,
+    nonce: Option<String>,
+}
+
+impl Reporter {
+    fn for_spec(spec: &LaunchSpec) -> Reporter {
+        let from_spec_or_env = |name: &str| {
+            spec.env
+                .get(name)
+                .cloned()
+                .or_else(|| std::env::var(name).ok())
+                .filter(|v| !v.is_empty())
+        };
+        Reporter {
+            file: from_spec_or_env(SIGNAL_FILE_ENV).map(PathBuf::from),
+            session: spec.session_id.clone(),
+            agent: spec.agent.clone(),
+            nonce: from_spec_or_env(NONCE_ENV),
+        }
+    }
+
+    fn report(&self, event: &str, payload: serde_json::Value) {
+        let Some(file) = &self.file else {
+            return;
+        };
+        let ms = now_unix_ms();
+        let mut line = serde_json::json!({
+            "v": 1,
+            "ts": ms / 1000,
+            "ts_ms": ms,
+            "session": self.session,
+            "agent": self.agent,
+            "event": event,
+            "payload": payload,
+        });
+        if let Some(nonce) = &self.nonce {
+            line["nonce"] = serde_json::Value::String(nonce.clone());
+        }
+        if let Err(e) = append_signal(file, &line) {
+            eprintln!("hi: could not report {event} to Hermes: {e}");
+        }
+    }
+
+    /// The agent process is gone: tell Hermes how, and return the code to
+    /// exit with.
+    fn exited(&self, code: i32, error: Option<&str>) -> i32 {
+        let mut payload = serde_json::json!({ "exit_code": code });
+        if let Some(error) = error {
+            payload["error"] = serde_json::Value::String(error.to_string());
+        }
+        self.report("hermes.exited", payload);
+        code
+    }
+}
+
+fn cmd_run(arg: &str) -> i32 {
+    let launch_dir = std::env::var_os(LAUNCH_DIR_ENV).map(PathBuf::from);
+    let spec_path = match locate_spec(arg, launch_dir.as_deref()) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return EXIT_USAGE;
+        }
+    };
+    let text = match std::fs::read_to_string(&spec_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("hi: cannot read {}: {e}", spec_path.display());
+            return EXIT_USAGE;
+        }
+    };
+    let spec = match LaunchSpec::parse(&text) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("hi: {}: {e}", spec_path.display());
+            return EXIT_USAGE;
+        }
+    };
+
+    let cwd: Option<PathBuf> = match spec.cwd.as_deref().map(Path::new) {
+        Some(dir) if dir.is_dir() => Some(dir.to_path_buf()),
+        Some(dir) => {
+            eprintln!(
+                "hi: folder {} no longer exists; starting in the current folder",
+                dir.display()
+            );
+            None
+        }
+        None => None,
+    };
+    let path = std::env::var_os("PATH");
+    let pathext = std::env::var_os("PATHEXT");
+    let reporter = Reporter::for_spec(&spec);
+
+    ignore_interrupts();
+
+    let Some(resolved) = resolve_program(&spec.program, path.as_deref(), pathext.as_deref()) else {
+        let error = format!("{}: command not found", spec.program);
+        eprintln!("hi: {error}");
+        return reporter.exited(EXIT_NOT_FOUND, Some(&error));
+    };
+    // Hermes reads the agent's refusal only from output after this marker:
+    // a terminal that repaints its screen (Windows' ConPTY) would otherwise
+    // replay an earlier launch's refusal into this one.
+    if spec.clear_screen {
+        let mut out = std::io::stdout();
+        let _ = write!(out, "\x1b[H\x1b[2J");
+        let _ = out.flush();
+    }
+    if spec.stop.is_some() {
+        if let Some(nonce) = reporter.nonce.as_deref() {
+            let mut out = std::io::stdout();
+            let _ = write!(out, "{}", launch_marker(nonce));
+            let _ = out.flush();
+        }
+    }
+    let started = Instant::now();
+    let stop_watch = spec.stop.as_ref().map(|st| StopWatch {
+        file: &st.file,
+        nonce: reporter.nonce.as_deref(),
+        window: Duration::from_millis(st.window_ms),
+    });
+    let status = match run_child(
+        &resolved,
+        &spec.args,
+        &spec.env,
+        cwd.as_deref(),
+        None,
+        stop_watch.as_ref(),
+    ) {
+        Ok((_, Some(vendor_message))) => {
+            // The CLI refused the launch (Hermes saw its words): the agent is
+            // stopped, the terminal is given back, and nothing is retried.
+            let mut out = std::io::stdout();
+            let _ = write!(out, "{}", stopped_text(&spec.agent, &vendor_message));
+            let _ = out.flush();
+            reporter.report(
+                "hermes.launch_stopped",
+                serde_json::json!({ "elapsed_ms": started.elapsed().as_millis() as u64 }),
+            );
+            return reporter.exited(1, Some("the agent refused the launch; Hermes stopped it"));
+        }
+        Ok((s, None)) => s,
+        Err(e) => {
+            let error = format!("cannot start {}: {e}", resolved.display());
+            eprintln!("hi: {error}");
+            return reporter.exited(EXIT_NOT_FOUND, Some(&error));
+        }
+    };
+    let elapsed = started.elapsed();
+    let ended = Ended::of(status);
+    let fall_back = match resume_verdict(ended, elapsed, spec.fallback.as_ref()) {
+        ResumeVerdict::Keep => false,
+        ResumeVerdict::FallBack => true,
+        ResumeVerdict::NeedsEvidence => spec
+            .fallback
+            .as_ref()
+            .and_then(|f| f.not_found.as_ref())
+            .and_then(|nf| {
+                nf.evidence_file.as_deref().map(|file| {
+                    wait_for_evidence(
+                        file,
+                        reporter.nonce.as_deref(),
+                        Duration::from_millis(nf.evidence_wait_ms),
+                    )
+                })
+            })
+            .unwrap_or(false),
+    };
+    if !fall_back {
+        return reporter.exited(ended.code(), None);
+    }
+
+    // The vendor does not know the conversation: say so once, tell Hermes,
+    // start fresh.
+    let fallback = spec.fallback.as_ref().expect("checked above");
+    let code = ended.code();
+    let message = fallback.message.clone().unwrap_or_else(|| {
+        format!("could not resume the previous conversation (exit {code}); starting a new one")
+    });
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\r\nhermes: {message}\r\n");
+    let _ = out.flush();
+    reporter.report(
+        "hermes.resume_fallback",
+        serde_json::json!({
+            "exit_code": code,
+            "elapsed_ms": elapsed.as_millis() as u64,
+            "vendor_session_id": fallback.vendor_session_id,
+        }),
+    );
+    let Some(resolved) = resolve_program(&fallback.program, path.as_deref(), pathext.as_deref())
+    else {
+        let error = format!("{}: command not found", fallback.program);
+        eprintln!("hi: {error}");
+        return reporter.exited(EXIT_NOT_FOUND, Some(&error));
+    };
+    // Tell Hermes once the fresh agent is past the quick-failure window, so
+    // it can adopt the new conversation even from an agent that sends no
+    // start signal of its own.
+    let running = || {
+        reporter.report(
+            "hermes.fallback_running",
+            serde_json::json!({ "vendor_session_id": fallback.vendor_session_id }),
+        )
+    };
+    let after = Duration::from_millis(fallback.after_ms);
+    match run_child(
+        &resolved,
+        &fallback.args,
+        &spec.env,
+        cwd.as_deref(),
+        Some((after, &running)),
+        None,
+    ) {
+        Ok((s, _)) => reporter.exited(Ended::of(s).code(), None),
+        Err(e) => {
+            let error = format!("cannot start {}: {e}", resolved.display());
+            eprintln!("hi: {error}");
+            reporter.exited(EXIT_NOT_FOUND, Some(&error))
+        }
+    }
+}
+
+// ─── Signals ─────────────────────────────────────────────────────────
+
+/// Small, well-known fields worth keeping from a hook payload. Anything else
+/// (tool inputs, messages, transcripts) stays out of the spool.
+const KEPT_FIELDS: &[&str] = &[
+    "hook_event_name",
+    "event",
+    "session_id",
+    "sessionId",
+    "thread-id",
+    "thread_id",
+    "conversationId",
+    "type",
+    "source",
+    "reason",
+    "cwd",
+    "notification_type",
+    "tool_name",
+    "permission_mode",
+    "stop_hook_active",
+    "transcript_path",
+    "title",
+    "message",
+    "error",
+    "fullyIdle",
+    "terminationReason",
+    "agent_id",
+    "agent_type",
+];
+
+/// Machine markers Hermes put into text the agent now reports back, in the
+/// form `[hermes-<name> #<n>]` (for example the `[hermes-review #3]` line a
+/// person pastes from the Review Desk, F21), as `hermes-<name>#<n>`,
+/// deduplicated, in order of appearance. Only the markers leave the process:
+/// the surrounding text (the prompt) never reaches the spool. Mirror of
+/// `contract::signal::tags_in_text` in the app.
+pub fn tags_in_text(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("[hermes-") {
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find(']') else {
+            break;
+        };
+        let inner = &after_open[..close];
+        if let Some((name, n)) = inner.split_once(" #") {
+            let name_ok = name.len() > "hermes-".len()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+            let n_ok = !n.is_empty() && n.len() <= 9 && n.bytes().all(|b| b.is_ascii_digit());
+            if name_ok && n_ok {
+                let tag = format!("{name}#{n}");
+                if !out.contains(&tag) {
+                    out.push(tag);
+                }
+            }
+        }
+        rest = &after_open[close + 1..];
+    }
+    out
+}
+
+/// The field a spool line carries the markers in.
+const TAGS_FIELD: &str = "hermes_tags";
+const MAX_TAGS: usize = 16;
+/// The status line input's `rate_limits` (N19), reduced to what Hermes
+/// reads: per window (`five_hour`, `seven_day`...) its `used_percentage` (or
+/// `utilization`) and `resets_at`. At most eight windows with short names;
+/// anything else is dropped, so a vendor adding fields never bloats the
+/// spool.
+pub fn kept_rate_limits(v: &serde_json::Value) -> Option<serde_json::Value> {
+    let map = v.as_object()?;
+    let mut out = serde_json::Map::new();
+    for (name, window) in map.iter().take(8) {
+        let valid_name = !name.is_empty()
+            && name.len() <= 32
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        let Some(window) = window.as_object().filter(|_| valid_name) else {
+            continue;
+        };
+        let mut kept = serde_json::Map::new();
+        for key in ["used_percentage", "utilization"] {
+            if let Some(n) = window.get(key).filter(|x| x.is_number()) {
+                kept.insert(key.to_string(), n.clone());
+            }
+        }
+        match window.get("resets_at") {
+            Some(n @ serde_json::Value::Number(_)) => {
+                kept.insert("resets_at".to_string(), n.clone());
+            }
+            Some(serde_json::Value::String(t)) if t.len() <= 64 => {
+                kept.insert(
+                    "resets_at".to_string(),
+                    serde_json::Value::String(t.clone()),
+                );
+            }
+            _ => {}
+        }
+        if !kept.is_empty() {
+            out.insert(name.clone(), serde_json::Value::Object(kept));
+        }
+    }
+    (!out.is_empty()).then_some(serde_json::Value::Object(out))
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
+/// One spool line. `event` is the vendor's own name for what happened: the
+/// payload's `hook_event_name` (Claude, Gemini, Copilot), else its `event`
+/// (goose), else `--event` (a hook file that names it), else its `type`
+/// (Codex's notify program), else "unknown". `nonce` is the launch's (from
+/// `HERMES_SIGNAL_NONCE`); without it Hermes ignores the line.
+///
+/// This is the whole of what `hi signal` does with a hook: it never answers
+/// one. Nothing is printed, so no agent ever reads a decision from it.
+pub fn signal_line(
+    event_flag: Option<&str>,
+    agent: &str,
+    session: &str,
+    nonce: Option<&str>,
+    payload: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut kept = serde_json::Map::new();
+    if let Some(serde_json::Value::Object(map)) = payload {
+        // Hermes markers in any text field (the submitted prompt, above all)
+        // are lifted out here; the text itself is dropped with the field.
+        let mut tags: Vec<String> = Vec::new();
+        for value in map.values() {
+            if let serde_json::Value::String(s) = value {
+                for tag in tags_in_text(s) {
+                    if !tags.contains(&tag) && tags.len() < MAX_TAGS {
+                        tags.push(tag);
+                    }
+                }
+            }
+        }
+        if !tags.is_empty() {
+            kept.insert(
+                TAGS_FIELD.to_string(),
+                serde_json::Value::Array(tags.into_iter().map(serde_json::Value::String).collect()),
+            );
+        }
+        for key in KEPT_FIELDS {
+            match map.get(*key) {
+                Some(serde_json::Value::String(s)) => {
+                    kept.insert(
+                        key.to_string(),
+                        serde_json::Value::String(truncate_chars(s, MAX_FIELD_CHARS)),
+                    );
+                }
+                Some(v @ serde_json::Value::Bool(_)) | Some(v @ serde_json::Value::Number(_)) => {
+                    kept.insert(key.to_string(), v.clone());
+                }
+                _ => {}
+            }
+        }
+        // The model the agent reports (a hook's `model` / Antigravity's
+        // `modelName`, or the status line's `model.id`), for the model chip.
+        if let Some(model) = map
+            .get("model")
+            .and_then(|m| m.as_str().or_else(|| m.get("id").and_then(|i| i.as_str())))
+            .or_else(|| map.get("modelName").and_then(|m| m.as_str()))
+            .filter(|m| !m.trim().is_empty())
+        {
+            kept.insert(
+                "model".to_string(),
+                serde_json::Value::String(truncate_chars(model.trim(), 200)),
+            );
+        }
+        if let Some(rl) = map.get("rate_limits").and_then(kept_rate_limits) {
+            kept.insert("rate_limits".to_string(), rl);
+        }
+        // The status line input's window size (F14): the one number the
+        // context gauge needs from `context_window`, nothing else of it.
+        if let Some(size) = map
+            .get("context_window")
+            .and_then(|c| c.get("context_window_size"))
+            .and_then(|n| n.as_u64())
+            .filter(|n| *n > 0 && *n <= 100_000_000)
+        {
+            kept.insert("context_window_size".to_string(), serde_json::json!(size));
+        }
+        // Antigravity names the tool inside `toolCall` (its arguments, which
+        // can hold a command line, are dropped): lift the name alone.
+        if !kept.contains_key("tool_name") {
+            if let Some(name) = map
+                .get("toolCall")
+                .and_then(|c| c.get("name"))
+                .and_then(|n| n.as_str())
+                .filter(|n| !n.is_empty())
+            {
+                kept.insert(
+                    "tool_name".to_string(),
+                    serde_json::Value::String(truncate_chars(name, 128)),
+                );
+            }
+        }
+    }
+    let kept_str = |key: &str| {
+        kept.get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let event = kept_str("hook_event_name")
+        .or_else(|| kept_str("event"))
+        .or_else(|| event_flag.filter(|e| !e.is_empty()).map(str::to_string))
+        .or_else(|| kept_str("type"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let ms = now_unix_ms();
+    let mut line = serde_json::json!({
+        "v": 1,
+        "ts": ms / 1000,
+        "ts_ms": ms,
+        "session": session,
+        "agent": agent,
+        "event": truncate_chars(&event, 64),
+        "payload": serde_json::Value::Object(kept),
+    });
+    if let Some(nonce) = nonce.filter(|n| !n.is_empty()) {
+        line["nonce"] = serde_json::Value::String(truncate_chars(nonce, 128));
+    }
+    line
+}
+
+fn stdin_is_terminal() -> bool {
+    #[cfg(unix)]
+    unsafe {
+        libc::isatty(0) == 1
+    }
+    #[cfg(windows)]
+    unsafe {
+        const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode = 0u32;
+        GetConsoleMode(handle, &mut mode) != 0
+    }
+}
+
+fn read_stdin_json() -> Option<serde_json::Value> {
+    if stdin_is_terminal() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    let mut limited = std::io::stdin().take(MAX_STDIN_BYTES as u64);
+    if limited.read_to_end(&mut buf).is_err() || buf.is_empty() {
+        return None;
+    }
+    serde_json::from_slice(&buf).ok()
+}
+
+fn cmd_signal(args: &[String]) -> i32 {
+    let mut agent: Option<String> = None;
+    let mut event: Option<String> = None;
+    // Codex's `notify` program gets the event as one JSON argument instead
+    // of stdin; `--argv-json` says the payload is the last argument.
+    let mut argv_json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agent" if i + 1 < args.len() => {
+                agent = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--event" if i + 1 < args.len() => {
+                event = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--argv-json" => argv_json = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    let Some(file) = std::env::var_os(SIGNAL_FILE_ENV).filter(|f| !f.is_empty()) else {
+        // Not started by Hermes: nothing to report to, nothing to say.
+        return 0;
+    };
+    let agent = agent
+        .or_else(|| std::env::var(AGENT_ENV).ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    let session = std::env::var(SESSION_ID_ENV).unwrap_or_default();
+    let nonce = std::env::var(NONCE_ENV).ok();
+    let payload = if argv_json {
+        args.last()
+            .filter(|a| a.len() <= MAX_STDIN_BYTES)
+            .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
+    } else {
+        read_stdin_json()
+    };
+    let line = signal_line(
+        event.as_deref(),
+        &agent,
+        &session,
+        nonce.as_deref(),
+        payload.as_ref(),
+    );
+    // A hook must never fail the agent, so errors are swallowed on purpose.
+    let _ = append_signal(Path::new(&file), &line);
+    0
+}
+
+// ─── Checks (Done-When) ──────────────────────────────────────────────
+
+const EXIT_CHECK_FAILED: i32 = 1;
+const EXIT_CHECK_UNREADABLE: i32 = 3;
+/// `--stop-hook`: exit 2 makes Claude continue, with stderr as feedback.
+const EXIT_BLOCK_STOP: i32 = 2;
+const CHECK_EVENT: &str = "hermes.check";
+const CHECK_STATE_FILE: &str = "done-when-state.json";
+/// A spool line stays under the 8 KB signal cap.
+const CHECK_SPOOL_CAP: usize = 7 * 1024;
+
+fn check_exit_code(state: done_when::State) -> i32 {
+    match state {
+        done_when::State::Passed | done_when::State::None => 0,
+        done_when::State::Failed => EXIT_CHECK_FAILED,
+        done_when::State::Error => EXIT_CHECK_UNREADABLE,
+    }
+}
+
+/// The spool payload of a check run: the report with short output tails,
+/// plus what the Stop hook decided.
+fn check_payload(
+    report: &done_when::Report,
+    extra: &[(&str, serde_json::Value)],
+) -> serde_json::Value {
+    let n = report.commands.len().max(1);
+    let mut tail = (4000 / n).clamp(160, 1200);
+    loop {
+        let mut v = report.to_json(tail);
+        for (k, val) in extra {
+            v[*k] = val.clone();
+        }
+        let size = serde_json::to_string(&v).map(|t| t.len()).unwrap_or(0);
+        if size <= CHECK_SPOOL_CAP || tail == 0 {
+            return v;
+        }
+        tail = if tail < 80 { 0 } else { tail / 2 };
+    }
+}
+
+/// Report a check run to Hermes when this runs inside a launched agent (the
+/// spool and the nonce are in the environment). Errors are swallowed: a
+/// check never fails because Hermes is not listening.
+fn report_check(payload: serde_json::Value) {
+    let Some(file) = std::env::var_os(SIGNAL_FILE_ENV).filter(|f| !f.is_empty()) else {
+        return;
+    };
+    let ms = now_unix_ms();
+    let mut line = serde_json::json!({
+        "v": 1,
+        "ts": ms / 1000,
+        "ts_ms": ms,
+        "session": std::env::var(SESSION_ID_ENV).unwrap_or_default(),
+        "agent": std::env::var(AGENT_ENV).unwrap_or_else(|_| "unknown".to_string()),
+        "event": CHECK_EVENT,
+        "payload": payload,
+    });
+    if let Ok(nonce) = std::env::var(NONCE_ENV) {
+        if !nonce.is_empty() {
+            line["nonce"] = serde_json::Value::String(nonce);
+        }
+    }
+    let _ = append_signal(Path::new(&file), &line);
+}
+
+fn secs(ms: u64) -> String {
+    format!("{:.1} s", ms as f64 / 1000.0)
+}
+
+/// What a person sees after `hi check` at a terminal.
+fn report_text(report: &done_when::Report) -> String {
+    use done_when::State;
+    let mut out = String::new();
+    match report.state {
+        State::None => out.push_str(
+            "hi check: no Done-When checks here (add done_when to .hermes/worktree.toml or to a feature.md)\n",
+        ),
+        State::Error => out.push_str(&format!(
+            "hi check: {}\n",
+            report
+                .error
+                .as_deref()
+                .unwrap_or("a done_when file can't be read")
+        )),
+        State::Passed | State::Failed => {
+            let from = report
+                .source
+                .as_ref()
+                .map(|s| s.path.as_str())
+                .unwrap_or("?");
+            let n = report.commands.len();
+            out.push_str(&format!(
+                "hi check: {n} check{} from {from}\n",
+                if n == 1 { "" } else { "s" }
+            ));
+            for c in &report.commands {
+                if c.passed() {
+                    out.push_str(&format!(
+                        "  ok      {}  ({})\n",
+                        c.command,
+                        secs(c.duration_ms)
+                    ));
+                    continue;
+                }
+                let how = if c.timed_out {
+                    "timed out".to_string()
+                } else {
+                    format!("exit {}", c.exit_code.unwrap_or(-1))
+                };
+                out.push_str(&format!(
+                    "  FAILED  {}  ({how}, {})\n",
+                    c.command,
+                    secs(c.duration_ms)
+                ));
+                let lines: Vec<&str> = c.output_tail.trim_end().lines().collect();
+                for l in &lines[lines.len().saturating_sub(15)..] {
+                    out.push_str(&format!("          {l}\n"));
+                }
+            }
+            let failed = report.failed_commands().len();
+            if failed == 0 {
+                out.push_str("All checks passed.\n");
+            } else {
+                out.push_str(&format!("{failed} of {n} checks failed.\n"));
+            }
+        }
+    }
+    out
+}
+
+fn cmd_check(args: &[String]) -> i32 {
+    let mut json = false;
+    let mut stop_hook = false;
+    let mut feature: Option<String> = None;
+    let mut trigger: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => json = true,
+            "--stop-hook" => stop_hook = true,
+            "--feature" if i + 1 < args.len() => {
+                feature = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--trigger" if i + 1 < args.len() => {
+                trigger = Some(args[i + 1].clone());
+                i += 1;
+            }
+            _ => return usage(),
+        }
+        i += 1;
+    }
+    let run_budget =
+        done_when::budget_from_env(done_when::RUN_BUDGET_ENV, done_when::DEFAULT_RUN_BUDGET);
+    if stop_hook {
+        return check_stop_hook(feature.as_deref(), run_budget);
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let trigger = trigger.unwrap_or_else(|| if json { "manual" } else { "cli" }.to_string());
+    // At a terminal the checks stay in the terminal's process group so
+    // Ctrl-C stops them; run for Hermes (--json) they get a group of their
+    // own, so a timeout ends everything they started.
+    let report = done_when::check(&cwd, feature.as_deref(), &trigger, run_budget, json);
+    if json {
+        let v = report.to_json(done_when::OUTPUT_TAIL_BYTES);
+        println!("{}", serde_json::to_string(&v).unwrap_or_default());
+    } else {
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(report_text(&report).as_bytes());
+        let _ = stdout.flush();
+        if report.state != done_when::State::None {
+            report_check(check_payload(&report, &[]));
+        }
+    }
+    check_exit_code(report.state)
+}
+
+/// Why the Stop hook must not hold the agent to the checks now: the
+/// checkout's feature (named, else its `hermes/<slug>` branch or only
+/// folder) is in a planning phase, or its gate waits for a person.
+pub fn track_holds_checks(cwd: &Path, feature: Option<&str>) -> Option<String> {
+    use hermes_track::{phases::Gate, phases::Phase, phases::Track};
+    let root = done_when::find_root(cwd);
+    let slug = match feature {
+        Some(s) => s.to_string(),
+        None => hermes_track::find_slug(&root, done_when::current_branch(&root).as_deref())?,
+    };
+    let meta = hermes_track::FeatureDir::new(&root, &slug)
+        .load()
+        .ok()?
+        .meta;
+    if meta.track == Track::Quick {
+        return None;
+    }
+    if meta.gate == Gate::Waiting {
+        return Some(format!(
+            "{slug}: {} waits for the person's review",
+            meta.phase.as_str()
+        ));
+    }
+    if !matches!(meta.phase, Phase::Implement | Phase::Done) {
+        return Some(format!(
+            "{slug} is in the {} phase (planning, no code yet)",
+            meta.phase.as_str()
+        ));
+    }
+    None
+}
+
+/// `hi check --stop-hook`: Claude's Stop hook. Reads the hook payload on
+/// stdin, runs the checks and decides whether the agent may stop.
+fn check_stop_hook(feature: Option<&str>, run_budget: Duration) -> i32 {
+    let payload = read_stdin_json().unwrap_or(serde_json::Value::Null);
+    let continuing = payload
+        .get("stop_hook_active")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let cwd = payload
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    // A Feature Track in a planning phase (no code yet), or waiting at a
+    // gate for the person: the checks are not what this turn is about, and
+    // sending the agent back to "fix" them would make it write code before
+    // the plan is approved, or move past a gate.
+    if let Some(why) = track_holds_checks(&cwd, feature) {
+        eprintln!("hi check: {why}; the checks run in the implement phase");
+        return 0;
+    }
+    let report = done_when::check(&cwd, feature, "stop_hook", run_budget, true);
+    if report.state == done_when::State::None {
+        return 0;
+    }
+    // The attempt count lives next to the session's spool. Without one this
+    // was not started by Hermes; with nowhere to count attempts it must
+    // never block (it could send the agent back forever).
+    let state_file = std::env::var_os(SIGNAL_FILE_ENV)
+        .filter(|f| !f.is_empty())
+        .and_then(|f| PathBuf::from(f).parent().map(|d| d.join(CHECK_STATE_FILE)));
+    let Some(state_file) = state_file else {
+        return 0;
+    };
+    let mut state = std::fs::read_to_string(&state_file)
+        .map(|t| done_when::HookState::parse(&t))
+        .unwrap_or_default();
+    let retry_budget =
+        done_when::budget_from_env(done_when::RETRY_BUDGET_ENV, done_when::DEFAULT_RETRY_BUDGET);
+    let decision = done_when::decide(
+        &mut state,
+        continuing,
+        report.state,
+        done_when::now_ms(),
+        done_when::MAX_ATTEMPTS,
+        retry_budget,
+    );
+    let _ = std::fs::write(&state_file, state.to_json());
+    let max = serde_json::json!(done_when::MAX_ATTEMPTS);
+    match decision {
+        done_when::Decision::Allow => {
+            report_check(check_payload(
+                &report,
+                &[("blocking", false.into()), ("final", true.into())],
+            ));
+            0
+        }
+        done_when::Decision::Block { attempt } => {
+            report_check(check_payload(
+                &report,
+                &[
+                    ("attempt", attempt.into()),
+                    ("max_attempts", max),
+                    ("blocking", true.into()),
+                    ("final", false.into()),
+                ],
+            ));
+            let feedback = report.feedback(Some((attempt, done_when::MAX_ATTEMPTS)));
+            let mut err = std::io::stderr();
+            let _ = err.write_all(feedback.as_bytes());
+            let _ = err.flush();
+            EXIT_BLOCK_STOP
+        }
+        done_when::Decision::GiveUp { attempt } => {
+            report_check(check_payload(
+                &report,
+                &[
+                    ("attempt", attempt.into()),
+                    ("max_attempts", max),
+                    ("blocking", false.into()),
+                    ("final", true.into()),
+                    ("gave_up", true.into()),
+                ],
+            ));
+            0
+        }
+    }
+}
+
+// ─── Entry point ─────────────────────────────────────────────────────
+
+fn usage() -> i32 {
+    eprintln!(
+        "hi {VERSION} — Hermes launch, signal and check helper\n\n\
+         usage:\n  hi run <session-id | launch-file>\n  hi signal [--agent <id>] [--event <name>] [--argv-json <json>]\n  hi check [--json] [--feature <slug>] [--stop-hook]\n\
+         \n  hi feature new <slug> [--track Quick|Light|Full] [--title <text>] [--no-branch]\n\
+         \x20 hi feature check\n\
+         \x20 hi phase [questions|research|design|structure|plan|implement|done]\n\
+         \x20 hi phase skip         (people only)\n\
+         \x20 hi approve            (people only: refuses when HERMES_AGENT is set)\n\
+         \x20 hi land [--body-file <path>]\n  hi status [--all]\n  hi --version"
+    );
+    EXIT_USAGE
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let code = match args.first().map(String::as_str) {
+        Some("run") => match args.get(1) {
+            Some(arg) if args.len() == 2 => cmd_run(arg),
+            _ => usage(),
+        },
+        Some("signal") => cmd_signal(&args[1..]),
+        Some("check") => cmd_check(&args[1..]),
+        Some("feature") => track_cmd::cmd_feature(&cwd, &args[1..]),
+        Some("phase") => track_cmd::cmd_phase(&cwd, &args[1..]),
+        Some("approve") => track_cmd::cmd_approve(&cwd, &args[1..]),
+        Some("land") => track_cmd::cmd_land(&cwd, &args[1..]),
+        Some("status") => track_cmd::cmd_status(&cwd, &args[1..]),
+        Some("--version") | Some("-V") | Some("version") => {
+            println!("hi {VERSION} (launch file v{SPEC_VERSION})");
+            0
+        }
+        _ => usage(),
+    };
+    std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_stop_hook_leaves_the_checks_to_the_implement_phase() {
+        use hermes_track::{feature, Track};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/hermes/demo\n").unwrap();
+        // No feature: the checks apply.
+        assert_eq!(track_holds_checks(root, None), None);
+        feature::create(root, "demo", Track::Full, "", "").unwrap();
+        // Planning: questions, gate none.
+        let why = track_holds_checks(root, None).unwrap();
+        assert!(why.contains("questions phase"), "{why}");
+        // Waiting at a gate.
+        std::fs::write(root.join(".hermes/features/demo/questions.md"), "# Q\n").unwrap();
+        feature::finish_phase(root, "demo").unwrap();
+        assert!(track_holds_checks(root, None)
+            .unwrap()
+            .contains("waits for the person's review"));
+        // Implement, working: the checks hold the agent.
+        let file = root.join(".hermes/features/demo/feature.md");
+        let text = std::fs::read_to_string(&file).unwrap();
+        let text =
+            hermes_track::set_keys(&text, &[("phase", "implement"), ("gate", "none")]).unwrap();
+        std::fs::write(&file, text).unwrap();
+        assert_eq!(track_holds_checks(root, None), None);
+        // A Quick track never holds them back.
+        feature::create(root, "quick", Track::Quick, "", "").unwrap();
+        assert_eq!(track_holds_checks(root, Some("quick")), None);
+    }
+
+    fn write_exe(dir: &Path, name: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        p
+    }
+
+    #[test]
+    fn parses_a_launch_file_with_a_fallback() {
+        let spec = LaunchSpec::parse(
+            r#"{"v":1,"session_id":"s1","agent":"claude","cwd":"/tmp/x","env":{"A":"1"},
+                "program":"claude","args":["--resume","abc"],
+                "fallback":{"program":"claude","args":["--session-id","def"],"after_ms":3000,"vendor_session_id":"def"}}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.program, "claude");
+        assert_eq!(spec.args, vec!["--resume", "abc"]);
+        assert_eq!(spec.env["A"], "1");
+        let fb = spec.fallback.unwrap();
+        assert_eq!(fb.args, vec!["--session-id", "def"]);
+        assert_eq!(fb.vendor_session_id.as_deref(), Some("def"));
+        assert_eq!(fb.after_ms, 3000);
+    }
+
+    #[test]
+    fn refuses_other_versions_and_missing_programs() {
+        assert!(LaunchSpec::parse(r#"{"v":2,"program":"x"}"#)
+            .unwrap_err()
+            .contains("version 2"));
+        assert!(LaunchSpec::parse(r#"{"v":1}"#)
+            .unwrap_err()
+            .contains("program"));
+        assert!(LaunchSpec::parse(r#"{"v":1,"program":"x","args":[1]}"#)
+            .unwrap_err()
+            .contains("args"));
+        assert!(LaunchSpec::parse("nope").unwrap_err().contains("JSON"));
+    }
+
+    #[test]
+    fn locates_the_launch_file_by_session_id_or_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let sess = dir.path().join("abc-123");
+        std::fs::create_dir_all(&sess).unwrap();
+        std::fs::write(sess.join(LAUNCH_FILE_NAME), "{}").unwrap();
+        assert_eq!(
+            locate_spec("abc-123", Some(dir.path())).unwrap(),
+            sess.join(LAUNCH_FILE_NAME)
+        );
+        let direct = sess.join(LAUNCH_FILE_NAME);
+        assert_eq!(locate_spec(direct.to_str().unwrap(), None).unwrap(), direct);
+        assert!(locate_spec("missing", Some(dir.path())).is_err());
+        assert!(locate_spec("../abc-123", Some(dir.path())).is_err());
+        assert!(locate_spec("abc-123", None)
+            .unwrap_err()
+            .contains(LAUNCH_DIR_ENV));
+    }
+
+    #[test]
+    fn resolves_a_program_on_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let name = if cfg!(windows) {
+            "fake-agent.cmd"
+        } else {
+            "fake-agent"
+        };
+        let exe = write_exe(dir.path(), name);
+        let path = std::env::join_paths([other.path(), dir.path()]).unwrap();
+        // On Windows the extension comes from PATHEXT (`.CMD`), and the file
+        // system does not care about case; compare without it there.
+        let same_file = |a: &Path, b: &Path| {
+            if cfg!(windows) {
+                a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+            } else {
+                a == b
+            }
+        };
+        let found = resolve_program(
+            "fake-agent",
+            Some(&path),
+            Some(OsStr::new(".COM;.EXE;.CMD")),
+        )
+        .expect("fake-agent is on PATH");
+        assert!(same_file(&found, &exe), "{found:?} vs {exe:?}");
+        assert_eq!(resolve_program("no-such-agent", Some(&path), None), None);
+        // A path is used as given.
+        assert_eq!(
+            resolve_program(exe.to_str().unwrap(), Some(&path), None),
+            Some(exe)
+        );
+        assert_eq!(
+            resolve_program(dir.path().join("nope").to_str().unwrap(), None, None),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_without_the_execute_bit_is_not_a_program() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("script"), "x").unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        assert_eq!(resolve_program("script", Some(&path), None), None);
+    }
+
+    fn fallback(not_found: Option<NotFound>) -> Fallback {
+        Fallback {
+            program: "x".into(),
+            args: vec![],
+            after_ms: 3000,
+            vendor_session_id: None,
+            message: None,
+            not_found,
+        }
+    }
+
+    const QUICK: Duration = Duration::from_millis(200);
+
+    #[test]
+    fn an_interrupted_resume_never_falls_back() {
+        // Ctrl-C at a resumed agent's trust prompt: exit 130, or killed by
+        // SIGINT, or Windows' Ctrl-C status. The conversation must stay,
+        // even with a catalog entry that accepts any exit code.
+        let any_code = fallback(Some(NotFound::default()));
+        for ended in [
+            Ended::Code(130),
+            Ended::Signal(2),
+            Ended::Signal(15),
+            Ended::Signal(9),
+            Ended::Code(143),
+            Ended::Code(0xC000_013Au32 as i32),
+        ] {
+            assert!(ended.is_interrupt(), "{ended:?}");
+            assert_eq!(
+                resume_verdict(ended, QUICK, Some(&any_code)),
+                ResumeVerdict::Keep,
+                "{ended:?}"
+            );
+        }
+        assert!(!Ended::Code(1).is_interrupt());
+        assert!(!Ended::Code(42).is_interrupt());
+        assert!(!Ended::Code(128).is_interrupt());
+        assert_eq!(Ended::Signal(2).code(), 130);
+    }
+
+    #[test]
+    fn only_the_vendors_own_not_found_exit_falls_back() {
+        // No catalog entry: an early exit proves nothing.
+        assert_eq!(
+            resume_verdict(Ended::Code(1), QUICK, Some(&fallback(None))),
+            ResumeVerdict::Keep
+        );
+        assert_eq!(
+            resume_verdict(Ended::Code(1), QUICK, None),
+            ResumeVerdict::Keep
+        );
+        let codes = fallback(Some(NotFound {
+            exit_codes: vec![1],
+            ..NotFound::default()
+        }));
+        assert_eq!(
+            resume_verdict(Ended::Code(1), QUICK, Some(&codes)),
+            ResumeVerdict::FallBack
+        );
+        // Another code, a clean exit, or a late failure keeps it.
+        assert_eq!(
+            resume_verdict(Ended::Code(2), QUICK, Some(&codes)),
+            ResumeVerdict::Keep
+        );
+        assert_eq!(
+            resume_verdict(Ended::Code(0), QUICK, Some(&codes)),
+            ResumeVerdict::Keep
+        );
+        assert_eq!(
+            resume_verdict(Ended::Code(1), Duration::from_millis(3001), Some(&codes)),
+            ResumeVerdict::Keep
+        );
+        // With a text to look for, the exit only qualifies; Hermes must
+        // also have seen the text.
+        let text = fallback(Some(NotFound {
+            exit_codes: vec![1],
+            evidence_file: Some(PathBuf::from("/nonexistent/evidence")),
+            evidence_wait_ms: 10,
+        }));
+        assert_eq!(
+            resume_verdict(Ended::Code(1), QUICK, Some(&text)),
+            ResumeVerdict::NeedsEvidence
+        );
+        assert_eq!(
+            resume_verdict(Ended::Code(130), QUICK, Some(&text)),
+            ResumeVerdict::Keep
+        );
+    }
+
+    #[test]
+    fn evidence_counts_only_with_this_launchs_nonce() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("resume-not-found");
+        assert!(!evidence_present(&file, Some("n1")));
+        std::fs::write(&file, "n0\n").unwrap();
+        assert!(!evidence_present(&file, Some("n1")), "another launch's");
+        std::fs::write(&file, "n1\n").unwrap();
+        assert!(evidence_present(&file, Some("n1")));
+        assert!(evidence_present(&file, None));
+        assert!(wait_for_evidence(&file, Some("n1"), Duration::ZERO));
+        let start = Instant::now();
+        assert!(!wait_for_evidence(
+            &dir.path().join("none"),
+            Some("n1"),
+            Duration::from_millis(100)
+        ));
+        assert!(start.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn parses_the_not_found_block() {
+        let spec = LaunchSpec::parse(
+            r#"{"v":1,"program":"claude","fallback":{"program":"claude",
+                "not_found":{"exit_codes":[1,42],"evidence_file":"/x/resume-not-found"}}}"#,
+        )
+        .unwrap();
+        let nf = spec.fallback.unwrap().not_found.unwrap();
+        assert_eq!(nf.exit_codes, vec![1, 42]);
+        assert_eq!(
+            nf.evidence_file.as_deref(),
+            Some(Path::new("/x/resume-not-found"))
+        );
+        assert_eq!(nf.evidence_wait_ms, DEFAULT_EVIDENCE_WAIT_MS);
+        let none =
+            LaunchSpec::parse(r#"{"v":1,"program":"x","fallback":{"program":"x"}}"#).unwrap();
+        assert!(none.fallback.unwrap().not_found.is_none());
+        assert!(LaunchSpec::parse(
+            r#"{"v":1,"program":"x","fallback":{"program":"x","not_found":{"exit_codes":["1"]}}}"#
+        )
+        .unwrap_err()
+        .contains("exit_codes"));
+    }
+
+    #[test]
+    fn signal_lines_are_dated_to_the_millisecond_and_name_antigravity_tools() {
+        // Antigravity's PreToolUse: no event name in the payload (the hook
+        // file names it), the tool inside `toolCall` with its arguments.
+        let payload = serde_json::json!({
+            "conversationId": "c-1",
+            "stepIdx": 4,
+            "toolCall": {"name": "run_command", "args": {"CommandLine": "curl https://example.com"}},
+        });
+        let before = now_unix_ms();
+        let line = signal_line(
+            Some("PreToolUse"),
+            "antigravity",
+            "hermes-1",
+            Some("n"),
+            Some(&payload),
+        );
+        let after = now_unix_ms();
+        assert_eq!(line["event"], "PreToolUse");
+        let kept = line["payload"].as_object().unwrap();
+        assert_eq!(kept["tool_name"], "run_command");
+        assert!(kept.get("toolCall").is_none());
+        assert!(!serde_json::to_string(&line).unwrap().contains("curl"));
+        let ms = line["ts_ms"].as_u64().unwrap();
+        assert!(ms >= before && ms <= after);
+        assert_eq!(line["ts"].as_u64().unwrap(), ms / 1000);
+        // A payload's own tool_name wins over toolCall.
+        let both = serde_json::json!({"tool_name": "Bash", "toolCall": {"name": "x"}});
+        let line = signal_line(None, "claude", "s", Some("n"), Some(&both));
+        assert_eq!(line["payload"]["tool_name"], "Bash");
+    }
+
+    #[test]
+    fn signal_lines_keep_only_small_known_fields() {
+        let big = "x".repeat(5000);
+        let payload = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "abc",
+            "cwd": "/repo",
+            "tool_input": {"command": "rm -rf /"},
+            "last_assistant_message": big,
+            "transcript_path": big,
+            "stop_hook_active": false,
+            "prompt": "[hermes-review #3] Please read the review",
+        });
+        let line = signal_line(
+            Some("Other"),
+            "claude",
+            "hermes-1",
+            Some("abc123"),
+            Some(&payload),
+        );
+        assert_eq!(line["event"], "SessionStart");
+        assert_eq!(line["agent"], "claude");
+        assert_eq!(line["session"], "hermes-1");
+        assert_eq!(line["nonce"], "abc123");
+        assert_eq!(line["v"], 1);
+        let kept = line["payload"].as_object().unwrap();
+        assert_eq!(kept["session_id"], "abc");
+        assert_eq!(kept["stop_hook_active"], false);
+        assert!(kept.get("tool_input").is_none());
+        assert!(kept.get("last_assistant_message").is_none());
+        // The prompt never reaches the spool; only Hermes's own markers in
+        // it do (F21), as `hermes_tags`.
+        assert!(kept.get("prompt").is_none());
+        assert_eq!(kept["hermes_tags"], serde_json::json!(["hermes-review#3"]));
+        assert!(!serde_json::to_string(&line)
+            .unwrap()
+            .contains("Please read the review"));
+        assert_eq!(
+            kept["transcript_path"].as_str().unwrap().len(),
+            MAX_FIELD_CHARS
+        );
+        assert!(serde_json::to_string(&line).unwrap().len() < 8 * 1024);
+    }
+
+    #[test]
+    fn markers_are_lifted_from_text_and_a_plain_prompt_leaves_no_field() {
+        assert_eq!(
+            tags_in_text("[hermes-review #3] Please read /tmp/review-3.md"),
+            vec!["hermes-review#3"]
+        );
+        assert_eq!(
+            tags_in_text("[hermes-review #3] again [hermes-review #3] and [hermes-gate #12]"),
+            vec!["hermes-review#3", "hermes-gate#12"]
+        );
+        for bad in [
+            "[hermes-review #]",
+            "[hermes-review 3]",
+            "[hermes- #3]",
+            "[hermes-review #x]",
+            "[hermes-review #3",
+            "no markers here",
+        ] {
+            assert!(tags_in_text(bad).is_empty(), "{bad}");
+        }
+        let plain = signal_line(
+            Some("UserPromptSubmit"),
+            "claude",
+            "s",
+            Some("n"),
+            Some(&serde_json::json!({ "prompt": "fix the tests" })),
+        );
+        assert!(plain["payload"].get("hermes_tags").is_none());
+        assert!(plain["payload"].get("prompt").is_none());
+    }
+
+    #[test]
+    fn a_batch_shim_gets_line_breaks_as_spaces_and_everything_else_untouched() {
+        let args = vec![
+            "-c".to_string(),
+            "Task:\nFix \"login\"\r\n- new: src/a.ts\rend".to_string(),
+            "100%".to_string(),
+        ];
+        for shim in ["codex.cmd", "C:/npm/gemini.CMD", "tool.bat"] {
+            assert!(is_batch_file(Path::new(shim)), "{shim}");
+            assert_eq!(
+                args_for(Path::new(shim), &args),
+                vec!["-c", "Task: Fix \"login\" - new: src/a.ts end", "100%"]
+            );
+        }
+        for program in ["codex", "codex.exe", "/usr/local/bin/codex", "run.cmd.sh"] {
+            assert!(!is_batch_file(Path::new(program)), "{program}");
+            assert_eq!(args_for(Path::new(program), &args), args);
+        }
+    }
+
+    #[test]
+    fn a_status_line_record_keeps_only_the_rate_limit_numbers() {
+        // What Claude Code pipes to a status line command (trimmed).
+        let payload = serde_json::json!({
+            "session_id": "abc",
+            "model": { "id": "fake-model", "display_name": "Fake" },
+            "workspace": { "current_dir": "/repo" },
+            "rate_limits": {
+                "five_hour": { "used_percentage": 100, "resets_at": 1790007200, "extra": "x" },
+                "seven_day": { "used_percentage": 41.5, "resets_at": "2026-09-30T10:00:00Z" },
+                "bad name!": { "used_percentage": 1 },
+                "not_an_object": 7,
+                "empty": { "label": "nothing we read" },
+            },
+        });
+        let line = signal_line(
+            Some("StatusLine"),
+            "claude",
+            "h1",
+            Some("n"),
+            Some(&payload),
+        );
+        assert_eq!(line["event"], "StatusLine");
+        let kept = line["payload"].as_object().unwrap();
+        // The model the agent runs is kept as its id (the session's model chip).
+        assert_eq!(kept.get("model"), Some(&serde_json::json!("fake-model")));
+        assert!(kept.get("workspace").is_none());
+        assert_eq!(
+            kept["rate_limits"],
+            serde_json::json!({
+                "five_hour": { "used_percentage": 100, "resets_at": 1790007200 },
+                "seven_day": { "used_percentage": 41.5, "resets_at": "2026-09-30T10:00:00Z" },
+            })
+        );
+        // No rate limits at all: no key.
+        let none = signal_line(
+            Some("StatusLine"),
+            "claude",
+            "h1",
+            Some("n"),
+            Some(&serde_json::json!({ "rate_limits": {} })),
+        );
+        assert!(none["payload"].get("rate_limits").is_none());
+    }
+
+    #[test]
+    fn a_status_line_record_keeps_the_window_size_and_nothing_else_of_context_window() {
+        // Claude Code 2.1.286's status line input (captured from a real run,
+        // paths and ids replaced).
+        let payload = serde_json::json!({
+            "session_id": "00000000-0000-4000-8000-000000000001",
+            "transcript_path": "/fixture-home/.claude/projects/x/s.jsonl",
+            "model": { "id": "claude-haiku-4-5-20251001", "display_name": "Haiku 4.5" },
+            "context_window": {
+                "total_input_tokens": 41150, "total_output_tokens": 27,
+                "context_window_size": 200000,
+                "current_usage": { "input_tokens": 8, "output_tokens": 27, "cache_creation_input_tokens": 229, "cache_read_input_tokens": 40913 },
+                "used_percentage": 21, "remaining_percentage": 79
+            },
+            "exceeds_200k_tokens": false
+        });
+        let line = signal_line(
+            Some("StatusLine"),
+            "claude",
+            "h1",
+            Some("n"),
+            Some(&payload),
+        );
+        let kept = line["payload"].as_object().unwrap();
+        assert_eq!(
+            kept.get("context_window_size"),
+            Some(&serde_json::json!(200000))
+        );
+        assert!(kept.get("context_window").is_none());
+        assert_eq!(
+            kept.get("model"),
+            Some(&serde_json::json!("claude-haiku-4-5-20251001"))
+        );
+        for junk in [
+            serde_json::json!(0),
+            serde_json::json!("200000"),
+            serde_json::json!(-1),
+        ] {
+            let p = serde_json::json!({ "context_window": { "context_window_size": junk } });
+            let l = signal_line(Some("StatusLine"), "claude", "h1", Some("n"), Some(&p));
+            assert!(l["payload"].get("context_window_size").is_none(), "{p}");
+        }
+    }
+
+    #[test]
+    fn the_reported_model_is_kept_from_a_hook_or_antigravitys_model_name() {
+        let hook = signal_line(
+            None,
+            "claude",
+            "s",
+            Some("n"),
+            Some(
+                &serde_json::json!({ "hook_event_name": "SessionStart", "model": "claude-haiku-4-5-20251001" }),
+            ),
+        );
+        assert_eq!(hook["payload"]["model"], "claude-haiku-4-5-20251001");
+        let agy = signal_line(
+            None,
+            "antigravity",
+            "s",
+            Some("n"),
+            Some(
+                &serde_json::json!({ "hook_event_name": "Stop", "modelName": "gemini-3.6-flash-medium" }),
+            ),
+        );
+        assert_eq!(agy["payload"]["model"], "gemini-3.6-flash-medium");
+        let none = signal_line(
+            None,
+            "codex",
+            "s",
+            Some("n"),
+            Some(&serde_json::json!({ "type": "agent-turn-complete", "model": "  " })),
+        );
+        assert!(none["payload"].get("model").is_none());
+    }
+
+    #[test]
+    fn signal_event_falls_back_to_the_flag_then_unknown() {
+        assert_eq!(
+            signal_line(Some("Stop"), "codex", "s", None, None)["event"],
+            "Stop"
+        );
+        assert_eq!(
+            signal_line(None, "codex", "s", None, None)["event"],
+            "unknown"
+        );
+        // Codex's notify program: the payload's `type` names the event.
+        let notify = serde_json::json!({"type":"agent-turn-complete","thread-id":"t-1","last-assistant-message":"done"});
+        let line = signal_line(None, "codex", "s", None, Some(&notify));
+        assert_eq!(line["event"], "agent-turn-complete");
+        assert_eq!(line["payload"]["thread-id"], "t-1");
+        assert!(line["payload"].get("last-assistant-message").is_none());
+        // goose names it `event`; Antigravity's Stop carries `fullyIdle`.
+        let goose = serde_json::json!({"event":"Stop","session_id":"g-1"});
+        assert_eq!(
+            signal_line(Some("Other"), "goose", "s", None, Some(&goose))["event"],
+            "Stop"
+        );
+        let agy = serde_json::json!({"fullyIdle":true,"conversationId":"c-1","error":"x"});
+        let line = signal_line(Some("Stop"), "antigravity", "s", None, Some(&agy));
+        assert_eq!(line["event"], "Stop");
+        assert_eq!(line["payload"]["fullyIdle"], true);
+        assert_eq!(line["payload"]["conversationId"], "c-1");
+        // The flag wins over `type` (a hook file that names the event).
+        let typed = serde_json::json!({"type":"something"});
+        assert_eq!(
+            signal_line(Some("Stop"), "x", "s", None, Some(&typed))["event"],
+            "Stop"
+        );
+        let not_object = serde_json::json!(["a"]);
+        assert_eq!(
+            signal_line(Some("E"), "x", "s", None, Some(&not_object))["event"],
+            "E"
+        );
+    }
+
+    #[test]
+    fn a_line_without_a_nonce_has_no_nonce_field() {
+        let line = signal_line(Some("Stop"), "x", "s", None, None);
+        assert!(line.get("nonce").is_none());
+        let empty = signal_line(Some("Stop"), "x", "s", Some(""), None);
+        assert!(empty.get("nonce").is_none());
+    }
+
+    #[test]
+    fn parses_the_stop_block_and_ignores_a_missing_one() {
+        let text = r#"{"v":1,"session_id":"s","agent":"claude","cwd":null,"env":{},"program":"claude","args":[],
+            "stop":{"file":"/tmp/x/launch-stop","window_ms":1234}}"#;
+        let spec = LaunchSpec::parse(text).unwrap();
+        let stop = spec.stop.unwrap();
+        assert_eq!(
+            (stop.file, stop.window_ms),
+            (PathBuf::from("/tmp/x/launch-stop"), 1234)
+        );
+        let plain = r#"{"v":1,"program":"claude"}"#;
+        assert!(LaunchSpec::parse(plain).unwrap().stop.is_none());
+        assert!(!LaunchSpec::parse(plain).unwrap().clear_screen);
+        let again = r#"{"v":1,"program":"claude","clear_screen":true}"#;
+        assert!(LaunchSpec::parse(again).unwrap().clear_screen);
+    }
+
+    #[test]
+    fn a_stop_counts_only_with_this_launchs_nonce() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("launch-stop");
+        assert_eq!(stop_requested(&file, Some("n1")), None);
+        std::fs::write(&file, "n0\nold words\n").unwrap();
+        assert_eq!(stop_requested(&file, Some("n1")), None);
+        std::fs::write(
+            &file,
+            "n1\nThere's an issue with the selected model (x).\u{1b}[0m\n",
+        )
+        .unwrap();
+        assert_eq!(
+            stop_requested(&file, Some("n1")).as_deref(),
+            Some("There's an issue with the selected model (x).[0m")
+        );
+        std::fs::write(&file, "n1\n").unwrap();
+        assert_eq!(stop_requested(&file, Some("n1")).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn the_stopped_text_gives_the_terminal_back_and_repeats_the_words() {
+        let t = stopped_text("claude", "Not logged in · Please run /login");
+        assert!(t.starts_with(TERMINAL_RESET));
+        assert!(t.contains("\r\nNot logged in · Please run /login\r\n"));
+        assert!(t.ends_with(
+            "hermes: claude refused this launch; Hermes stopped it. Nothing more will run.\r\n"
+        ));
+        assert!(!stopped_text("", "").contains("\r\n\r\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_ends_a_running_agent_and_its_children_within_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("launch-stop");
+        let sh = PathBuf::from("/bin/sh");
+        // A wrapper that starts a child of its own, like an npm-installed CLI.
+        let args = vec!["-c".to_string(), "sleep 30 & wait".to_string()];
+        let watch = StopWatch {
+            file: &file,
+            nonce: Some("n1"),
+            window: Duration::from_secs(20),
+        };
+        let writer = {
+            let file = file.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                std::fs::write(&file, "n1\nrefused\n").unwrap();
+            })
+        };
+        let t0 = Instant::now();
+        let (status, message) =
+            run_child(&sh, &args, &BTreeMap::new(), None, None, Some(&watch)).unwrap();
+        writer.join().unwrap();
+        assert_eq!(message.as_deref(), Some("refused"));
+        assert!(!status.success());
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "stopped at once, not after the sleep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_stop_after_the_window_and_none_without_a_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("launch-stop");
+        std::fs::write(&file, "n1\nlate\n").unwrap();
+        let sh = PathBuf::from("/bin/sh");
+        let args = vec!["-c".to_string(), "sleep 0.4".to_string()];
+        let watch = StopWatch {
+            file: &file,
+            nonce: Some("n1"),
+            window: Duration::from_millis(0),
+        };
+        let (status, message) =
+            run_child(&sh, &args, &BTreeMap::new(), None, None, Some(&watch)).unwrap();
+        assert!(
+            status.success() && message.is_none(),
+            "a stop outside the window is ignored"
+        );
+        let other = StopWatch {
+            file: &file,
+            nonce: Some("n2"),
+            window: Duration::from_secs(5),
+        };
+        let (status, message) =
+            run_child(&sh, &args, &BTreeMap::new(), None, None, Some(&other)).unwrap();
+        assert!(
+            status.success() && message.is_none(),
+            "another launch's stop is ignored"
+        );
+    }
+
+    #[test]
+    fn the_launch_marker_is_an_osc_the_app_knows() {
+        assert_eq!(launch_marker("n0"), "\x1b]777;hermes-launch;n0\x07");
+    }
+}

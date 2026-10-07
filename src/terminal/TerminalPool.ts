@@ -11,18 +11,21 @@
 
 import { listen } from "@tauri-apps/api/event";
 import { writeToSession } from "../api/sessions";
+import { noteUserInput } from "../agent/status/userInput";
 import { suggest } from "./intelligence/suggestionEngine";
 import { resolveIntent, getIntentSuggestions } from "./intentCommands";
 import { type ProjectContext, getCachedContext } from "./intelligence/contextAnalyzer";
 import { type SuggestionState } from "./intelligence/SuggestionOverlay";
 import {
   isIntelligenceDisabled,
+  applyShellSuggestionsSetting,
   shouldShowGhostText,
   shouldShowOverlay,
   shouldConsumeTab,
 } from "./intelligence/shellEnvironment";
 
 import { THEMES, FONT_FAMILIES } from "./themes";
+import { parseFontSize } from "./terminalKeys";
 import {
   pool,
   setCurrentSettings,
@@ -35,6 +38,7 @@ import {
   has,
   clearTerminal,
   writeScrollback,
+  releaseOutput,
   subscribeSuggestions,
   notifySubscribers,
   setSessionPhase,
@@ -50,6 +54,8 @@ import {
   cleanSelection,
   estimateInitialDimensions,
   getFocusedSessionId,
+  refreshShellForeground,
+  pasteIntoTerminal,
   type PoolEntry,
 } from "./pool";
 
@@ -68,10 +74,11 @@ const SUGGESTION_DEBOUNCE_MS = 50;
 
 export function updateSettings(settings: Record<string, string>): void {
   setCurrentSettings(settings);
+  applyShellSuggestionsSetting(settings);
   // Apply to all existing terminals
   const themeName = settings.theme || "frosted-dark";
   const theme = THEMES[themeName] || THEMES["frosted-dark"];
-  const fontSize = parseInt(settings.font_size || "14", 10);
+  const fontSize = parseFontSize(settings.font_size);
   const fontFamily = FONT_FAMILIES[settings.font_family || "default"] || FONT_FAMILIES.default;
   const scrollback = parseInt(settings.scrollback || "10000", 10);
 
@@ -85,7 +92,7 @@ export function updateSettings(settings: Record<string, string>): void {
     if (entry.attached && entry.opened) {
       try {
         const proposed = entry.fitAddon.proposeDimensions();
-        if (proposed && proposed.cols >= 10 && proposed.rows >= 2) {
+        if (proposed && Number.isFinite(proposed.cols) && Number.isFinite(proposed.rows) && proposed.cols >= 10 && proposed.rows >= 2) {
           entry.fitAddon.fit();
           entry.terminal.refresh(0, entry.terminal.rows - 1);
         }
@@ -118,9 +125,9 @@ export function setupNativeSigintListener(): void {
 
 // ─── Terminal Creation (wires input handler) ─────────────────────────
 
-export async function createTerminal(sessionId: string, color: string): Promise<void> {
+export async function createTerminal(sessionId: string, color: string, opts?: { holdOutput?: boolean }): Promise<void> {
   setupNativeSigintListener(); // idempotent — sets up once
-  return createTerminalCore(sessionId, color, handleTerminalInput);
+  return createTerminalCore(sessionId, color, handleTerminalInput, opts);
 }
 
 // ─── Input Handling & Intelligence ───────────────────────────────────
@@ -128,10 +135,9 @@ export async function createTerminal(sessionId: string, color: string): Promise<
 function handleTerminalInput(sessionId: string, data: string): void {
   const entry = pool.get(sessionId);
   if (!entry) return;
+  // The session status needs to know a person answered (deriveStatus, rule 6).
+  noteUserInput(sessionId, data);
 
-  const phase = entry.sessionPhase;
-  const intelligenceActive = !isIntelligenceDisabled() &&
-    (phase === "idle" || phase === "shell_ready");
   const overlayVisible = entry.suggestionState?.visible ?? false;
 
   // ── Dismiss stale overlay when alternate buffer becomes active ──
@@ -160,9 +166,12 @@ function handleTerminalInput(sessionId: string, data: string): void {
       moveSuggestionSelection(sessionId, 1);
       return; // CONSUME
     }
-    // Tab — accept selected if an item is highlighted (respects shell compatibility)
+    // Tab — accept selected if an item is highlighted (respects shell compatibility;
+    // a ':' intent is Hermes's own, so it's accepted whatever the shell setup)
     if (data === "\t") {
-      if (entry.suggestionState.selectedIndex !== null && shouldConsumeTab(sessionId, true)) {
+      const { selectedIndex, suggestions } = entry.suggestionState;
+      const selectedIsIntent = selectedIndex !== null && suggestions[selectedIndex]?.badge === "intent";
+      if (selectedIndex !== null && (selectedIsIntent || shouldConsumeTab(sessionId, true))) {
         acceptSuggestion(sessionId);
         return; // CONSUME
       }
@@ -210,6 +219,13 @@ function handleTerminalInput(sessionId: string, data: string): void {
     return;
   }
 
+  // ── Intent command interception ──
+  // Runs before the buffer update below, which clears the buffer on Enter —
+  // the typed ':' command is needed to resolve the intent.
+  if (data === "\r" && runIntentCommand(sessionId, entry, entry.inputBuffer)) {
+    return;
+  }
+
   // ── Update input buffer ──
   // Always track input regardless of phase — the buffer must reflect what
   // the user has typed. Only suggestion computation is gated on phase,
@@ -219,23 +235,6 @@ function handleTerminalInput(sessionId: string, data: string): void {
   // ── Clear ghost text on any non-navigation keystroke ──
   if (entry.ghostText) {
     clearGhostText(sessionId);
-  }
-
-  // ── Intent command interception ──
-  if (data === "\r" && intelligenceActive && entry.inputBuffer.trimStart().startsWith(":")) {
-    const result = resolveIntent(entry.inputBuffer, { cwd: entry.cwd });
-    if (result.resolved) {
-      const eraseSequence = "\x7f".repeat(entry.inputBuffer.length);
-      const fullData = eraseSequence + result.command + "\r";
-      entry.historyProvider.addCommand(result.command);
-      entry.inputBuffer = "";
-      dismissSuggestions(sessionId);
-      clearGhostText(sessionId);
-      writeToSession(sessionId, utf8ToBase64(fullData)).catch((err) => {
-        console.warn(`[TerminalPool] write_to_session (intent) failed:`, err);
-      });
-      return;
-    }
   }
 
   // ── Pass data to PTY ──
@@ -258,6 +257,42 @@ function handleTerminalInput(sessionId: string, data: string): void {
   }
 }
 
+/**
+ * Whether typed input is going to the shell's own prompt rather than to a
+ * program running in it. Uses lastStablePhase: sessionPhase reads "busy"
+ * from the echo of each keystroke until the output has been quiet for a
+ * while, so it can't gate what Enter does.
+ */
+function isAtShellPrompt(entry: PoolEntry): boolean {
+  if (entry.lastStablePhase !== "idle" && entry.lastStablePhase !== "shell_ready") return false;
+  if (entry.terminal.buffer.active.type === "alternate") return false;
+  return entry.shellIsForeground;
+}
+
+/**
+ * Run a ':' intent command: erase what's typed on the prompt and write the
+ * resolved shell command + Enter. Returns false (nothing written) when
+ * `intentText` isn't a known intent or the shell isn't at its prompt.
+ * Intent commands work whether or not Hermes inline suggestions are on.
+ */
+function runIntentCommand(sessionId: string, entry: PoolEntry, intentText: string): boolean {
+  if (!intentText.trimStart().startsWith(":")) return false;
+  if (isIntelligenceDisabled() || !isAtShellPrompt(entry)) return false;
+  const result = resolveIntent(intentText, { cwd: entry.cwd });
+  if (!result.resolved) return false;
+
+  const eraseSequence = "\x7f".repeat(entry.inputBuffer.length);
+  const fullData = eraseSequence + result.command + "\r";
+  entry.historyProvider.addCommand(result.command);
+  entry.inputBuffer = "";
+  dismissSuggestions(sessionId);
+  clearGhostText(sessionId);
+  writeToSession(sessionId, utf8ToBase64(fullData)).catch((err) => {
+    console.warn(`[TerminalPool] write_to_session (intent) failed:`, err);
+  });
+  return true;
+}
+
 /** Remove the last Unicode code point from the buffer (surrogate-pair safe) */
 function sliceLastCodePoint(buf: string): string {
   if (buf.length === 0) return buf;
@@ -270,6 +305,19 @@ function sliceLastCodePoint(buf: string): string {
     }
   }
   return buf.slice(0, -1);
+}
+
+/**
+ * Add the typed line to suggestion history — but only when it was typed at
+ * the shell prompt. Input typed inside an interactive program (Claude, vim,
+ * less, etc.) is not a shell command and must not feed suggestions (#172).
+ */
+function recordInputInHistory(entry: PoolEntry): void {
+  const command = entry.inputBuffer.trim();
+  if (!command) return;
+  if (!entry.shellIsForeground) return;
+  if (entry.terminal.buffer.active.type === "alternate") return;
+  entry.historyProvider.addCommand(command);
 }
 
 function updateInputBuffer(entry: PoolEntry, data: string): void {
@@ -285,9 +333,7 @@ function updateInputBuffer(entry: PoolEntry, data: string): void {
       dismissSuggestionsForEntry(entry);
     } else if (code === 0x0d) {
       // Enter — log to history and clear
-      if (entry.inputBuffer.trim()) {
-        entry.historyProvider.addCommand(entry.inputBuffer.trim());
-      }
+      recordInputInHistory(entry);
       entry.inputBuffer = "";
       dismissSuggestionsForEntry(entry);
     } else if (code === 0x1b) {
@@ -318,9 +364,7 @@ function updateInputBuffer(entry: PoolEntry, data: string): void {
       dismissSuggestionsForEntry(entry);
     } else if (code === 0x0d) {
       // Enter within paste — log to history and clear
-      if (entry.inputBuffer.trim()) {
-        entry.historyProvider.addCommand(entry.inputBuffer.trim());
-      }
+      recordInputInHistory(entry);
       entry.inputBuffer = "";
       dismissSuggestionsForEntry(entry);
     } else if (code === 0x1b) {
@@ -346,37 +390,59 @@ function updateInputBuffer(entry: PoolEntry, data: string): void {
   }
 }
 
-function computeSuggestions(sessionId: string): void {
-  const entry = pool.get(sessionId);
-  if (!entry || !entry.inputBuffer.trim()) return;
-  if (isIntelligenceDisabled()) return;
-  if (!shouldShowOverlay(sessionId)) return;
+/**
+ * Whether suggestions may be drawn for what is typed now: only on the
+ * shell's own prompt, never while a program the shell started (an agent
+ * CLI, an editor, a pager) is reading the keys.
+ */
+function maySuggest(entry: PoolEntry): boolean {
+  if (!entry.inputBuffer.trim()) return false;
+  if (isIntelligenceDisabled()) return false;
 
   // Only show suggestions when the shell is at an interactive prompt.
   // Use lastStablePhase instead of sessionPhase — the current phase can
   // be "busy" from echo-flicker (both shell AND AI agent echo trigger it).
   // lastStablePhase tracks the real state: "idle"/"shell_ready" = shell
   // prompt, "needs_input" = AI agent, "creating"/etc. = lifecycle.
-  if (entry.lastStablePhase !== "idle" && entry.lastStablePhase !== "shell_ready") return;
+  if (entry.lastStablePhase !== "idle" && entry.lastStablePhase !== "shell_ready") return false;
 
   // Don't show suggestions when the alternate screen buffer is active.
   // Interactive CLI tools (Claude Code, vim, htop, etc.) use the alternate
   // buffer — cursor coordinates in that buffer don't correspond to the shell
   // prompt, and our input buffer tracking doesn't reflect the tool's input.
-  if (entry.terminal.buffer.active.type === "alternate") return;
+  if (entry.terminal.buffer.active.type === "alternate") return false;
 
   // Don't show suggestions when the user has scrolled up — the cursor is
   // off-screen and the overlay would appear at a misleading position.
-  if (entry.userScrolledUp) return;
+  if (entry.userScrolledUp) return false;
 
-  // OS-level foreground process check — uses a cached value updated by a
-  // 300ms polling interval (see pool.ts createTerminal). Synchronous access
-  // avoids async gaps where state can change between the check and usage.
-  // This is the most reliable guard: tcgetpgrp() / /proc/stat tells us
-  // whether the shell or a child program (AI tools, editors, etc.) owns
-  // the terminal foreground process group.
-  if (!entry.shellIsForeground) return;
+  // OS-level foreground process check — the value cached by the poll in
+  // pool.ts attach(); computeSuggestions asks again before drawing. This is
+  // the most reliable guard: tcgetpgrp() / /proc/stat (on Windows, whether
+  // the shell has a child process) tells us whether the shell or a program
+  // it started (agent CLIs, editors, etc.) owns the terminal.
+  return entry.shellIsForeground;
+}
 
+function computeSuggestions(sessionId: string): void {
+  const entry = pool.get(sessionId);
+  if (!entry || !maySuggest(entry)) return;
+
+  // The cached foreground value can be up to one poll old: long enough for
+  // an agent CLI started a moment ago to be reading these keys. Ask the OS
+  // again and draw nothing unless the shell still owns the terminal and the
+  // input is what it was (a newer keystroke schedules its own computation).
+  const typed = entry.inputBuffer;
+  refreshShellForeground(sessionId)
+    .then((isFg) => {
+      if (!isFg || pool.get(sessionId) !== entry) return;
+      if (entry.inputBuffer !== typed || !maySuggest(entry)) return;
+      showSuggestions(sessionId, entry);
+    })
+    .catch(() => { /* cannot tell who owns the terminal: draw nothing */ });
+}
+
+function showSuggestions(sessionId: string, entry: PoolEntry): void {
   // Intent suggestions (colon-prefixed commands)
   if (entry.inputBuffer.trimStart().startsWith(":")) {
     const intentResults = getIntentSuggestions(entry.inputBuffer.trim());
@@ -401,6 +467,10 @@ function computeSuggestions(sessionId: string): void {
       return;
     }
   }
+
+  // Everything below is Hermes inline suggestions, which the user can turn
+  // off. ':' intent commands above are not affected by that setting.
+  if (!shouldShowOverlay(sessionId)) return;
 
   const context: ProjectContext | null = entry.cwd ? getCachedContext(entry.cwd) : null;
   const results = suggest(entry.inputBuffer, context, entry.historyProvider);
@@ -514,6 +584,9 @@ function executeSuggestion(sessionId: string): void {
 
   const selected = entry.suggestionState.suggestions[entry.suggestionState.selectedIndex];
   if (!selected) return;
+
+  // A ':' intent picked from the list runs the command it stands for.
+  if (selected.badge === "intent" && runIntentCommand(sessionId, entry, selected.text)) return;
 
   // Log to history
   entry.historyProvider.addCommand(selected.text);
@@ -646,6 +719,14 @@ export function terminalGetSelection(sessionId: string): string {
   return cleanSelection(entry.terminal, raw);
 }
 
+/** Paste the clipboard into a session's terminal (the right-click Paste). */
+export function pasteIntoSession(sessionId: string): void {
+  const entry = pool.get(sessionId);
+  if (!entry) return;
+  pasteIntoTerminal(entry.terminal);
+  entry.terminal.focus();
+}
+
 /** Write arbitrary text into the terminal as if pasted (e.g. a file path from a drop event).
  *  Writes directly to the PTY, bypassing the clipboard entirely. */
 export function writeTextToTerminal(sessionId: string, text: string): void {
@@ -703,6 +784,7 @@ export {
   has,
   clearTerminal,
   writeScrollback,
+  releaseOutput,
   subscribeSuggestions,
   setSessionPhase,
   setSessionCwd,

@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeAsPlugin } from "../plugins/identity";
 import type { PluginSettingsSchema, PluginSettingDefinition } from "../plugins/types";
 import type { PluginRuntime } from "../plugins/PluginRuntime";
+import { Input, NativeSelect, Toggle } from "./ui";
 
 interface PluginSettingsFormProps {
 	pluginId: string;
@@ -15,7 +16,7 @@ export function PluginSettingsForm({ pluginId, schema, runtime }: PluginSettings
 
 	useEffect(() => {
 		setLoading(true);
-		invoke<Record<string, string>>("get_plugin_settings_batch", { pluginId })
+		invokeAsPlugin<Record<string, string>>(pluginId, "get_plugin_settings_batch")
 			.then((stored) => {
 				const resolved: Record<string, string | number | boolean> = {};
 				for (const [key, def] of Object.entries(schema)) {
@@ -43,8 +44,7 @@ export function PluginSettingsForm({ pluginId, schema, runtime }: PluginSettings
 		(key: string, value: string | number | boolean) => {
 			setValues((prev) => ({ ...prev, [key]: value }));
 			const storageKey = `__setting:${key}`;
-			invoke("set_plugin_setting", {
-				pluginId,
+			invokeAsPlugin(pluginId, "set_plugin_setting", {
 				key: storageKey,
 				value: String(value),
 			}).catch(console.error);
@@ -90,6 +90,21 @@ function SettingField({
 	value: string | number | boolean;
 	onChange: (key: string, value: string | number | boolean) => void;
 }) {
+	if (definition.type === "boolean") {
+		// An on/off setting is a toggle whose label is the setting's title.
+		return (
+			<div className="ps-field">
+				<Toggle
+					id={`ps-${settingKey}`}
+					className="ps-toggle"
+					checked={!!value}
+					onChange={(next) => onChange(settingKey, next)}
+					label={definition.title}
+					description={definition.description}
+				/>
+			</div>
+		);
+	}
 	return (
 		<div className="ps-field">
 			<label className="ps-label" htmlFor={`ps-${settingKey}`}>
@@ -100,7 +115,7 @@ function SettingField({
 			)}
 			<div className="ps-control">
 				{definition.type === "string" && (
-					<input
+					<Input
 						id={`ps-${settingKey}`}
 						type="text"
 						className="ps-input"
@@ -111,7 +126,7 @@ function SettingField({
 					/>
 				)}
 				{definition.type === "number" && (
-					<input
+					<Input
 						id={`ps-${settingKey}`}
 						type="number"
 						className="ps-input ps-input-number"
@@ -122,20 +137,8 @@ function SettingField({
 						onChange={(e) => onChange(settingKey, parseFloat(e.target.value) || 0)}
 					/>
 				)}
-				{definition.type === "boolean" && (
-					<button
-						id={`ps-${settingKey}`}
-						type="button"
-						className={`ps-toggle${value ? " ps-toggle-on" : ""}`}
-						onClick={() => onChange(settingKey, !value)}
-						role="switch"
-						aria-checked={!!value}
-					>
-						<span className="ps-toggle-knob" />
-					</button>
-				)}
 				{definition.type === "select" && (
-					<select
+					<NativeSelect
 						id={`ps-${settingKey}`}
 						className="ps-select"
 						value={String(value)}
@@ -146,7 +149,7 @@ function SettingField({
 								{opt.label}
 							</option>
 						))}
-					</select>
+					</NativeSelect>
 				)}
 			</div>
 		</div>

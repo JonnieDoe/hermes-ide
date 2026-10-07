@@ -1,15 +1,16 @@
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::thread;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
-use crate::db::{Database, ExecutionNode, SessionWorktreeRow};
+use crate::db::{Database, SessionWorktreeRow};
 use crate::pty::adapters::now;
-use crate::pty::analyzer::{CommandPredictionEvent, OutputAnalyzer};
+use crate::pty::analyzer::OutputAnalyzer;
 use crate::pty::models::*;
+use crate::pty::transport::{InProcessPty, PtyTransport};
 use crate::pty::{
     ai_launch_command, channels_suffix, detect_shell, get_working_directory, PtySession,
 };
@@ -17,12 +18,21 @@ use crate::AppState;
 
 // ─── SSH / tmux helpers ─────────────────────────────────────────────
 
+/// Normalize the SSH user. Blank or absent means "let ssh decide", so a Host
+/// alias in ~/.ssh/config can supply its own `User` (falls back to the local
+/// user, exactly like plain `ssh host`).
 fn resolve_ssh_user(user: Option<String>) -> String {
-    user.unwrap_or_else(|| {
-        std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| "root".to_string())
-    })
+    user.map(|u| u.trim().to_string()).unwrap_or_default()
+}
+
+/// The ssh destination argument: `user@host`, or the bare host/alias when no
+/// user is set.
+fn ssh_destination(user: &str, host: &str) -> String {
+    if user.is_empty() {
+        host.to_string()
+    } else {
+        format!("{}@{}", user, host)
+    }
 }
 
 /// Directory for SSH ControlMaster sockets.
@@ -32,13 +42,23 @@ fn ssh_control_dir() -> std::path::PathBuf {
     dir
 }
 
+/// ControlMaster socket path for a connection.
+fn ssh_socket_path(user: &str, host: &str, port: u16) -> std::path::PathBuf {
+    ssh_control_dir().join(format!("{}:{}", ssh_destination(user, host), port))
+}
+
 /// Build a base SSH command with common options and connection multiplexing.
-fn ssh_command(user: &str, host: &str, port: u16) -> std::process::Command {
+fn ssh_command(
+    user: &str,
+    host: &str,
+    port: u16,
+    jump_host: Option<&str>,
+) -> std::process::Command {
     let mut cmd = std::process::Command::new("ssh");
     cmd.arg("-o").arg("ConnectTimeout=5");
     cmd.arg("-o").arg("BatchMode=yes");
     // Reuse existing TCP connection if available, or establish a new persistent one
-    let socket_path = ssh_control_dir().join(format!("{}@{}:{}", user, host, port));
+    let socket_path = ssh_socket_path(user, host, port);
     cmd.arg("-o")
         .arg(format!("ControlPath={}", socket_path.display()));
     cmd.arg("-o").arg("ControlMaster=auto");
@@ -46,8 +66,60 @@ fn ssh_command(user: &str, host: &str, port: u16) -> std::process::Command {
     if port != 22 {
         cmd.arg("-p").arg(port.to_string());
     }
-    cmd.arg(format!("{}@{}", user, host));
+    if let Some(jump) = normalize_jump_host(jump_host) {
+        cmd.arg("-J").arg(jump);
+    }
+    // `--` stops option parsing so a host starting with '-' is never read as an option.
+    cmd.arg("--");
+    cmd.arg(ssh_destination(user, host));
     cmd
+}
+
+/// Build the interactive `ssh` command for an SSH terminal session.
+fn ssh_pty_command(info: &SshConnectionInfo, cols: u16, rows: u16) -> CommandBuilder {
+    let mut c = CommandBuilder::new("ssh");
+    c.arg("-t"); // Force TTY allocation
+    c.arg("-o");
+    c.arg("ServerAliveInterval=15");
+    c.arg("-o");
+    c.arg("ServerAliveCountMax=3");
+    let socket_path = ssh_socket_path(&info.user, &info.host, info.port);
+    c.arg("-o");
+    c.arg(format!("ControlPath={}", socket_path.display()));
+    c.arg("-o");
+    c.arg("ControlMaster=auto");
+    c.arg("-o");
+    c.arg("ControlPersist=300");
+    if info.port != 22 {
+        c.arg("-p");
+        c.arg(info.port.to_string());
+    }
+    if let Some(ref id_file) = info.identity_file {
+        c.arg("-i");
+        c.arg(id_file);
+    }
+    if let Some(jump) = normalize_jump_host(info.jump_host.as_deref()) {
+        c.arg("-J");
+        c.arg(jump);
+    }
+    c.arg("--");
+    c.arg(ssh_destination(&info.user, &info.host));
+    // Attach to tmux session if specified.
+    // `new-session -A` attaches if it exists, creates if it doesn't.
+    if let Some(ref tmux_name) = info.tmux_session {
+        c.arg(format!(
+            "tmux new-session -A -s '{}' -x {} -y {}",
+            tmux_name.replace('\'', "'\\''"),
+            cols,
+            rows
+        ));
+    }
+    c
+}
+
+/// Trimmed jump host, or `None` when unset/blank.
+fn normalize_jump_host(jump_host: Option<&str>) -> Option<&str> {
+    jump_host.map(str::trim).filter(|j| !j.is_empty())
 }
 
 /// Run a remote SSH command and return (stdout, stderr, success).
@@ -55,9 +127,10 @@ fn ssh_exec(
     user: &str,
     host: &str,
     port: u16,
+    jump_host: Option<&str>,
     remote_cmd: &str,
 ) -> Result<(String, String, bool), String> {
-    let mut cmd = ssh_command(user, host, port);
+    let mut cmd = ssh_command(user, host, port, jump_host);
     cmd.arg(remote_cmd);
     let output = cmd
         .output()
@@ -98,7 +171,7 @@ pub async fn ssh_list_directory(
     path: Option<String>,
 ) -> Result<Vec<SshFileEntry>, String> {
     // Look up SSH connection info from the session
-    let (user, host, port) = {
+    let (user, host, port, jump_host) = {
         let mgr = state
             .pty_manager
             .lock()
@@ -115,7 +188,12 @@ pub async fn ssh_list_directory(
             .ssh_info
             .as_ref()
             .ok_or_else(|| "Not an SSH session".to_string())?;
-        (ssh.user.clone(), ssh.host.clone(), ssh.port)
+        (
+            ssh.user.clone(),
+            ssh.host.clone(),
+            ssh.port,
+            ssh.jump_host.clone(),
+        )
     };
 
     // Use the given path, or detect the remote working directory via pwd
@@ -123,7 +201,8 @@ pub async fn ssh_list_directory(
         Some(p) if !p.is_empty() => p.clone(),
         _ => {
             // Ask the remote host for its home directory (session.working_directory is local)
-            let (pwd_out, _, ok) = ssh_exec(&user, &host, port, "echo $HOME")?;
+            let (pwd_out, _, ok) =
+                ssh_exec(&user, &host, port, jump_host.as_deref(), "echo $HOME")?;
             if ok && !pwd_out.trim().is_empty() {
                 pwd_out.trim().to_string()
             } else {
@@ -140,7 +219,8 @@ pub async fn ssh_list_directory(
         shell_escape(&target), shell_escape(&target), shell_escape(&target), shell_escape(&target), shell_escape(&target)
     );
 
-    let (stdout, _stderr, success) = ssh_exec(&user, &host, port, &remote_cmd)?;
+    let (stdout, _stderr, success) =
+        ssh_exec(&user, &host, port, jump_host.as_deref(), &remote_cmd)?;
     if !success && stdout.is_empty() {
         return Err(format!("Failed to list directory: {}", target));
     }
@@ -216,7 +296,7 @@ pub async fn ssh_read_file(
     session_id: String,
     file_path: String,
 ) -> Result<SshFileContent, String> {
-    let (user, host, port) = {
+    let (user, host, port, jump_host) = {
         let mgr = state
             .pty_manager
             .lock()
@@ -233,7 +313,12 @@ pub async fn ssh_read_file(
             .ssh_info
             .as_ref()
             .ok_or_else(|| "Not an SSH session".to_string())?;
-        (ssh.user.clone(), ssh.host.clone(), ssh.port)
+        (
+            ssh.user.clone(),
+            ssh.host.clone(),
+            ssh.port,
+            ssh.jump_host.clone(),
+        )
     };
 
     let file_name = file_path
@@ -288,7 +373,7 @@ pub async fn ssh_read_file(
         ),
         f = escaped,
     );
-    let (stdout, _, success) = ssh_exec(&user, &host, port, &combined_cmd)?;
+    let (stdout, _, success) = ssh_exec(&user, &host, port, jump_host.as_deref(), &combined_cmd)?;
     if !success && stdout.is_empty() {
         return Err(format!("Failed to read file: {}", file_path));
     }
@@ -354,7 +439,7 @@ pub async fn ssh_write_file(
     file_path: String,
     content: String,
 ) -> Result<(), String> {
-    let (user, host, port) = {
+    let (user, host, port, jump_host) = {
         let mgr = state
             .pty_manager
             .lock()
@@ -371,12 +456,17 @@ pub async fn ssh_write_file(
             .ssh_info
             .as_ref()
             .ok_or_else(|| "Not an SSH session".to_string())?;
-        (ssh.user.clone(), ssh.host.clone(), ssh.port)
+        (
+            ssh.user.clone(),
+            ssh.host.clone(),
+            ssh.port,
+            ssh.jump_host.clone(),
+        )
     };
 
     let escaped = shell_escape(&file_path);
     let cmd = format!("cat > {}", escaped);
-    let mut child = ssh_command(&user, &host, port)
+    let mut child = ssh_command(&user, &host, port, jump_host.as_deref())
         .arg(cmd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -414,6 +504,7 @@ pub async fn ssh_list_tmux_sessions(
     host: String,
     port: Option<u16>,
     user: Option<String>,
+    jump_host: Option<String>,
 ) -> Result<Vec<TmuxSessionEntry>, String> {
     let user = resolve_ssh_user(user);
     let port = port.unwrap_or(22);
@@ -422,6 +513,7 @@ pub async fn ssh_list_tmux_sessions(
         &user,
         &host,
         port,
+        jump_host.as_deref(),
         "tmux list-sessions -F '#{session_name}|||#{session_windows}|||#{session_attached}'",
     )?;
 
@@ -461,6 +553,7 @@ pub async fn ssh_list_tmux_windows(
     host: String,
     port: Option<u16>,
     user: Option<String>,
+    jump_host: Option<String>,
     tmux_session: String,
 ) -> Result<Vec<TmuxWindowEntry>, String> {
     let user = resolve_ssh_user(user);
@@ -470,7 +563,8 @@ pub async fn ssh_list_tmux_windows(
         "tmux list-windows -t '{}' -F '#{{window_index}}|||#{{window_name}}|||#{{window_active}}'",
         tmux_session.replace('\'', "'\\''")
     );
-    let (stdout, stderr, success) = ssh_exec(&user, &host, port, &remote_cmd)?;
+    let (stdout, stderr, success) =
+        ssh_exec(&user, &host, port, jump_host.as_deref(), &remote_cmd)?;
 
     if !success {
         return Err(format!("Failed to list tmux windows: {}", stderr.trim()));
@@ -502,6 +596,7 @@ pub async fn ssh_tmux_select_window(
     host: String,
     port: Option<u16>,
     user: Option<String>,
+    jump_host: Option<String>,
     tmux_session: String,
     window_index: u32,
 ) -> Result<(), String> {
@@ -513,7 +608,8 @@ pub async fn ssh_tmux_select_window(
         tmux_session.replace('\'', "'\\''"),
         window_index
     );
-    let (_stdout, stderr, success) = ssh_exec(&user, &host, port, &remote_cmd)?;
+    let (_stdout, stderr, success) =
+        ssh_exec(&user, &host, port, jump_host.as_deref(), &remote_cmd)?;
 
     if !success {
         return Err(format!("Failed to select tmux window: {}", stderr.trim()));
@@ -526,6 +622,7 @@ pub async fn ssh_tmux_new_window(
     host: String,
     port: Option<u16>,
     user: Option<String>,
+    jump_host: Option<String>,
     tmux_session: String,
     window_name: Option<String>,
 ) -> Result<(), String> {
@@ -544,7 +641,8 @@ pub async fn ssh_tmux_new_window(
             tmux_session.replace('\'', "'\\''")
         )
     };
-    let (_stdout, stderr, success) = ssh_exec(&user, &host, port, &remote_cmd)?;
+    let (_stdout, stderr, success) =
+        ssh_exec(&user, &host, port, jump_host.as_deref(), &remote_cmd)?;
 
     if !success {
         return Err(format!("Failed to create tmux window: {}", stderr.trim()));
@@ -557,6 +655,7 @@ pub async fn ssh_tmux_rename_window(
     host: String,
     port: Option<u16>,
     user: Option<String>,
+    jump_host: Option<String>,
     tmux_session: String,
     window_index: u32,
     new_name: String,
@@ -570,7 +669,8 @@ pub async fn ssh_tmux_rename_window(
         window_index,
         new_name.replace('\'', "'\\''")
     );
-    let (_stdout, stderr, success) = ssh_exec(&user, &host, port, &remote_cmd)?;
+    let (_stdout, stderr, success) =
+        ssh_exec(&user, &host, port, jump_host.as_deref(), &remote_cmd)?;
 
     if !success {
         return Err(format!("Failed to rename tmux window: {}", stderr.trim()));
@@ -578,14 +678,340 @@ pub async fn ssh_tmux_rename_window(
     Ok(())
 }
 
+/// Which agent CLIs are installed. Off the main thread: the check starts a
+/// process per agent (`where` on Windows, a login shell elsewhere), which
+/// takes seconds on a slow machine, and a synchronous command runs on the
+/// main thread, so the window froze meanwhile (F02 on the Windows CI runner:
+/// the onboarding's AI tools screen, then "the webview did not answer").
 #[tauri::command]
-pub fn check_ai_providers() -> std::collections::HashMap<String, bool> {
-    crate::platform::check_ai_cli_availability()
+pub async fn check_ai_providers(
+    include_beta: Option<bool>,
+) -> Result<HashMap<String, bool>, String> {
+    tokio::task::spawn_blocking(move || {
+        e2e_hold("HERMES_E2E_SLOW_PROBE_MS", "the AI tools check");
+        crate::platform::check_ai_cli_availability(include_beta.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| format!("the AI tools check failed: {e}"))
 }
 
-// Tauri command handler — params come from frontend invocation
+/// The line typed into a session's shell to start its agent.
+struct AgentLaunch {
+    cmd: String,
+    provider: String,
+    /// The project-context prompt travels with the command (no later nudge).
+    context_in_args: bool,
+    /// With the `hi` helper: what the spool watcher needs (the session's
+    /// launch folder, whether silence means a startup prompt, the nonce the
+    /// launch's spool lines carry, the agent and its event stream).
+    watch: Option<crate::pty::launch::SignalWatch>,
+    /// The command goes after a `cd` into the session's folder: the shell's
+    /// answer to that `cd` is watched.
+    cd_first: bool,
+}
+
+/// How long an agent's launch line waits for the terminal's real size.
+/// The pane in view measures its terminal within a few frames of the
+/// session's creation; a session nobody looks at has no pane and starts
+/// after this.
+const LAUNCH_WAITS_FOR_SIZE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Type the agent's launch line, once the terminal has its real size.
+///
+/// The PTY opens at a size the frontend estimates; the pane then measures
+/// the real one, usually just as the shell shows its first prompt, which is
+/// when the launch line used to be typed. The resize's SIGWINCH then reached
+/// bash while its line editor was accepting the line, and it redrew the
+/// prompt and the line over the newline it had printed (the agent's first
+/// output started at the end of the command). Waiting for the size first
+/// puts the signal before the line, where the shell handles it before
+/// reading the line.
+fn type_agent_launch(
+    app: &AppHandle,
+    session: &Arc<StdMutex<Session>>,
+    analyzer: &Arc<StdMutex<OutputAnalyzer>>,
+    writer: &Arc<StdMutex<Box<dyn Write + Send>>>,
+    sized: &std::sync::atomic::AtomicBool,
+    watch_not_found: bool,
+) {
+    crate::pty::wait_until(sized, LAUNCH_WAITS_FOR_SIZE);
+    let gone = session.lock().map_or(true, |s| {
+        matches!(
+            s.phase,
+            SessionPhase::Destroyed | SessionPhase::Disconnected
+        )
+    });
+    if gone {
+        return;
+    }
+    if let Some(reason) = launch_blocked(session, analyzer) {
+        block_agent_launch(app, session, &reason);
+        return;
+    }
+    let Some(launch) = resolve_agent_launch(app, session) else {
+        return;
+    };
+    if let Ok(mut a) = analyzer.lock() {
+        // "command not found" detection: scan the next 10 lines (only for
+        // a launch at the detected prompt, as before)
+        if watch_not_found {
+            a.ai_launching_provider = Some(launch.provider.clone());
+            a.ai_launch_check_remaining = 10;
+        }
+        // Mark context as injected if it was baked into the launch command
+        if launch.context_in_args {
+            a.context_injected = true;
+        }
+        if launch.cd_first {
+            a.launch_cd_check_remaining = 10;
+        }
+    }
+    // The phase before the line: this runs off the reader thread, which
+    // moves the phase on (Busy) as soon as the agent prints, and a later
+    // LaunchingAgent would undo that (the turn ledger then misses the turn).
+    if let Ok(mut s) = session.lock() {
+        if launch.context_in_args {
+            s.context_injected = true;
+        }
+        s.phase = SessionPhase::LaunchingAgent;
+        let update = SessionUpdate::from(&*s);
+        let _ = app.emit("session-updated", &update);
+    }
+    if let Ok(mut w) = writer.lock() {
+        let _ = w.write_all(format!("{}\r", launch.cmd).as_bytes());
+        let _ = w.flush();
+    }
+    if let Some(watch) = launch.watch {
+        crate::pty::launch::watch_signals(app.clone(), Arc::clone(session), watch);
+    }
+}
+
+/// Why an agent session's launch line must not be typed now, or None: the
+/// person has text on the command line (it would run into theirs), or the
+/// session's folder cannot be entered (the agent would fail at once with a
+/// misleading error).
+fn launch_blocked(
+    session: &Arc<StdMutex<Session>>,
+    analyzer: &Arc<StdMutex<OutputAnalyzer>>,
+) -> Option<String> {
+    let (cwd, local) = {
+        let s = session.lock().ok()?;
+        s.ai_provider.as_ref()?;
+        (s.working_directory.clone(), s.ssh_info.is_none())
+    };
+    if analyzer.lock().is_ok_and(|a| a.typed_line.pending()) {
+        return Some(crate::pty::launch::TYPING_SKIPPED_MESSAGE.to_string());
+    }
+    if local {
+        return crate::pty::launch::unreadable_folder_message(std::path::Path::new(&cwd));
+    }
+    None
+}
+
+/// Start nothing and say why: on the session (its status) and as a notice.
+fn block_agent_launch(app: &AppHandle, session: &Arc<StdMutex<Session>>, reason: &str) {
+    let Ok(s) = session.lock() else {
+        return;
+    };
+    log::warn!("[LAUNCH] {}: agent not started — {reason}", s.id);
+    crate::contract::emit_session_event(
+        app,
+        &s.id,
+        crate::pty::launch::refused_launch_event(reason),
+    );
+    let _ = app.emit(
+        "agent-launch-blocked",
+        serde_json::json!({ "sessionId": s.id, "message": reason }),
+    );
+}
+
+/// Resolve the launch line once the shell is ready: through the bundled `hi`
+/// helper when the `launchHelper` flag is on (see `launch.rs`), else the
+/// vendor command typed as before. None when the session has no agent, or
+/// an agent Hermes does not know.
+fn resolve_agent_launch(app: &AppHandle, session: &Arc<StdMutex<Session>>) -> Option<AgentLaunch> {
+    // Outside the session lock: the hook trust may ask the agent's app
+    // server (once per app run).
+    let hook_trust = {
+        let s = session.lock().ok()?;
+        let wants = s.launch_helper && s.ssh_info.is_none();
+        let provider = s.ai_provider.clone();
+        let cwd = s.working_directory.clone();
+        drop(s);
+        match provider {
+            Some(p) if wants => crate::pty::launch::hook_trust_for(app, &p, &cwd),
+            _ => None,
+        }
+    };
+    let mut s = session.lock().ok()?;
+    let provider = s.ai_provider.clone()?;
+    match crate::pty::launch::prepare_helper_launch(app, &mut s, hook_trust.as_deref()) {
+        crate::pty::launch::HelperLaunch::Prepared(prepared) => {
+            return Some(AgentLaunch {
+                cmd: prepared.line,
+                provider,
+                context_in_args: prepared.context_in_args,
+                watch: Some(prepared.watch),
+                cd_first: false,
+            });
+        }
+        // This build cannot launch through the helper although it should:
+        // the session says so (an exact error line) and no command is
+        // typed, so nothing starts without its task, hooks and status.
+        crate::pty::launch::HelperLaunch::Refused(message) => {
+            s.task_prompt = None;
+            s.seed_prompt = None;
+            crate::contract::emit_session_event(
+                app,
+                &s.id,
+                crate::pty::launch::refused_launch_event(&message),
+            );
+            return None;
+        }
+        crate::pty::launch::HelperLaunch::TypeCommand => {}
+    }
+    // The typed command (flag off) cannot carry a launcher task: hand it to
+    // the UI, which puts it on the clipboard and says so, instead of
+    // dropping it.
+    if let Some(task) = crate::pty::launch::take_undelivered_task(&mut s) {
+        log::warn!(
+            "[LAUNCH] {} starts {} without its task (no helper launch); handing the task to the UI",
+            s.id,
+            provider
+        );
+        let _ = app.emit(
+            "task-prompt-undelivered",
+            serde_json::json!({ "sessionId": s.id, "agentId": provider, "task": task }),
+        );
+    }
+    // Only launch known/allowed AI providers (reject unknown values)
+    let Some(launch_cmd) = ai_launch_command(
+        &provider,
+        &s.permission_mode,
+        &s.custom_prefix,
+        &s.custom_suffix,
+        &s.agent_command,
+    ) else {
+        log::warn!("Unknown AI provider rejected: {}", provider);
+        return None;
+    };
+    if s.seed_prompt.is_some() {
+        // A handoff's task goes only through the launch file `hi` reads,
+        // never into the shell line typed below.
+        log::warn!(
+            "[LAUNCH] {}: the handoff task needs the launch helper; the agent starts without it",
+            s.id
+        );
+    }
+    // For Claude/Gemini: pass context instruction as CLI argument
+    // so it's processed immediately without PTY injection timing issues
+    let supports_cli_prompt = provider == "claude" || provider == "gemini";
+    let context_in_args = s.has_initial_context && supports_cli_prompt;
+    // Build command: base+flags, then prompt, then --channels
+    // (channels must come AFTER prompt so CLI doesn't treat prompt as a channel entry)
+    let mut cmd = if context_in_args {
+        format!(
+            "{} {}",
+            launch_cmd,
+            crate::pty::context_prompt_arg(&s.shell)
+        )
+    } else {
+        launch_cmd
+    };
+    if provider == "claude" && !s.channels.is_empty() {
+        cmd.push_str(&channels_suffix(&s.channels));
+    }
+    // Claude over SSH (flag on): there is no `hi` on the remote host, so the
+    // hooks make Claude print nonce-tagged markers the PTY parser reads.
+    if let Some((settings_arg, nonce)) = crate::pty::launch::ssh_signal_args(&s) {
+        cmd.push(' ');
+        cmd.push_str(&settings_arg);
+        s.signal_nonce = Some(nonce);
+    }
+    // Into the session's folder first: a shell that could not read its
+    // folder as it started (zsh shows ".") makes the agent fail at once,
+    // and a fresh `cd` fixes that. The helper sets its agent's folder itself.
+    let mut cd_first = false;
+    let dir = std::path::Path::new(&s.working_directory);
+    if cfg!(unix) && s.ssh_info.is_none() && dir.is_absolute() && dir.is_dir() {
+        if let Some(line) = crate::pty::launch::cd_then(&s.shell, &s.working_directory, &cmd) {
+            cmd = line;
+            cd_first = true;
+        }
+    }
+    Some(AgentLaunch {
+        cmd,
+        provider,
+        context_in_args,
+        watch: None,
+        cd_first,
+    })
+}
+
+/// Test builds only: `HERMES_E2E_SLOW_SPAWN_MS=<ms>` makes opening a
+/// terminal take that long, as a spawn stuck in the OS does, and
+/// `HERMES_E2E_SLOW_PROBE_MS=<ms>` the AI tools check and the shell list, as
+/// a slow machine does, so a scenario can check the app keeps answering
+/// meanwhile. Needs the `e2e` cargo feature (never in a release build) AND
+/// `HERMES_E2E=1` at run time.
+fn e2e_hold(var: &str, what: &str) {
+    #[cfg(feature = "e2e")]
+    {
+        if !crate::e2e_protocol::is_enabled(std::env::var("HERMES_E2E").ok().as_deref()) {
+            return;
+        }
+        let ms = std::env::var(var)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(60_000);
+        if ms > 0 {
+            log::warn!("[e2e] {} is held for {} ms", what, ms);
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    #[cfg(not(feature = "e2e"))]
+    let _ = (var, what);
+}
+
+/// Ends a session's opening (see `PtyManager::opening`) on every early
+/// return of `create_session`, so a failed spawn leaves nothing behind.
+/// `create_session` ends it itself, with the manager held, once the terminal
+/// is registered or refused, and disarms this.
+struct OpeningGuard<'a> {
+    manager: &'a StdMutex<crate::pty::PtyManager>,
+    session_id: String,
+    armed: bool,
+}
+
+impl Drop for OpeningGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut mgr = self.manager.lock().unwrap_or_else(|e| e.into_inner());
+            mgr.finish_opening(&self.session_id);
+        }
+    }
+}
+
+/// The error `create_session` returns when the session was closed while
+/// it was being opened.
+const CLOSED_WHILE_OPENING: &str = "The session was closed while it was being opened";
+
+/// Input bigger than this (a paste, not typing) is written to the terminal
+/// in the background (CHAOS-05).
+const BACKGROUND_WRITE_BYTES: usize = 64 * 1024;
+
+/// Whether input of `len` bytes is written in the background (a paste)
+/// rather than right away (typing); see [`BACKGROUND_WRITE_BYTES`].
+fn writes_in_background(len: usize) -> bool {
+    len > BACKGROUND_WRITE_BYTES
+}
+
+// Tauri command handler — params come from frontend invocation. Off the main
+// thread: starting the session host can take seconds, and on the main thread
+// that would freeze the window.
 #[allow(clippy::too_many_arguments)]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_session(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -600,28 +1026,79 @@ pub fn create_session(
     permission_mode: Option<String>,
     custom_prefix: Option<String>,
     custom_suffix: Option<String>,
+    agent_name: Option<String>,
+    agent_command: Option<String>,
     channels: Option<Vec<String>>,
     ssh_host: Option<String>,
     ssh_port: Option<u16>,
     ssh_user: Option<String>,
     tmux_session: Option<String>,
     ssh_identity_file: Option<String>,
+    ssh_jump_host: Option<String>,
     initial_rows: Option<u16>,
     initial_cols: Option<u16>,
-    worktree_base_path: Option<String>,
     // `mode` is the frontend-chosen runtime mode.  `"terminal"` (default)
     // spawns a PTY; `"agent"` skips PTY spawn and lets the frontend drive
     // the Claude subprocess via `agent::spawn_agent_session` after this
     // command returns.
     mode: Option<SessionMode>,
+    // Feature flag `launchHelper` (evaluated by the frontend): start the
+    // agent through the bundled `hi` helper and resume it on restore.
+    launch_helper: Option<bool>,
+    // The `launchHelper` flag as such: with it on, a launch the helper
+    // cannot carry (no runnable `hi` in this build) is refused with an
+    // error on the session instead of typed (see `launch.rs`).
+    launch_helper_required: Option<bool>,
+    // A restored session's saved conversation id; with the helper on, the
+    // agent resumes it (see `launch.rs`).
+    vendor_session_id: Option<String>,
+    // Feature flag `featureTracks` (evaluated by the frontend): put the
+    // bundled `hi` helper on the terminal's PATH so `hi phase`, `hi status`
+    // and friends work in every Hermes shell.
+    feature_tracks: Option<bool>,
+    // Feature flag `sessionHost` (evaluated by the frontend): open the
+    // terminal in the background session host, and reattach to a program
+    // the host still has under this session id (see `session_host.rs`).
+    session_host: Option<bool>,
+    // The task launcher's task (F15): handed to the agent as its first
+    // prompt through the `hi` helper.
+    initial_prompt: Option<String>,
+    // A library persona for the agent's system prompt (its catalog's
+    // `system_prompt` flag, through the `hi` helper).
+    system_prompt: Option<String>,
+    // N19: the first prompt of a handed-off session (the task and the work
+    // so far). Only ever passed as a launch argument through `hi`.
+    seed_prompt: Option<String>,
+    // N19: the session this one continues or duplicates.
+    parent_session_id: Option<String>,
+    // 2.0 launch contract: the model, effort and account to start the agent
+    // with (helper launch only), or "login" to run the CLI's sign-in in the
+    // account's profile (Add account).
+    agent_launch: Option<crate::agent_caps::AgentLaunchOptions>,
 ) -> Result<SessionUpdate, String> {
     let session_mode = mode.unwrap_or(SessionMode::Terminal);
-    let session_id = session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-    if let Some(ref base) = worktree_base_path {
-        if !base.trim().is_empty() {
-            crate::git::worktree::validate_custom_worktree_base(base, None)?;
+    let agent_launch = match (&ai_provider, &agent_launch) {
+        (Some(provider), Some(options)) if ssh_host.is_none() => {
+            match crate::agent_caps::commands::session_launch(&app, provider, options) {
+                Ok(launch) => launch,
+                // A restored session whose account Hermes no longer knows
+                // resumes in the default profile rather than not at all; a
+                // new launch with an unknown account is refused.
+                Err(e)
+                    if vendor_session_id
+                        .as_deref()
+                        .is_some_and(|id| !id.is_empty()) =>
+                {
+                    log::warn!("[CAPS] restoring {provider} without its launch choice: {e}");
+                    Default::default()
+                }
+                Err(e) => return Err(e),
+            }
         }
-    }
+        _ => Default::default(),
+    };
+    let session_id = session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    state.closed_sessions.mark_created(&session_id);
     let shell = state
         .db
         .lock()
@@ -631,37 +1108,78 @@ pub fn create_session(
         .flatten()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(detect_shell);
+    // Hermes inline suggestions on (default) → disable the shell's own
+    // autosuggestion plugins so the two don't overlap.
+    let disable_native_suggestions = crate::pty::shell_integration::hermes_suggestions_enabled(
+        state
+            .db
+            .lock()
+            .ok()
+            .and_then(|db| db.get_setting("shell_suggestions").ok().flatten())
+            .as_deref(),
+    );
     let original_cwd = working_directory.unwrap_or_else(get_working_directory);
 
-    // If this session has a linked worktree, use its path as the working directory.
-    // The worktree row may have been inserted before create_session is called
-    // (e.g. the frontend pre-generated the session_id and created the worktree first).
-    let cwd = if let Ok(db) = state.db.lock() {
-        if let Ok(worktrees) = db.get_session_worktrees(&session_id) {
-            if let Some(primary) = worktrees.first() {
-                let wt = std::path::Path::new(&primary.worktree_path);
-                if wt.is_dir() {
-                    primary.worktree_path.clone()
-                } else {
-                    log::warn!(
-                        "Worktree directory '{}' does not exist for session {}; falling back to '{}'",
-                        primary.worktree_path, session_id, original_cwd
-                    );
-                    original_cwd
-                }
-            } else {
-                original_cwd
-            }
-        } else {
-            original_cwd
-        }
-    } else {
-        original_cwd
-    };
+    // Fast worktrees: the block of ports recorded for the session's primary
+    // worktree (only set when the worktree was prepared).
+    let port_block: Option<crate::git::fast_setup::PortBlock> =
+        state.db.lock().ok().and_then(|db| {
+            let primary = db
+                .get_session_worktrees(&session_id)
+                .ok()?
+                .into_iter()
+                .next()?;
+            db.get_worktree_setup(&session_id, &primary.project_id)
+                .ok()
+                .and_then(|(base, _)| base)
+                .map(|base| crate::git::fast_setup::PortBlock {
+                    base,
+                    count: crate::git::fast_setup::PORT_BLOCK_SIZE,
+                })
+        });
 
-    let mut mgr = state.pty_manager.lock().unwrap_or_else(|e| e.into_inner());
-    mgr.session_counter += 1;
-    let counter = mgr.session_counter;
+    // If this session has a linked worktree, use its path as the working
+    // directory. The worktree row may have been inserted before
+    // create_session is called (the frontend pre-generates the session id
+    // and creates the worktree first). A folder that went missing is put
+    // back or replaced by a folder that exists: the shell is never spawned
+    // into a missing directory (a restored session used to hang at
+    // "starting" that way).
+    let (cwd, recovery) =
+        resolve_session_cwd(&state.db, &session_id, original_cwd, project_ids.as_deref());
+    if let Some(recovery) = recovery {
+        log::warn!(
+            "Session {} did not open in '{}' ({}); it opens in '{}' instead",
+            session_id,
+            recovery.missing_path,
+            recovery.outcome,
+            recovery.path
+        );
+        let _ = app.emit(WORKING_DIRECTORY_RECOVERED_EVENT, &recovery);
+    }
+
+    // The PTY manager is NOT held while the terminal is opened below: opening
+    // a PTY and starting its shell (or reaching the session host) can take
+    // seconds, or hang in the OS, and most commands that need the manager
+    // (typing, resizing, listing the sessions, quitting) run on the main
+    // thread. Held across the spawn, one stuck spawn froze the whole window,
+    // Quit included (the webview stopped answering; N20 on the macOS CI
+    // runner). It is taken for the counter here, and again once the terminal
+    // exists, before its reader starts, until the session is registered.
+    // Meanwhile the session is marked as being opened: a close that arrives
+    // then is remembered, and the new terminal is killed instead of
+    // registered (a closed session must never come back).
+    let counter = {
+        let mut mgr = state.pty_manager.lock().unwrap_or_else(|e| e.into_inner());
+        mgr.session_counter += 1;
+        mgr.begin_opening(&session_id);
+        mgr.session_counter
+    };
+    let mut opening_guard = OpeningGuard {
+        manager: &state.pty_manager,
+        session_id: session_id.clone(),
+        armed: true,
+    };
 
     let session_label = label.unwrap_or_else(|| format!("Session {}", counter));
     let session_color = color.unwrap_or_default();
@@ -708,26 +1226,40 @@ pub fn create_session(
         }),
         custom_prefix: custom_prefix.unwrap_or_default(),
         custom_suffix: custom_suffix.unwrap_or_default(),
+        agent_name: agent_name.unwrap_or_default(),
+        agent_command: agent_command.unwrap_or_default(),
         channels: channels.unwrap_or_default(),
         context_injected: false,
         has_initial_context: ssh_host.is_none()
             && project_ids.as_ref().is_some_and(|ids| !ids.is_empty()),
         last_nudged_version: 0,
         pending_nudge: None,
+        agent_launch,
         ssh_info: ssh_host.as_ref().map(|host| SshConnectionInfo {
             host: host.clone(),
             port: ssh_port.unwrap_or(22),
-            user: ssh_user.unwrap_or_else(|| {
-                std::env::var("USER")
-                    .or_else(|_| std::env::var("USERNAME"))
-                    .unwrap_or_else(|_| "root".to_string())
-            }),
+            user: resolve_ssh_user(ssh_user),
             tmux_session: tmux_session.clone(),
             identity_file: ssh_identity_file.clone(),
+            jump_host: normalize_jump_host(ssh_jump_host.as_deref()).map(str::to_string),
             port_forwards: Vec::new(),
         }),
-        worktree_base_path,
         mode: session_mode,
+        vendor_session_id: vendor_session_id.filter(|id| !id.is_empty()),
+        agent_startup: None,
+        hosted: false,
+        launch_helper: launch_helper.unwrap_or(false),
+        launch_helper_required: launch_helper_required.unwrap_or(false),
+        signal_nonce: None,
+        reported_status: None,
+        task_prompt: initial_prompt
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty()),
+        system_prompt: system_prompt
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty()),
+        seed_prompt: seed_prompt.filter(|p| !p.trim().is_empty()),
+        parent_session_id: parent_session_id.filter(|id| !id.is_empty()),
     };
 
     // ─── Agent-mode short-circuit ───────────────────────────────────────
@@ -742,8 +1274,8 @@ pub fn create_session(
     //   3. Emit `session-updated` so the UI can render `<AgentSessionView>`
     //      immediately, even before the agent has fully booted.
     //
-    // Note: `mgr` (the PtyManager guard) is held above; we don't insert a
-    // PtySession into it for agent-mode sessions because there is no PTY.
+    // Note: we don't insert a PtySession into the PtyManager for agent-mode
+    // sessions because there is no PTY.
     // That's fine — code that iterates `mgr.sessions` will simply skip
     // agent sessions, and writes via `write_to_session` will return a
     // "not found" error, which is the right behaviour (composer should
@@ -783,12 +1315,20 @@ pub fn create_session(
             }
         }
 
+        // Closed already: nothing is announced or written for it.
+        let closed = {
+            let mut mgr = state.pty_manager.lock().unwrap_or_else(|e| e.into_inner());
+            opening_guard.armed = false;
+            mgr.finish_opening(&session_id)
+                .map(|o| o.closed)
+                .unwrap_or(false)
+        };
+        if closed {
+            return Err(CLOSED_WHILE_OPENING.to_string());
+        }
+
         let result = SessionUpdate::from(&s);
         let _ = app.emit("session-updated", &result);
-
-        // Drop the PTY-manager lock before touching the DB so we don't hold
-        // two locks at once.
-        drop(mgr);
 
         if let Ok(db) = state.db.lock() {
             db.create_session_v2(&result).ok();
@@ -820,76 +1360,44 @@ pub fn create_session(
     // because its signal handler isn't installed yet.
     let pty_rows = initial_rows.unwrap_or(24);
     let pty_cols = initial_cols.unwrap_or(80);
-    let pty_system = native_pty_system();
     let pty_size = PtySize {
         rows: pty_rows,
         cols: pty_cols,
         pixel_width: 0,
         pixel_height: 0,
     };
-    let pair = pty_system
-        .openpty(pty_size)
-        .map_err(|e| format!("Failed to open PTY: {}", e))?;
-
-    // Workaround: portable-pty's openpty() does not apply the initial window
-    // size on macOS — get_size() returns (0, 0) right after creation.
-    // Explicitly resize to ensure the PTY starts with the correct dimensions.
-    let _ = pair.master.resize(pty_size);
 
     let is_ssh = ssh_info_clone.is_some();
+
+    // Session host (N20): a program the host still runs under this id is
+    // reattached to instead of started again; it keeps the shell it has.
+    let use_host = session_host.unwrap_or(false) && crate::session_host::supported();
+    let reattach = use_host && crate::session_host::has_session(&app, &session_id);
 
     // Set up shell integration (disables conflicting autosuggestion plugins).
     // Only for local sessions — SSH sessions run on the remote host where we
     // can't create temp files.
-    let shell_integration = if !is_ssh {
-        crate::pty::shell_integration::setup(&shell, &session_id)
+    let shell_integration = if !is_ssh && !reattach {
+        crate::pty::shell_integration::setup(&shell, &session_id, disable_native_suggestions)
     } else {
         crate::pty::shell_integration::ShellIntegration::None
     };
 
     let mut cmd = if let Some(ref info) = ssh_info_clone {
-        let mut c = CommandBuilder::new("ssh");
-        c.arg("-t"); // Force TTY allocation
-        c.arg("-o");
-        c.arg("ServerAliveInterval=15");
-        c.arg("-o");
-        c.arg("ServerAliveCountMax=3");
-        let socket_path =
-            ssh_control_dir().join(format!("{}@{}:{}", info.user, info.host, info.port));
-        c.arg("-o");
-        c.arg(format!("ControlPath={}", socket_path.display()));
-        c.arg("-o");
-        c.arg("ControlMaster=auto");
-        c.arg("-o");
-        c.arg("ControlPersist=300");
-        if info.port != 22 {
-            c.arg("-p");
-            c.arg(info.port.to_string());
-        }
-        if let Some(ref id_file) = info.identity_file {
-            c.arg("-i");
-            c.arg(id_file);
-        }
-        c.arg(format!("{}@{}", info.user, info.host));
-        // Attach to tmux session if specified.
-        // `new-session -A` attaches if it exists, creates if it doesn't.
-        if let Some(ref tmux_name) = info.tmux_session {
-            c.arg(format!(
-                "tmux new-session -A -s '{}' -x {} -y {}",
-                tmux_name.replace('\'', "'\\''"),
-                pty_cols,
-                pty_rows
-            ));
-        }
-        c
+        ssh_pty_command(info, pty_cols, pty_rows)
     } else {
         #[cfg(unix)]
         {
             let mut c = CommandBuilder::new("env");
-            c.arg("-u");
-            c.arg("CLAUDECODE");
-            c.arg("-u");
-            c.arg("CLAUDE_CODE");
+            // A parent agent session's marks (CLAUDECODE, CLAUDE_CODE_*,
+            // ...) must not reach the agent this session starts, or it
+            // believes it is nested and stops saving its transcript. On the
+            // command line, so a session the background host starts is
+            // scrubbed the same way (see pty/session_markers.rs).
+            for name in crate::pty::session_markers::session_markers_present() {
+                c.arg("-u");
+                c.arg(name);
+            }
             // Strip COLUMNS/LINES so the shell reads actual PTY dimensions
             // from ioctl instead of inheriting stale values from the GUI app.
             c.arg("-u");
@@ -909,7 +1417,9 @@ pub fn create_session(
                 crate::pty::shell_integration::ShellIntegration::Fish => {
                     c.arg("-l");
                     c.arg("-C");
-                    c.arg(crate::pty::shell_integration::fish_init_command());
+                    c.arg(crate::pty::shell_integration::fish_init_command(
+                        disable_native_suggestions,
+                    ));
                 }
                 _ => {
                     // Zsh, unknown, or no integration — use login shell
@@ -921,8 +1431,10 @@ pub fn create_session(
         #[cfg(windows)]
         {
             let mut c = CommandBuilder::new(&shell);
-            c.env_remove("CLAUDECODE");
-            c.env_remove("CLAUDE_CODE");
+            // See the unix branch: a parent agent session's marks stay out.
+            for name in crate::pty::session_markers::session_markers_present() {
+                c.env_remove(name);
+            }
             c
         }
     };
@@ -989,38 +1501,107 @@ pub fn create_session(
             cmd.env("HERMES_CONTEXT", context_path.to_string_lossy().as_ref());
         }
         cmd.env("HERMES_SESSION_ID", &session_id);
+
+        // The bundled `hi` helper, only while the `launchHelper` flag is on
+        // (a stable user's PATH stays exactly as it was): first on PATH for
+        // this terminal so `hi run` is unambiguous (the shell integration
+        // re-adds it after the user's profile ran), plus where it finds the
+        // session's launch file. The PATH it goes in front of is the one the
+        // terminal would get anyway (on Windows the terminal library rebuilds
+        // it from the registry, not from this process).
+        if launch_helper.unwrap_or(false) || feature_tracks.unwrap_or(false) {
+            if let Some(dir) = crate::pty::launch::hi_path(&app)
+                .and_then(|hi| hi.parent().map(|d| d.to_path_buf()))
+            {
+                let mut paths = vec![dir.clone()];
+                if let Some(existing) = cmd.get_env("PATH").map(|p| p.to_os_string()) {
+                    paths.extend(std::env::split_paths(&existing));
+                }
+                if let Ok(joined) = std::env::join_paths(paths) {
+                    cmd.env("PATH", joined);
+                }
+                cmd.env("HERMES_BIN_DIR", dir.as_os_str());
+            }
+            if let Ok(launch_dir) = crate::pty::launch::launch_dir(&app) {
+                cmd.env("HERMES_LAUNCH_DIR", launch_dir.as_os_str());
+            }
+        }
+
+        // This worktree's own ports, so parallel dev servers never collide.
+        if let Some(block) = port_block {
+            for (name, value) in block.env() {
+                cmd.env(name, value);
+            }
+        }
     }
 
-    // On macOS, portable-pty's spawn_command() uses fork() + pre_exec which
-    // crashes in multi-threaded processes ("multi-threaded process forked").
-    // Use posix_spawn() instead which atomically creates the child process.
-    // See issue #31 and issue-31-investigation.md.
-    // Save the slave TTY path before spawning — needed later for direct
-    // SIGINT delivery via tcgetpgrp()/kill() when the line discipline
-    // fails to convert \x03 into a signal.
-    #[cfg(target_os = "macos")]
-    let saved_tty_path = pair.master.tty_name();
-
-    #[cfg(target_os = "macos")]
-    let child = {
-        let tty_path = saved_tty_path
-            .clone()
-            .ok_or_else(|| "Failed to get PTY device path for posix_spawn".to_string())?;
-        // Drop the slave end — the child opens the TTY by path via posix_spawn
-        // file actions.  CTT assignment is handled by the --pty-setup trampoline.
-        drop(pair.slave);
-        crate::pty::spawn::posix_spawn_in_pty(&cmd, &tty_path)
-            .map_err(|e| format!("Failed to spawn shell: {}", e))?
+    // Where the terminal lives: the session host when the flag is on (a
+    // host that cannot be reached falls back to this process, with a log
+    // line), otherwise this process as always.
+    let mut ended_before_attach: Option<Option<i32>> = None;
+    e2e_hold("HERMES_E2E_SLOW_SPAWN_MS", "opening this terminal");
+    let (mut transport, reattached): (Box<dyn PtyTransport>, bool) = if use_host {
+        match crate::session_host::open_hosted(&app, &session_id, Some(&cmd), pty_rows, pty_cols) {
+            Ok(opened) => {
+                ended_before_attach = opened.ended_before_attach;
+                (opened.transport, opened.reattached)
+            }
+            Err(e) => {
+                log::warn!(
+                    "[session-host] {}: falling back to an in-process terminal: {}",
+                    session_id,
+                    e
+                );
+                // The user asked for a terminal that survives the app and
+                // is not getting one: say so (the frontend shows a notice).
+                let _ = app.emit(
+                    crate::session_host::FALLBACK_EVENT,
+                    crate::session_host::HostFallback {
+                        session_id: session_id.clone(),
+                        reason: e,
+                    },
+                );
+                (Box::new(InProcessPty::spawn(cmd, pty_size)?), false)
+            }
+        }
+    } else {
+        (Box::new(InProcessPty::spawn(cmd, pty_size)?), false)
     };
-
-    #[cfg(not(target_os = "macos"))]
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| format!("Failed to spawn shell: {}", e))?;
+    // The terminal exists: from its first output on, anything that looks the
+    // session up waits until it is registered below (as it always did).
+    let mut mgr = state.pty_manager.lock().unwrap_or_else(|e| e.into_inner());
+    opening_guard.armed = false;
+    let opened = mgr.finish_opening(&session_id).unwrap_or_default();
+    if opened.closed {
+        // Closed while it was being opened (close_session found nothing to
+        // stop and has cleaned up already): stop this terminal, and register
+        // or write nothing, or the closed session would be live again.
+        drop(mgr);
+        log::info!(
+            "[create_session] {} was closed while it was being opened; stopping its terminal",
+            session_id
+        );
+        transport.kill().ok();
+        crate::pty::shell_integration::cleanup(&shell_integration);
+        if let Ok(mut s) = session_arc.lock() {
+            s.phase = SessionPhase::Destroyed;
+        }
+        thread::spawn(move || {
+            transport.wait();
+        });
+        return Err(CLOSED_WHILE_OPENING.to_string());
+    }
+    if let Ok(mut s) = session_arc.lock() {
+        s.hosted = transport.hosted();
+        if reattached {
+            // The running agent already has its context; never type it
+            // (or the launch line) into it again.
+            s.context_injected = true;
+        }
+    }
 
     let writer = Arc::new(StdMutex::new(
-        pair.master
+        transport
             .take_writer()
             .map_err(|e| format!("Failed to get PTY writer: {}", e))?,
     ));
@@ -1036,17 +1617,31 @@ pub fn create_session(
         let update = SessionUpdate::from(&*s);
         let _ = app.emit("session-updated", &update);
     }
+    // Turn ledger (F20): the baseline every turn of this session is diffed
+    // against, taken in the background.
+    crate::turn_ledger::on_session_started(&app, &session_id, &cwd);
 
     let analyzer = Arc::new(StdMutex::new(OutputAnalyzer::new()));
+    if reattached {
+        if let Ok(mut a) = analyzer.lock() {
+            // A reattached shell had its first prompt long ago: the replay
+            // must not trigger the agent auto-launch or the context nudge.
+            a.shell_ready = true;
+            a.context_injected = true;
+        }
+    }
     let analyzer_clone = Arc::clone(&analyzer);
     let session_clone = Arc::clone(&session_arc);
 
-    let mut reader = pair
-        .master
-        .try_clone_reader()
+    let mut reader = transport
+        .take_reader()
         .map_err(|e| format!("Failed to clone reader: {}", e))?;
     let event_session_id = session_id.clone();
     let app_clone = app.clone();
+    // Set once the frontend measured this terminal (see type_agent_launch).
+    let sized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sized_for_reader = Arc::clone(&sized);
+    let sized_for_silence = Arc::clone(&sized);
 
     thread::spawn(move || {
         // Wrap the reader loop in catch_unwind so that a panic inside the
@@ -1078,13 +1673,30 @@ pub fn create_session(
                         break;
                     }
                     Ok(n) => {
+                        // Session was closed but something still holds the PTY
+                        // open (e.g. a TUI that ignored SIGHUP).  Stop reading so
+                        // we never re-announce a closed session; exiting also
+                        // drops our master fd so the kernel hangs up the PTY.
+                        if session_clone
+                            .lock()
+                            .map(|s| s.phase == SessionPhase::Destroyed)
+                            .unwrap_or(false)
+                        {
+                            break;
+                        }
                         let data = &buf[..n];
-
-                        // Declare outside analyzer lock scope so DB work can
-                        // access them after the lock is released.
-                        let mut completed = Vec::new();
-                        let mut recent_cmds_snapshot: Option<std::collections::VecDeque<String>> =
-                            None;
+                        crate::pty::launch::observe_output(&event_session_id, data);
+                        // 2.0: a CLI that refuses the launch (unknown model,
+                        // signed out) is stopped and the session says why.
+                        if let Some(found) =
+                            crate::agent_caps::watch::observe(&event_session_id, data)
+                        {
+                            crate::agent_caps::commands::on_rejected(
+                                &app_clone,
+                                &event_session_id,
+                                found,
+                            );
+                        }
 
                         if let Ok(mut a) = analyzer_clone.lock() {
                             a.process(data);
@@ -1098,19 +1710,44 @@ pub fn create_session(
                                     .emit(&format!("cwd-changed-{}", event_session_id), &new_cwd);
                             }
 
-                            // Drain completed nodes — processed OUTSIDE the analyzer
-                            // lock to prevent AB-BA deadlock with do_save_workspace
-                            // (which acquires db → analyzer; here we'd be analyzer → db).
-                            completed = a.drain_completed_nodes();
-                            recent_cmds_snapshot = if !completed.is_empty() {
-                                Some(a.recent_commands.clone())
-                            } else {
-                                None
-                            };
+                            // Terminal notifications (F11): the status
+                            // fallback for agents without hooks. Untrusted
+                            // text, never exact unless it is this launch's
+                            // own nonce-tagged marker.
+                            let notifications = a.take_pending_notifications();
+                            if !notifications.is_empty() {
+                                let (agent, nonce) = session_clone
+                                    .lock()
+                                    .map(|s| {
+                                        (
+                                            s.ai_provider
+                                                .clone()
+                                                .unwrap_or_else(|| "terminal".to_string()),
+                                            s.signal_nonce.clone(),
+                                        )
+                                    })
+                                    .unwrap_or_else(|_| ("terminal".to_string(), None));
+                                let at = crate::pty::opencode_stream::now_millis();
+                                for n in &notifications {
+                                    for event in crate::pty::osc_signals::notification_events(
+                                        n,
+                                        &agent,
+                                        nonce.as_deref(),
+                                        at,
+                                    ) {
+                                        crate::contract::emit_session_event(
+                                            &app_clone,
+                                            &event_session_id,
+                                            event,
+                                        );
+                                    }
+                                }
+                            }
 
                             if let Some(new_phase) = a.take_pending_phase() {
                                 if let Ok(mut s) = session_clone.lock() {
-                                    if s.phase != new_phase {
+                                    if s.phase.can_transition_to(&new_phase) {
+                                        let old_phase = s.phase.clone();
                                         s.phase = new_phase.clone();
                                         s.last_activity_at = now();
                                         s.detected_agent = a.detected_agent.clone();
@@ -1119,6 +1756,16 @@ pub fn create_session(
                                         // need phase + agent + activity timestamp.
                                         let update = SessionUpdate::from(&*s);
                                         let _ = app_clone.emit("session-updated", &update);
+                                        // Turn ledger (F20): a guessed turn boundary. Only
+                                        // spawns work; never blocks this thread.
+                                        crate::turn_ledger::on_phase_change(
+                                            &app_clone,
+                                            &event_session_id,
+                                            &s.working_directory,
+                                            &old_phase,
+                                            &new_phase,
+                                            s.ai_provider.is_some() || s.detected_agent.is_some(),
+                                        );
 
                                         // Deliver any deferred context nudge now that the agent is idle
                                         if new_phase == SessionPhase::NeedsInput {
@@ -1140,99 +1787,52 @@ pub fn create_session(
                             // is the lightweight field that actually changed.
                             if a.detected_agent.is_some() {
                                 if let Ok(mut s) = session_clone.lock() {
-                                    if s.detected_agent.is_none() {
+                                    if agent_model_needs_emit(&s.detected_agent, &a.detected_agent)
+                                    {
+                                        if s.detected_agent.is_none() {
+                                            s.last_activity_at = now();
+                                        }
                                         s.detected_agent = a.detected_agent.clone();
-                                        s.last_activity_at = now();
                                         let update = SessionUpdate::from(&*s);
                                         let _ = app_clone.emit("session-updated", &update);
-                                    } else if let (Some(ref sa), Some(ref aa)) =
-                                        (&s.detected_agent, &a.detected_agent)
-                                    {
-                                        // Model enrichment: agent detected but model was unknown, now resolved
-                                        if sa.model.is_none() && aa.model.is_some() {
-                                            s.detected_agent = a.detected_agent.clone();
-                                            let update = SessionUpdate::from(&*s);
-                                            let _ = app_clone.emit("session-updated", &update);
-                                        }
                                     }
                                 }
                             }
 
-                            // Auto-launch AI agent when shell is ready
+                            // Auto-launch AI agent when shell is ready: typed
+                            // once the terminal has its real size (see
+                            // type_agent_launch), off this thread.
                             if a.pending_ai_launch {
                                 a.pending_ai_launch = false;
-                                let launch_info = session_clone.lock().ok().map(|s| {
-                                    (
-                                        s.ai_provider.clone(),
-                                        s.has_initial_context,
-                                        s.permission_mode.clone(),
-                                        s.custom_prefix.clone(),
-                                        s.custom_suffix.clone(),
-                                        s.channels.clone(),
+                                let app = app_clone.clone();
+                                let session = Arc::clone(&session_clone);
+                                let analyzer = Arc::clone(&analyzer_clone);
+                                let writer = Arc::clone(&writer_for_reader);
+                                let sized = Arc::clone(&sized_for_reader);
+                                thread::spawn(move || {
+                                    type_agent_launch(
+                                        &app, &session, &analyzer, &writer, &sized, true,
                                     )
                                 });
-                                if let Some((
-                                    Some(ref provider),
-                                    has_context,
-                                    ref perm_mode,
-                                    ref custom_prefix,
-                                    ref custom_suffix,
-                                    ref channels,
-                                )) = launch_info
-                                {
-                                    // Only launch known/allowed AI providers (reject unknown values)
-                                    if let Some(launch_cmd) = ai_launch_command(
-                                        provider,
-                                        perm_mode,
-                                        custom_prefix,
-                                        custom_suffix,
-                                    ) {
-                                        // For Claude/Gemini: pass context instruction as CLI argument
-                                        // so it's processed immediately without PTY injection timing issues
-                                        let supports_cli_prompt =
-                                            provider == "claude" || provider == "gemini";
-                                        // Build command: base+flags, then prompt, then --channels
-                                        // (channels must come AFTER prompt so CLI doesn't treat prompt as a channel entry)
-                                        let mut cmd = if has_context && supports_cli_prompt {
-                                            format!("{} \"Read the file at $HERMES_CONTEXT for project context about the attached workspaces.\"", launch_cmd)
-                                        } else {
-                                            launch_cmd
-                                        };
-                                        if provider == "claude" && !channels.is_empty() {
-                                            cmd.push_str(&channels_suffix(channels));
-                                        }
-                                        // Set up "command not found" detection window
-                                        a.ai_launching_provider = Some(provider.clone());
-                                        a.ai_launch_check_remaining = 10; // scan next 10 lines
-                                        if let Ok(mut w) = writer_for_reader.lock() {
-                                            let _ = w.write_all(format!("{}\r", cmd).as_bytes());
-                                            let _ = w.flush();
-                                        }
-                                        // Mark context as injected if it was baked into the launch command
-                                        if has_context && supports_cli_prompt {
-                                            a.context_injected = true;
-                                            if let Ok(mut s) = session_clone.lock() {
-                                                s.context_injected = true;
-                                                s.phase = SessionPhase::LaunchingAgent;
-                                                let update = SessionUpdate::from(&*s);
-                                                let _ = app_clone.emit("session-updated", &update);
-                                            }
-                                        } else {
-                                            if let Ok(mut s) = session_clone.lock() {
-                                                s.phase = SessionPhase::LaunchingAgent;
-                                                let update = SessionUpdate::from(&*s);
-                                                let _ = app_clone.emit("session-updated", &update);
-                                            }
-                                        }
-                                    } else {
-                                        log::warn!("Unknown AI provider rejected: {}", provider);
-                                    }
-                                }
                             }
 
                             // Emit event if AI CLI was not found
                             if let Some(failed_provider) = a.ai_launch_failed.take() {
                                 let _ = app_clone.emit("ai-launch-failed", &failed_provider);
+                            }
+                            // The shell refused the `cd` before the agent.
+                            if std::mem::take(&mut a.launch_cd_failed) {
+                                let cwd = session_clone
+                                    .lock()
+                                    .map(|s| s.working_directory.clone())
+                                    .unwrap_or_default();
+                                block_agent_launch(
+                                    &app_clone,
+                                    &session_clone,
+                                    &crate::pty::launch::folder_blocked_message(
+                                        std::path::Path::new(&cwd),
+                                    ),
+                                );
                             }
 
                             // Auto-inject context when agent prompt is first detected
@@ -1242,7 +1842,14 @@ pub fn create_session(
                                 .lock()
                                 .ok()
                                 .is_some_and(|s| s.ssh_info.is_some());
-                            if a.pending_context_inject && !a.context_injected && !is_ssh_session {
+                            if a.pending_context_inject && a.typed_line.pending() {
+                                // Never into a line the person is writing: the
+                                // next prompt tries again.
+                                a.pending_context_inject = false;
+                            } else if a.pending_context_inject
+                                && !a.context_injected
+                                && !is_ssh_session
+                            {
                                 a.pending_context_inject = false;
                                 let mut write_ok = false;
                                 if let Ok(mut w) = writer_for_reader.lock() {
@@ -1277,153 +1884,6 @@ pub fn create_session(
                                     // Phase-change paths already set it on real activity.
                                     let update = SessionUpdate::from(&*s);
                                     let _ = app_clone.emit("session-updated", &update);
-                                }
-                            }
-                        }
-
-                        // ─── DB work: analyzer lock is NOT held ──────────
-                        // Process completed execution nodes with the DB lock.
-                        // This runs after releasing the analyzer lock to maintain
-                        // consistent lock ordering (db before analyzer) and prevent
-                        // deadlocks with save_workspace_state / save_all_snapshots.
-                        if !completed.is_empty() {
-                            if let Some(mut recent_cmds) = recent_cmds_snapshot {
-                                if let Ok(db) = app_clone.state::<AppState>().db.lock() {
-                                    for node in &completed {
-                                        let node_id = db
-                                            .insert_execution_node(
-                                                &event_session_id,
-                                                node.timestamp,
-                                                &node.kind,
-                                                node.input.as_deref(),
-                                                node.output_summary.as_deref(),
-                                                node.exit_code,
-                                                &node.working_dir,
-                                                node.duration_ms,
-                                                None,
-                                            )
-                                            .ok();
-
-                                        // Emit execution-node event
-                                        if let Some(id) = node_id {
-                                            let exec_node = ExecutionNode {
-                                                id,
-                                                session_id: event_session_id.clone(),
-                                                timestamp: node.timestamp,
-                                                kind: node.kind.clone(),
-                                                input: node.input.clone(),
-                                                output_summary: node.output_summary.clone(),
-                                                exit_code: node.exit_code,
-                                                working_dir: node.working_dir.clone(),
-                                                duration_ms: node.duration_ms,
-                                                metadata: None,
-                                            };
-                                            let _ = app_clone.emit(
-                                                &format!("execution-node-{}", event_session_id),
-                                                &exec_node,
-                                            );
-                                        }
-
-                                        let project_id: Option<String> =
-                                            Some(node.working_dir.clone());
-
-                                        // Command sequence tracking — push FIRST then record
-                                        if node.kind == "command" {
-                                            if let Some(ref input) = node.input {
-                                                let normalized = input
-                                                    .trim()
-                                                    .trim_start_matches('$')
-                                                    .trim()
-                                                    .to_string();
-                                                if !normalized.is_empty() {
-                                                    recent_cmds.push_back(normalized.clone());
-                                                    if recent_cmds.len() > 5 {
-                                                        recent_cmds.pop_front();
-                                                    }
-
-                                                    let cmds: Vec<String> =
-                                                        recent_cmds.iter().cloned().collect();
-                                                    if cmds.len() >= 2 {
-                                                        let prev: Vec<&str> = cmds
-                                                            [..cmds.len() - 1]
-                                                            .iter()
-                                                            .rev()
-                                                            .take(2)
-                                                            .map(|s| s.as_str())
-                                                            .collect::<Vec<_>>()
-                                                            .into_iter()
-                                                            .rev()
-                                                            .collect();
-                                                        let seq_json = serde_json::to_string(&prev)
-                                                            .unwrap_or_default();
-                                                        db.record_command_sequence(
-                                                            project_id.as_deref(),
-                                                            &seq_json,
-                                                            &normalized,
-                                                        )
-                                                        .ok();
-                                                    }
-                                                    if cmds.len() >= 3 {
-                                                        let prev: Vec<&str> = cmds
-                                                            [..cmds.len() - 1]
-                                                            .iter()
-                                                            .rev()
-                                                            .take(3)
-                                                            .map(|s| s.as_str())
-                                                            .collect::<Vec<_>>()
-                                                            .into_iter()
-                                                            .rev()
-                                                            .collect();
-                                                        let seq_json = serde_json::to_string(&prev)
-                                                            .unwrap_or_default();
-                                                        db.record_command_sequence(
-                                                            project_id.as_deref(),
-                                                            &seq_json,
-                                                            &normalized,
-                                                        )
-                                                        .ok();
-                                                    }
-
-                                                    // Query predictions and emit
-                                                    let seq: Vec<&str> = cmds
-                                                        .iter()
-                                                        .rev()
-                                                        .take(2)
-                                                        .collect::<Vec<_>>()
-                                                        .into_iter()
-                                                        .rev()
-                                                        .map(|s| s.as_str())
-                                                        .collect();
-                                                    let seq_json = serde_json::to_string(&seq)
-                                                        .unwrap_or_default();
-                                                    if let Ok(predictions) = db
-                                                        .predict_next_command(
-                                                            project_id.as_deref(),
-                                                            &seq_json,
-                                                            3,
-                                                        )
-                                                    {
-                                                        if !predictions.is_empty() {
-                                                            let evt = CommandPredictionEvent {
-                                                                predictions,
-                                                            };
-                                                            let _ = app_clone.emit(
-                                                                &format!(
-                                                                    "command-prediction-{}",
-                                                                    event_session_id
-                                                                ),
-                                                                &evt,
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                // Write back updated recent_commands to analyzer
-                                if let Ok(mut a) = analyzer_clone.lock() {
-                                    a.recent_commands = recent_cmds;
                                 }
                             }
                         }
@@ -1542,94 +2002,121 @@ pub fn create_session(
                 if let Some((new_phase, detected_agent, metrics, launch_info)) = silence_result {
                     if let Some(new_phase) = new_phase {
                         if let (Some(metrics), Ok(mut s)) = (metrics, session_silence.lock()) {
-                            if s.phase != new_phase {
+                            if s.phase.can_transition_to(&new_phase) {
+                                let old_phase = s.phase.clone();
                                 s.phase = new_phase.clone();
                                 s.detected_agent = detected_agent;
                                 s.metrics = metrics;
                                 s.last_activity_at = now();
                                 let update = SessionUpdate::from(&*s);
                                 let _ = app_silence.emit("session-updated", &update);
+                                // Turn ledger (F20): silence after work is the
+                                // guessed end of a turn.
+                                crate::turn_ledger::on_phase_change(
+                                    &app_silence,
+                                    &s.id,
+                                    &s.working_directory,
+                                    &old_phase,
+                                    &new_phase,
+                                    s.ai_provider.is_some() || s.detected_agent.is_some(),
+                                );
                             }
                         }
                     }
 
                     // Fallback auto-launch
                     if launch_info.is_some() {
-                        let launch_data = session_silence.lock().ok().map(|s| {
-                            (
-                                s.ai_provider.clone(),
-                                s.has_initial_context,
-                                s.permission_mode.clone(),
-                                s.custom_prefix.clone(),
-                                s.custom_suffix.clone(),
-                                s.channels.clone(),
-                            )
-                        });
-                        if let Some((
-                            Some(ref provider),
-                            has_context,
-                            ref perm_mode,
-                            ref custom_prefix,
-                            ref custom_suffix,
-                            ref channels,
-                        )) = launch_data
-                        {
-                            if let Some(launch_cmd) =
-                                ai_launch_command(provider, perm_mode, custom_prefix, custom_suffix)
-                            {
-                                let supports_cli_prompt =
-                                    provider == "claude" || provider == "gemini";
-                                let mut cmd = if has_context && supports_cli_prompt {
-                                    format!("{} \"Read the file at $HERMES_CONTEXT for project context about the attached workspaces.\"", launch_cmd)
-                                } else {
-                                    launch_cmd
-                                };
-                                if provider == "claude" && !channels.is_empty() {
-                                    cmd.push_str(&channels_suffix(channels));
-                                }
-                                if let Ok(mut w) = writer_for_silence.lock() {
-                                    let _ = w.write_all(format!("{}\r", cmd).as_bytes());
-                                    let _ = w.flush();
-                                }
-                                // Update session state — need analyzer lock for context_injected
-                                if has_context && supports_cli_prompt {
-                                    if let Ok(mut a) = analyzer_silence.lock() {
-                                        a.context_injected = true;
-                                    }
-                                }
-                                if let Ok(mut s) = session_silence.lock() {
-                                    if has_context && supports_cli_prompt {
-                                        s.context_injected = true;
-                                    }
-                                    s.phase = SessionPhase::LaunchingAgent;
-                                    let update = SessionUpdate::from(&*s);
-                                    let _ = app_silence.emit("session-updated", &update);
-                                }
-                            }
-                        }
+                        type_agent_launch(
+                            &app_silence,
+                            &session_silence,
+                            &analyzer_silence,
+                            &writer_for_silence,
+                            &sized_for_silence,
+                            false,
+                        );
                     }
                 }
             }
         });
     }
 
+    if reattached {
+        // A full-screen program only redraws on a size change: nudge it
+        // (one column narrower, then back) so the screen is current again
+        // after the replay. Hermes never types into a terminal on its own.
+        let _ = transport.resize(pty_rows, pty_cols.saturating_sub(1).max(1));
+        let _ = transport.resize(pty_rows, pty_cols);
+        // LEAD-01: the agent kept running and kept reporting into its spool
+        // while the app was away. Read it again from the start (its status,
+        // identity and usage come back) and keep listening, so what it asks
+        // next reaches the badge, the inbox and the notifications.
+        let reattach = crate::pty::launch::launch_dir(&app)
+            .ok()
+            .and_then(|dir| crate::pty::launch::reattach_watch(&dir.join(&session_id)));
+        if let Some(watch) = reattach {
+            if let Ok(mut s) = session_arc.lock() {
+                s.signal_nonce = Some(watch.nonce.clone());
+            }
+            crate::pty::launch::watch_signals(app.clone(), Arc::clone(&session_arc), watch);
+        }
+        if let Some(code) = ended_before_attach {
+            // The program ended while the app was away: a fact worth
+            // reporting through the 2.0 event contract.
+            crate::contract::emit_session_event(
+                &app,
+                &session_id,
+                crate::contract::SessionEvent::Exit {
+                    at: chrono::Utc::now().timestamp_millis(),
+                    source: Some("host".to_string()),
+                    tags: None,
+                    code,
+                    signal: None,
+                },
+            );
+        }
+    }
+
     let result = {
         let s = session_arc
             .lock()
             .map_err(|e| format!("Lock poisoned: {}", e))?;
-        SessionUpdate::from(&*s)
+        let mut update = SessionUpdate::from(&*s);
+        update.reattached = reattached;
+        update
     };
 
-    let pty_session = PtySession {
-        master: pair.master,
+    let mut pty_session = PtySession {
+        transport,
         writer,
         session: session_arc,
         analyzer,
-        child,
-        #[cfg(target_os = "macos")]
-        tty_path: saved_tty_path,
         shell_integration,
+        hermes_suggestions: disable_native_suggestions,
+        size: (pty_rows, pty_cols),
+        sized,
     };
+    // Typing and a resize that arrived while it was being opened.
+    if let Some((rows, cols)) = opened.size {
+        if pty_session.transport.resize(rows, cols).is_ok() {
+            pty_session.size = (rows, cols);
+        }
+        pty_session
+            .sized
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    if !opened.input.is_empty() {
+        if let Ok(mut a) = pty_session.analyzer.lock() {
+            a.typed_line.feed(&opened.input);
+        }
+        if let Ok(mut w) = pty_session.writer.lock() {
+            if w.write_all(&opened.input).and_then(|_| w.flush()).is_err() {
+                log::warn!(
+                    "[create_session] {}: could not write the input typed while it was opening",
+                    session_id
+                );
+            }
+        }
+    }
     mgr.sessions.insert(session_id.clone(), pty_session);
 
     // Save to DB
@@ -1658,7 +2145,7 @@ pub fn create_session(
 
 /// Enumerate direct child PIDs of a given parent process.
 #[cfg(unix)]
-fn enumerate_child_pids(parent_pid: u32) -> Vec<u32> {
+pub(crate) fn enumerate_child_pids(parent_pid: u32) -> Vec<u32> {
     let mut children = Vec::new();
 
     #[cfg(target_os = "macos")]
@@ -1689,7 +2176,10 @@ fn enumerate_child_pids(parent_pid: u32) -> Vec<u32> {
         };
 
         if ret > 0 {
-            let actual = ret as usize / std::mem::size_of::<libc::pid_t>();
+            // libproc's proc_listchildpids returns a number of pids (it
+            // divides proc_listpids' byte count by the size of a pid), not
+            // a number of bytes.
+            let actual = (ret as usize).min(pids.len());
             for &pid in &pids[..actual] {
                 if pid > 0 {
                     children.push(pid as u32);
@@ -1724,52 +2214,55 @@ fn enumerate_child_pids(parent_pid: u32) -> Vec<u32> {
 
 #[tauri::command]
 pub fn write_to_session(
+    app: AppHandle,
     state: State<'_, AppState>,
     session_id: String,
     data: String,
 ) -> Result<(), String> {
     let mut mgr = state.pty_manager.lock().unwrap_or_else(|e| e.into_inner());
-    let session = mgr
-        .sessions
-        .get_mut(&session_id)
-        .ok_or_else(|| format!("Session {} not found", session_id))?;
 
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&data)
         .map_err(|e| format!("Invalid base64 input: {}", e))?;
 
+    // Still being opened: kept, and written once it is.
+    if !mgr.sessions.contains_key(&session_id) && mgr.queue_opening_input(&session_id, &bytes) {
+        return Ok(());
+    }
+    let session = mgr
+        .sessions
+        .get_mut(&session_id)
+        .ok_or_else(|| format!("Session {} not found", session_id))?;
+
     if let Ok(mut a) = session.analyzer.lock() {
         a.mark_input_sent();
+        a.typed_line.feed(&bytes);
+    }
 
-        let text = String::from_utf8_lossy(&bytes);
-        let is_enter = text.contains('\r') || text.contains('\n');
-
-        // Accumulate printable chars into the line buffer
-        for ch in text.chars() {
-            if ch == '\r' || ch == '\n' {
-                // Enter pressed — commit the accumulated line
-                continue;
-            } else if ch == '\x7f' || ch == '\x08' {
-                // Backspace — pop last char
-                a.input_line_buffer.pop();
-            } else if ch == '\x03' {
-                // Ctrl+C — clear buffer
-                a.input_line_buffer.clear();
-            } else if !ch.is_control() {
-                a.input_line_buffer.push(ch);
+    // CHAOS-05: a big paste takes as long as the program needs to read it.
+    // Written here, it would hold the session list (and the window, whose
+    // thread runs this command) until then. It is written in the
+    // background instead; a failure is reported on `pty-write-failed-<id>`.
+    if writes_in_background(bytes.len()) {
+        let writer = Arc::clone(&session.writer);
+        drop(mgr);
+        let id = session_id.clone();
+        thread::spawn(move || {
+            let written = writer.lock().map_err(|e| e.to_string()).and_then(|mut w| {
+                w.write_all(&bytes)
+                    .and_then(|_| w.flush())
+                    .map_err(|e| e.to_string())
+            });
+            if let Err(e) = written {
+                log::warn!(
+                    "[write_to_session] {id}: a paste of {} bytes failed: {e}",
+                    bytes.len()
+                );
+                let _ = app.emit(&format!("pty-write-failed-{id}"), e);
             }
-        }
-
-        if is_enter && !a.input_line_buffer.is_empty() {
-            let line = a.input_line_buffer.drain(..).collect::<String>();
-            a.mark_input_line(&line);
-            let cwd = a.current_cwd.clone().unwrap_or_default();
-            a.start_node(&cwd);
-        } else if is_enter {
-            // Enter with empty buffer — still mark activity
-            a.input_line_buffer.clear();
-        }
+        });
+        return Ok(());
     }
 
     {
@@ -1780,6 +2273,24 @@ pub fn write_to_session(
         w.write_all(&bytes)
             .map_err(|e| format!("Write failed: {}", e))?;
         w.flush().map_err(|e| format!("Flush failed: {}", e))?;
+    }
+
+    // What the person types is never the CLI refusing the launch, and their
+    // first Enter in a resumed agent ends its replayed history.
+    crate::agent_caps::watch::user_input(&session_id, &bytes);
+
+    // A key after the agent asked the person (approval, a question) is the
+    // answer; the agent itself says nothing until the work is done.
+    if crate::pty::launch::is_keystroke(&bytes) {
+        crate::pty::os_activity::note_person_input(&session_id);
+    }
+
+    // A key typed at an agent's startup prompt answers it: the "waiting at
+    // a startup prompt" report must not outlive the prompt.
+    if let Ok(mut s) = session.session.lock() {
+        if crate::pty::launch::note_user_input(&mut s, &bytes) {
+            let _ = app.emit("session-updated", SessionUpdate::from(&*s));
+        }
     }
 
     // ── Direct SIGINT delivery (macOS/Unix) ──
@@ -1797,8 +2308,19 @@ pub fn write_to_session(
         // Send SIGINT to the shell's child processes directly.
         // The shell's PID is known; we enumerate its children via sysctl
         // and send SIGINT to each child's process group.
-        if let Some(shell_pid) = session.child.process_id() {
-            let child_pids = enumerate_child_pids(shell_pid);
+        if let Some(shell_pid) = session.transport.pid() {
+            // macOS: only the shell's own group. The trampoline gives the
+            // shell its controlling terminal (#214), so the line discipline
+            // interrupts a cooked-mode program itself, and a signal sent to
+            // a raw-mode program (an agent's TUI) would kill it instead of
+            // letting it handle the Ctrl+C it reads. That is also what macOS
+            // always got here: the child scan never listed a single child
+            // until it read proc_listchildpids' count correctly.
+            let child_pids = if cfg!(target_os = "macos") {
+                Vec::new()
+            } else {
+                enumerate_child_pids(shell_pid)
+            };
             if !child_pids.is_empty() {
                 for &cpid in &child_pids {
                     if cpid > 0 && cpid <= i32::MAX as u32 {
@@ -1830,44 +2352,87 @@ pub fn write_to_session(
 /// vim, htop, etc.) is running in the foreground.
 ///
 /// Strategy:
-///   1. macOS — open the TTY slave device and call `tcgetpgrp()` to get the
-///      foreground PGID, then compare with the shell's own PGID.
-///   2. Linux — read `/proc/{pid}/stat` to obtain `pgrp` and `tpgid`.
-///   3. Fallback — enumerate the shell's direct children; if none exist the
-///      shell is assumed to be at its prompt.
+///   1. macOS and Linux — `tcgetpgrp()` on the PTY master gives the
+///      terminal's foreground process group; compare it with the shell's.
+///      (The slave side cannot be used: on macOS `tcgetpgrp()` on a terminal
+///      that is not this process's controlling terminal fails with ENOTTY.)
+///   2. Linux fallback — read `/proc/{pid}/stat` to obtain `pgrp` and `tpgid`.
+///   3. Windows (no process groups on a pseudo console) and the last Unix
+///      fallback — the shell is at its prompt when it has no child process.
+///      A program the shell started, such as an agent CLI, is its child.
+///      Without process groups a background job (`npm run dev &`) cannot be
+///      told apart from a foreground one, so on Windows suggestions also stay
+///      off while the shell has one running. Erring that way never draws over
+///      an agent.
+///
+/// The frontend asks every 300 ms and before each suggestion. The check runs
+/// on a blocking thread, and the PTY manager lock is held only for step 1:
+/// keystrokes are written under the same lock, and steps 2 and 3 (the Windows
+/// one scans the whole process table) must never make typing wait.
 #[tauri::command]
-pub fn is_shell_foreground(state: State<'_, AppState>, session_id: String) -> Result<bool, String> {
-    let mgr = state.pty_manager.lock().unwrap_or_else(|e| e.into_inner());
+pub async fn is_shell_foreground(app: AppHandle, session_id: String) -> Result<bool, String> {
+    use tauri::Manager;
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        foreground_lock_released_for_scan(
+            &state.pty_manager,
+            |mgr| {
+                let probe = probe_foreground(mgr, &session_id);
+                #[cfg(feature = "e2e")]
+                let probe = e2e_slow_foreground::probe(probe);
+                probe
+            },
+            |shell_pid| {
+                #[cfg(feature = "e2e")]
+                e2e_slow_foreground::scan();
+                shell_at_prompt_by_process_table(shell_pid)
+            },
+        )
+    })
+    .await
+    .map_err(|e| format!("Foreground check failed: {}", e))?
+}
+
+/// Run `probe` under the PTY manager lock and, only after releasing it,
+/// `scan` when the probe could not tell. `probe` gives the shell's pid and,
+/// when the terminal can say, whether the shell owns it; `scan` answers from
+/// the process table.
+fn foreground_lock_released_for_scan<M>(
+    manager: &StdMutex<M>,
+    probe: impl FnOnce(&M) -> Result<(u32, Option<bool>), String>,
+    scan: impl FnOnce(u32) -> bool,
+) -> Result<bool, String> {
+    let (shell_pid, from_terminal) = {
+        let mgr = manager.lock().unwrap_or_else(|e| e.into_inner());
+        probe(&mgr)?
+    };
+    match from_terminal {
+        Some(owns) => Ok(owns),
+        None => Ok(scan(shell_pid)),
+    }
+}
+
+/// The session's shell pid and, on Unix, whether its process group is the
+/// terminal's foreground group (one `tcgetpgrp()` on the master).
+fn probe_foreground(
+    mgr: &super::PtyManager,
+    session_id: &str,
+) -> Result<(u32, Option<bool>), String> {
     let session = mgr
         .sessions
-        .get(&session_id)
+        .get(session_id)
         .ok_or_else(|| format!("Session {} not found", session_id))?;
-
     let shell_pid = session
-        .child
-        .process_id()
+        .transport
+        .pid()
         .ok_or_else(|| "Shell process ID not available".to_string())?;
+    let from_master = session.transport.shell_owns_terminal(shell_pid);
+    Ok((shell_pid, from_master))
+}
 
-    // ── macOS: tcgetpgrp on the TTY slave ──
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(ref tty_path) = session.tty_path {
-            if let Ok(tty_cstr) = std::ffi::CString::new(tty_path.to_string_lossy().into_owned()) {
-                let fd = unsafe { libc::open(tty_cstr.as_ptr(), libc::O_RDONLY | libc::O_NOCTTY) };
-                if fd >= 0 {
-                    let fg_pgid = unsafe { libc::tcgetpgrp(fd) };
-                    unsafe { libc::close(fd) };
-                    if fg_pgid > 0 {
-                        let shell_pgid = unsafe { libc::getpgid(shell_pid as i32) };
-                        if shell_pgid > 0 {
-                            return Ok(fg_pgid == shell_pgid);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
+/// Whether the shell is at its prompt, from the process table (steps 2 and 3
+/// above). Slow on Windows; never call it holding the PTY manager lock.
+pub(crate) fn shell_at_prompt_by_process_table(shell_pid: u32) -> bool {
     // ── Linux: read tpgid from /proc/{pid}/stat ──
     #[cfg(target_os = "linux")]
     {
@@ -1881,7 +2446,7 @@ pub fn is_shell_foreground(state: State<'_, AppState>, session_id: String) -> Re
                     if let (Ok(pgrp), Ok(tpgid)) =
                         (fields[2].parse::<i32>(), fields[5].parse::<i32>())
                     {
-                        return Ok(tpgid == pgrp);
+                        return tpgid == pgrp;
                     }
                 }
             }
@@ -1891,12 +2456,110 @@ pub fn is_shell_foreground(state: State<'_, AppState>, session_id: String) -> Re
     // ── Fallback: no direct children → shell is at prompt ──
     #[cfg(unix)]
     {
-        let children = enumerate_child_pids(shell_pid);
-        Ok(children.is_empty())
+        enumerate_child_pids(shell_pid).is_empty()
+    }
+    #[cfg(not(unix))]
+    {
+        !has_child_process(shell_pid)
+    }
+}
+
+/// e2e builds only: make the foreground check slow on purpose, so the
+/// real-app scenario F03-foreground-check-lock can show that typing does not
+/// wait for it. `HERMES_E2E_FOREGROUND_SCAN_MS` sends every check down the
+/// process-table path and makes that scan take this long. With
+/// `HERMES_E2E_FOREGROUND_SCAN_UNDER_LOCK=1` the delay is spent while the
+/// PTY manager lock is held instead (the scenario's negative control).
+#[cfg(feature = "e2e")]
+mod e2e_slow_foreground {
+    use std::time::Duration;
+
+    fn delay() -> Option<Duration> {
+        std::env::var("HERMES_E2E_FOREGROUND_SCAN_MS")
+            .ok()?
+            .parse()
+            .ok()
+            .map(Duration::from_millis)
     }
 
-    #[cfg(not(unix))]
-    Ok(true)
+    fn under_lock() -> bool {
+        std::env::var("HERMES_E2E_FOREGROUND_SCAN_UNDER_LOCK").as_deref() == Ok("1")
+    }
+
+    /// Runs under the lock.
+    pub fn probe(
+        probe: Result<(u32, Option<bool>), String>,
+    ) -> Result<(u32, Option<bool>), String> {
+        let Some(delay) = delay() else { return probe };
+        if under_lock() {
+            std::thread::sleep(delay);
+        }
+        probe.map(|(pid, _)| (pid, None))
+    }
+
+    /// Runs with the lock released.
+    pub fn scan() {
+        if let Some(delay) = delay() {
+            if !under_lock() {
+                std::thread::sleep(delay);
+            }
+        }
+    }
+}
+
+/// Whether the shell's process group is the terminal's foreground process
+/// group, or `None` when either cannot be read.
+#[cfg(unix)]
+#[cfg(test)]
+fn shell_group_is_foreground(
+    master: &(dyn portable_pty::MasterPty + Send),
+    shell_pid: u32,
+) -> Option<bool> {
+    let foreground = master.process_group_leader()?;
+    let shell_pgid = unsafe { libc::getpgid(shell_pid as i32) };
+    if shell_pgid <= 0 {
+        return None;
+    }
+    Some(foreground == shell_pgid)
+}
+
+/// Whether any running process has `parent_pid` as its parent and counts as
+/// a program the shell started (see [`counts_as_shell_child`]).
+#[cfg(any(not(unix), test))]
+pub(crate) fn has_child_process(parent_pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let parent = Pid::from_u32(parent_pid);
+    let parent_started = sys.process(parent).map_or(0, |p| p.start_time());
+    sys.processes().values().any(|p| {
+        p.parent() == Some(parent)
+            && counts_as_shell_child(parent_started, p.start_time(), &p.name().to_string_lossy())
+    })
+}
+
+/// Whether a process whose parent id is the shell's pid is a program the
+/// shell started. Start times are in whole seconds since the epoch; 0 means
+/// the OS would not say (Windows cannot open some processes).
+///
+/// - Windows reuses process ids and keeps an orphan's old parent id, so a
+///   process that started before the shell was the child of an earlier
+///   process with the same id: it does not count.
+/// - The times have one-second granularity. A child started in the same
+///   second as the shell counts; so does an orphan of a reused id started
+///   in that second, which only keeps suggestions off (never draws over an
+///   agent).
+/// - An unknown time counts, for the same reason.
+/// - The console host Windows may start for a console program is not a
+///   program the user ran, so it does not count.
+///
+/// Also used by the fleet load (`crate::fleet`) on every platform.
+pub(crate) fn counts_as_shell_child(shell_started: u64, started: u64, name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if name == "conhost.exe" || name == "openconsole.exe" {
+        return false;
+    }
+    shell_started == 0 || started == 0 || started >= shell_started
 }
 
 #[tauri::command]
@@ -1954,42 +2617,19 @@ pub fn resize_session(
     rows: u16,
     cols: u16,
 ) -> Result<(), String> {
-    let mgr = state.pty_manager.lock().unwrap_or_else(|e| e.into_inner());
+    let mut mgr = state.pty_manager.lock().unwrap_or_else(|e| e.into_inner());
+    // Still being opened: applied once it is.
+    if !mgr.sessions.contains_key(&session_id) && mgr.queue_opening_resize(&session_id, rows, cols)
+    {
+        return Ok(());
+    }
+    if !mgr.resize(&session_id, rows, cols)? {
+        return Ok(());
+    }
     let session = mgr
         .sessions
         .get(&session_id)
         .ok_or_else(|| format!("Session {} not found", session_id))?;
-
-    session
-        .master
-        .resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| format!("Resize failed: {}", e))?;
-
-    // Explicitly send SIGWINCH to the child process.
-    // On macOS with posix_spawn(POSIX_SPAWN_SETSID), ioctl(TIOCSWINSZ) on the
-    // master fd does NOT automatically deliver SIGWINCH because the parent
-    // process is in a different session than the child.  tcgetpgrp() returns -1
-    // from the parent's context.  Send SIGWINCH directly to the child's process
-    // group (negative PID = entire process group) so the shell and its children
-    // pick up the new terminal dimensions.
-    #[cfg(unix)]
-    {
-        if let Some(child_pid) = session.child.process_id() {
-            if child_pid > 0 && child_pid <= i32::MAX as u32 {
-                let pgid = child_pid as i32;
-                unsafe {
-                    // Send to the process group (negative PID), not just the shell.
-                    // This ensures child processes (e.g. Claude Code) also receive it.
-                    libc::kill(-(pgid), libc::SIGWINCH);
-                }
-            }
-        }
-    }
 
     // Sync remote tmux dimensions when resizing SSH+tmux sessions.
     // Fire-and-forget on a background thread so resize doesn't block.
@@ -2000,12 +2640,13 @@ pub fn resize_session(
                     info.user.clone(),
                     info.host.clone(),
                     info.port,
+                    info.jump_host.clone(),
                     tmux_name.clone(),
                 )
             })
         })
     });
-    if let Some((user, host, port, tmux_name)) = ssh_tmux_info {
+    if let Some((user, host, port, jump_host, tmux_name)) = ssh_tmux_info {
         let resize_cols = cols;
         let resize_rows = rows;
         thread::spawn(move || {
@@ -2015,11 +2656,211 @@ pub fn resize_session(
                 resize_cols,
                 resize_rows
             );
-            let _ = ssh_exec(&user, &host, port, &remote_cmd);
+            let _ = ssh_exec(&user, &host, port, jump_host.as_deref(), &remote_cmd);
         });
     }
 
     Ok(())
+}
+
+/// Whether the analyzer's agent info should be pushed to the session and
+/// emitted: first detection, or any model change (None→Some and Some(a)→Some(b),
+/// e.g. `/model sonnet` → `/model opus`).
+fn agent_model_needs_emit(current: &Option<AgentInfo>, detected: &Option<AgentInfo>) -> bool {
+    match (current, detected) {
+        (None, Some(_)) => true,
+        (Some(cur), Some(new)) => new.model.is_some() && cur.model != new.model,
+        _ => false,
+    }
+}
+
+/// Emitted when a session could not open in the folder it was asked to open
+/// in (payload: `WorkingDirectoryRecovery`). The frontend shows one line.
+pub const WORKING_DIRECTORY_RECOVERED_EVENT: &str = "session-working-directory-recovered";
+
+/// How a session whose folder went missing was given a folder that exists.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkingDirectoryRecovery {
+    pub session_id: String,
+    /// Branch of the worktree that was missing, when there was one.
+    pub branch_name: Option<String>,
+    /// The folder that no longer exists.
+    pub missing_path: String,
+    /// The folder the session opens in.
+    pub path: String,
+    /// `recreated`: the worktree was put back at `path` on its branch.
+    /// `project-folder`: the branch is gone (or there was no worktree), so
+    /// the session opens in the project folder. `folder`: it opens in the
+    /// folder it was asked for, which is not the project folder. `home`:
+    /// nothing else exists.
+    pub outcome: &'static str,
+}
+
+/// The folder a session's shell starts in, always one that exists.
+///
+/// Preference: the session's linked worktree; when its folder is missing and
+/// Hermes made it, the worktree recreated on its branch; else the requested
+/// folder; else the project folder (the worktree's project, or the first
+/// attached one); else the home folder. A worktree link that could not be
+/// honoured is dropped so the session is not shown as isolated when it is
+/// not. The second value says what happened when it was not the plain case.
+///
+/// The database lock is taken only to read the rows and to drop a stale
+/// link, never while git recreates a worktree (which can take a while on a
+/// large repository and would block every other command that uses it).
+pub fn resolve_session_cwd(
+    db: &std::sync::Mutex<Database>,
+    session_id: &str,
+    requested_cwd: String,
+    project_ids: Option<&[String]>,
+) -> (String, Option<WorkingDirectoryRecovery>) {
+    use crate::git::worktree::{is_owned_checkout, isolation_fixes_enabled, recreate_worktree};
+    use std::path::Path;
+
+    let recovered = |missing: &str, branch: Option<&str>, path: String, outcome: &'static str| {
+        Some(WorkingDirectoryRecovery {
+            session_id: session_id.to_string(),
+            branch_name: branch.map(str::to_string),
+            missing_path: missing.to_string(),
+            path,
+            outcome,
+        })
+    };
+
+    // Read everything needed under the lock, then let it go.
+    let (primary, project_path, attached_projects) = match db.lock() {
+        Ok(db) => {
+            let primary = db
+                .get_session_worktrees(session_id)
+                .unwrap_or_default()
+                .into_iter()
+                .next();
+            let project_path = primary
+                .as_ref()
+                .and_then(|p| db.get_project(&p.project_id).ok().flatten())
+                .map(|p| p.path);
+            let attached: Vec<String> = project_ids
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|id| db.get_project(id).ok().flatten().map(|p| p.path))
+                .collect();
+            (primary, project_path, attached)
+        }
+        Err(_) => return (requested_cwd, None),
+    };
+
+    let mut missing: Option<(String, Option<String>)> = None;
+    let mut fallback_project: Option<String> = None;
+
+    if let Some(primary) = primary {
+        if Path::new(&primary.worktree_path).is_dir() {
+            return (primary.worktree_path, None);
+        }
+        if !isolation_fixes_enabled() {
+            // Test builds only (negative control): the old behaviour, which
+            // handed back the requested folder even when it was missing.
+            return (requested_cwd, None);
+        }
+        if is_owned_checkout(primary.is_main_worktree, &primary.worktree_path) {
+            if let (Some(repo), Some(branch)) = (&project_path, &primary.branch_name) {
+                match recreate_worktree(repo, &primary.worktree_path, branch) {
+                    Ok(()) => {
+                        return (
+                            primary.worktree_path.clone(),
+                            recovered(
+                                &primary.worktree_path,
+                                Some(branch),
+                                primary.worktree_path.clone(),
+                                "recreated",
+                            ),
+                        );
+                    }
+                    Err(e) => log::warn!(
+                        "Could not put back the worktree '{}' of session {}: {}",
+                        primary.worktree_path,
+                        session_id,
+                        e
+                    ),
+                }
+            }
+        }
+        // The link cannot be honoured: drop it, so the session is not shown
+        // as isolated, and open somewhere that exists.
+        match db.lock() {
+            Ok(db) => {
+                if let Err(e) = db.delete_session_worktree(&primary.id) {
+                    log::warn!(
+                        "Failed to drop the stale worktree link '{}': {}",
+                        primary.id,
+                        e
+                    );
+                }
+            }
+            Err(e) => log::warn!(
+                "Failed to drop the stale worktree link '{}': {}",
+                primary.id,
+                e
+            ),
+        }
+        missing = Some((primary.worktree_path, primary.branch_name));
+        fallback_project = project_path;
+    }
+
+    if Path::new(&requested_cwd).is_dir() {
+        use crate::git::worktree::same_dir;
+        return match missing {
+            // The worktree is gone, but the folder asked for exists: say
+            // which folder that is (the project folder, or another one).
+            Some((gone, branch)) if !same_dir(&gone, &requested_cwd) => {
+                let outcome = match &fallback_project {
+                    Some(project) if same_dir(project, &requested_cwd) => "project-folder",
+                    _ => "folder",
+                };
+                (
+                    requested_cwd.clone(),
+                    recovered(&gone, branch.as_deref(), requested_cwd, outcome),
+                )
+            }
+            _ => (requested_cwd, None),
+        };
+    }
+    if !isolation_fixes_enabled() {
+        return (requested_cwd, None);
+    }
+
+    let (gone, branch) = missing.unwrap_or((requested_cwd, None));
+    let project_folder = fallback_project
+        .into_iter()
+        .chain(attached_projects)
+        .find(|p| Path::new(p).is_dir());
+    if let Some(folder) = project_folder {
+        return (
+            folder.clone(),
+            recovered(&gone, branch.as_deref(), folder, "project-folder"),
+        );
+    }
+    // The home folder; failing that (HOME pointing at a folder that is
+    // gone), the process' working directory, then the temp folder, which
+    // always exists. Never a folder that does not.
+    let home = crate::platform::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|p| Path::new(p).is_dir());
+    match home {
+        Some(home) => (
+            home.clone(),
+            recovered(&gone, branch.as_deref(), home, "home"),
+        ),
+        None => {
+            let folder = Some(get_working_directory())
+                .filter(|p| Path::new(p).is_dir())
+                .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
+            (
+                folder.clone(),
+                recovered(&gone, branch.as_deref(), folder, "folder"),
+            )
+        }
+    }
 }
 
 /// Drain the DB-side state for `session_id`: mark the session as
@@ -2060,11 +2901,18 @@ pub fn drain_session_db_state(db: &Database, session_id: &str) -> Vec<SessionWor
     let mut needs_disk_removal: Vec<SessionWorktreeRow> = Vec::new();
 
     for wt in worktrees {
-        if wt.is_main_worktree {
-            // Main worktrees live in the project repo itself; close must
-            // never remove them from disk.  Drop the link row.
+        if !crate::git::worktree::is_owned_checkout(wt.is_main_worktree, &wt.worktree_path) {
+            // The project folder, or a worktree made outside Hermes that the
+            // user chose to reuse: not ours, so close must never remove it
+            // from disk (and `remove_worktree` would refuse to, which used
+            // to surface as a "cleanup failed, retrying on next startup"
+            // warning on every close).  Drop the link row only.
             if let Err(e) = db.delete_session_worktree(&wt.id) {
-                log::warn!("Failed to delete main-worktree DB row '{}': {}", wt.id, e,);
+                log::warn!(
+                    "Failed to delete the link row '{}' for a checkout not made by Hermes: {}",
+                    wt.id,
+                    e,
+                );
             }
             continue;
         }
@@ -2119,14 +2967,7 @@ fn remove_owned_worktrees_from_disk(
 
         repos_to_prune.insert(proj.path.clone());
 
-        let custom_base = crate::git::resolve_worktree_base(db, Some(session_id), Some(&wt.project_id));
-
-        match crate::git::worktree::remove_worktree(
-            &proj.path,
-            session_id,
-            &wt.worktree_path,
-            custom_base.as_deref(),
-        ) {
+        match crate::git::worktree::remove_worktree(&proj.path, session_id, &wt.worktree_path) {
             Ok(()) => {
                 if let Err(e) = db.delete_session_worktree(&wt.id) {
                     log::warn!(
@@ -2179,17 +3020,25 @@ pub fn close_session(
     // before touching the DB / filesystem.  Agent sessions never insert
     // into `mgr.sessions` — for them this branch is a no-op and the
     // mode-agnostic cleanup below runs unconditionally.
+    // Still being opened: create_session stops the new terminal and
+    // registers nothing once its spawn returns (the cleanup below runs now).
+    if mgr.close_opening(&session_id) {
+        log::info!(
+            "close_session: '{}' is still being opened; it will not be registered",
+            session_id
+        );
+    }
     if let Some(mut pty_session) = mgr.sessions.remove(&session_id) {
         // Kill the child shell process FIRST — it may still be using ZDOTDIR
         // temp files. Don't block on wait() since the process may be hung.
-        pty_session.child.kill().ok();
+        pty_session.transport.kill().ok();
 
         // Clean up shell integration temp files after killing the child
         crate::pty::shell_integration::cleanup(&pty_session.shell_integration);
 
-        let mut child = pty_session.child;
+        let mut transport = pty_session.transport;
         thread::spawn(move || {
-            child.wait().ok();
+            transport.wait();
         });
 
         // Save snapshot and persist token data.  Note: status update +
@@ -2244,8 +3093,24 @@ pub fn close_session(
     drop(mgr); // release PTY-manager lock before touching DB / filesystem
     let _ = app.emit("session-removed", &session_id);
     crate::project::attunement::delete_session_context_file(&app, &session_id);
+    crate::pty::launch::remove_session_files(&app, &session_id);
+    if let Some(checks) = tauri::Manager::try_state::<crate::done_when::DoneWhenState>(&app) {
+        checks.forget(&session_id);
+    }
+
+    // Drop it from the saved workspace now: a quit right after this close
+    // must not bring it back on the next launch.
+    state.closed_sessions.mark_closed(&session_id);
+    let closed = state.closed_sessions.snapshot();
 
     if let Ok(db) = state.db.lock() {
+        if let Err(e) = crate::saved_workspace::prune_stored(&db, &closed) {
+            log::warn!(
+                "close_session: could not drop '{}' from the saved workspace: {}",
+                session_id,
+                e
+            );
+        }
         let needs_disk = drain_session_db_state(&db, &session_id);
         if !needs_disk.is_empty() {
             remove_owned_worktrees_from_disk(&app, &db, &session_id, needs_disk);
@@ -2601,8 +3466,19 @@ pub fn get_session_metadata(
 }
 
 /// Returns a list of `{ name, path }` objects for shells found on this machine.
+/// Off the main thread, like `check_ai_providers`: on Windows it starts
+/// `where` for each PowerShell (Settings opening froze the window meanwhile).
 #[tauri::command]
-pub fn get_available_shells() -> Vec<ShellInfo> {
+pub async fn get_available_shells() -> Result<Vec<ShellInfo>, String> {
+    tokio::task::spawn_blocking(|| {
+        e2e_hold("HERMES_E2E_SLOW_PROBE_MS", "the shell list");
+        available_shells()
+    })
+    .await
+    .map_err(|e| format!("could not list the shells: {e}"))
+}
+
+fn available_shells() -> Vec<ShellInfo> {
     let mut shells: Vec<ShellInfo> = Vec::new();
 
     #[cfg(unix)]
@@ -2659,17 +3535,96 @@ pub fn get_available_shells() -> Vec<ShellInfo> {
                 path: "cmd.exe".to_string(),
             });
         }
-        // Git Bash
-        let git_bash = "C:\\Program Files\\Git\\bin\\bash.exe";
-        if std::path::Path::new(git_bash).exists() {
+        // Git Bash, wherever Git for Windows is installed (XP-15).
+        let where_bash = std::process::Command::new("where")
+            .arg("bash")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        let install_path = std::process::Command::new("reg")
+            .args(["query", r"HKLM\SOFTWARE\GitForWindows", "/v", "InstallPath"])
+            .output()
+            .ok()
+            .and_then(|o| reg_install_path(&String::from_utf8_lossy(&o.stdout)));
+        if let Some(path) = git_bash_candidates(&where_bash, install_path.as_deref())
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+        {
             shells.push(ShellInfo {
                 name: "Git Bash".to_string(),
-                path: git_bash.to_string(),
+                path,
             });
         }
     }
 
     shells
+}
+
+/// Where Git Bash may be, best first: the Git for Windows install folder
+/// from the registry, every `bash.exe` on PATH that is not the WSL launcher
+/// in System32, then the default install folders.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn git_bash_candidates(where_output: &str, install_path: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(dir) = install_path {
+        out.push(format!(
+            "{}\\bin\\bash.exe",
+            dir.trim_end_matches(['\\', '/'])
+        ));
+    }
+    for line in where_output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
+        let lower = line.to_ascii_lowercase();
+        if lower.ends_with("bash.exe")
+            && !lower.contains("\\system32\\")
+            && !lower.contains("\\windowsapps\\")
+        {
+            out.push(line.to_string());
+        }
+    }
+    out.push(r"C:\Program Files\Git\bin\bash.exe".to_string());
+    out.push(r"C:\Program Files (x86)\Git\bin\bash.exe".to_string());
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(p.to_ascii_lowercase()));
+    out
+}
+
+/// The `InstallPath` value in `reg query` output.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn reg_install_path(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("InstallPath")?;
+        let value = rest.trim_start().strip_prefix("REG_SZ")?.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// The kind of shell a shell setting names, from its file name, any case
+/// (`C:\Windows\...\PowerShell.exe`, `CMD.EXE`), never from the folders
+/// around it (XP-15).
+fn shell_type_of(shell: &str) -> &'static str {
+    let name = shell
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(shell)
+        .to_ascii_lowercase();
+    let stem = name.strip_suffix(".exe").unwrap_or(&name);
+    if stem.contains("zsh") {
+        "zsh"
+    } else if stem.contains("bash") {
+        "bash"
+    } else if stem.contains("fish") {
+        "fish"
+    } else if stem.contains("pwsh") || stem.contains("powershell") {
+        "powershell"
+    } else if stem == "cmd" {
+        "cmd"
+    } else {
+        "unknown"
+    }
 }
 
 #[tauri::command]
@@ -2683,33 +3638,52 @@ pub fn detect_shell_environment(
         .get(&session_id)
         .ok_or_else(|| format!("Session {} not found", session_id))?;
     let s = session.session.lock().map_err(|e| e.to_string())?;
+    let home = crate::platform::home_dir().unwrap_or_default();
+    Ok(build_shell_environment(
+        &s.shell,
+        s.ssh_info.is_some(),
+        &home,
+        session.shell_integration.is_active(),
+        session.hermes_suggestions,
+    ))
+}
 
-    let shell = &s.shell;
-    let shell_type = if shell.contains("zsh") {
-        "zsh"
-    } else if shell.contains("bash") {
-        "bash"
-    } else if shell.contains("fish") {
-        "fish"
-    } else if shell.contains("pwsh") || shell.contains("powershell") {
-        "powershell"
-    } else if shell.contains("cmd") {
-        "cmd"
-    } else {
-        "unknown"
-    };
+/// `shellType` reported for SSH sessions. The shell and its config live on
+/// the remote host, so nothing about the local shell applies: no local
+/// history is loaded and local autosuggest plugins don't suppress Hermes.
+pub(crate) const REMOTE_SHELL_TYPE: &str = "remote";
 
-    let home = crate::platform::home_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
+/// Build the shell environment for a session. `shell` is the local shell
+/// setting; for SSH sessions it is ignored (see `REMOTE_SHELL_TYPE`).
+fn build_shell_environment(
+    shell: &str,
+    is_ssh: bool,
+    home_path: &std::path::Path,
+    integration_active: bool,
+    hermes_suggestions: bool,
+) -> ShellEnvironment {
+    if is_ssh {
+        return ShellEnvironment {
+            shell_type: REMOTE_SHELL_TYPE.to_string(),
+            plugins_detected: Vec::new(),
+            has_native_autosuggest: false,
+            has_oh_my_zsh: false,
+            has_syntax_highlighting: false,
+            has_starship: false,
+            has_powerlevel10k: false,
+            shell_integration_active: false,
+            hermes_suggestions,
+        };
+    }
+
+    let shell_type = shell_type_of(shell);
+
     let mut plugins = Vec::new();
     let mut has_oh_my_zsh = false;
     let mut has_autosuggest = false;
     let mut has_syntax_highlighting = false;
     let mut has_starship = false;
     let mut has_powerlevel10k = false;
-
-    let home_path = std::path::PathBuf::from(&home);
 
     // Check for Oh My Zsh (Unix only)
     if home_path.join(".oh-my-zsh").exists() {
@@ -2749,15 +3723,14 @@ pub fn detect_shell_environment(
         has_autosuggest = true;
     }
 
-    // PowerShell has PSReadLine autosuggestions
     if shell_type == "powershell" {
-        has_autosuggest = true;
         plugins.push("PSReadLine".to_string());
+        if powershell_predicts_by_default(shell) {
+            has_autosuggest = true;
+        }
     }
 
-    let integration_active = session.shell_integration.is_active();
-
-    Ok(ShellEnvironment {
+    ShellEnvironment {
         shell_type: shell_type.to_string(),
         plugins_detected: plugins,
         has_native_autosuggest: has_autosuggest,
@@ -2766,11 +3739,17 @@ pub fn detect_shell_environment(
         has_starship,
         has_powerlevel10k,
         shell_integration_active: integration_active,
-    })
+        hermes_suggestions,
+    }
 }
 
 #[tauri::command]
 pub fn read_shell_history(shell: String, limit: usize) -> Result<Vec<String>, String> {
+    // An SSH session's history lives on the remote host; the local history
+    // file belongs to a different machine.
+    if shell == REMOTE_SHELL_TYPE {
+        return Ok(Vec::new());
+    }
     let home_dir =
         crate::platform::home_dir().ok_or_else(|| "Cannot determine home directory".to_string())?;
 
@@ -2787,23 +3766,15 @@ pub fn read_shell_history(shell: String, limit: usize) -> Result<Vec<String>, St
             .to_string_lossy()
             .to_string()
     } else if shell.contains("pwsh") || shell.contains("powershell") {
-        // PowerShell history via PSReadLine
+        // PowerShell history via PSReadLine. On Windows, PowerShell 7+ and
+        // Windows PowerShell 5.1 share this file.
         #[cfg(windows)]
         {
             let appdata = std::env::var("APPDATA").unwrap_or_default();
-            if shell.contains("pwsh") {
-                // PowerShell 7+ (Core)
-                format!(
-                    "{}\\Microsoft\\PowerShell\\PSReadLine\\ConsoleHost_history.txt",
-                    appdata
-                )
-            } else {
-                // Windows PowerShell 5.1
-                format!(
-                    "{}\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt",
-                    appdata
-                )
-            }
+            format!(
+                "{}\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt",
+                appdata
+            )
         }
         #[cfg(not(windows))]
         {
@@ -2826,8 +3797,11 @@ pub fn read_shell_history(shell: String, limit: usize) -> Result<Vec<String>, St
         }
     };
 
-    let content = std::fs::read_to_string(&history_path)
+    // Lossy: zsh stores non-ASCII bytes "metafied" (not valid UTF-8), which
+    // would otherwise fail the whole read over one entry.
+    let bytes = std::fs::read(&history_path)
         .map_err(|e| format!("Cannot read history file {}: {}", history_path, e))?;
+    let content = String::from_utf8_lossy(&bytes);
 
     let is_fish = shell.contains("fish") || shell == "fish";
     let is_zsh = shell.contains("zsh") || shell == "zsh";
@@ -3019,7 +3993,7 @@ pub async fn ssh_upload_file(
     let local_file = std::fs::File::open(&local_path)
         .map_err(|e| format!("Failed to open local file: {}", e))?;
 
-    let mut cmd = ssh_command(&info.user, &info.host, info.port);
+    let mut cmd = ssh_command(&info.user, &info.host, info.port, info.jump_host.as_deref());
     cmd.arg(format!("cat > {}", shell_escape(&remote_path)));
     cmd.stdin(std::process::Stdio::from(local_file));
 
@@ -3051,7 +4025,7 @@ pub async fn ssh_download_file(
     let local_file = std::fs::File::create(&local_path)
         .map_err(|e| format!("Failed to create local file: {}", e))?;
 
-    let mut cmd = ssh_command(&info.user, &info.host, info.port);
+    let mut cmd = ssh_command(&info.user, &info.host, info.port, info.jump_host.as_deref());
     cmd.arg(format!("cat {}", shell_escape(&remote_path)));
     cmd.stdout(local_file);
     cmd.stderr(std::process::Stdio::piped());
@@ -3107,7 +4081,7 @@ pub fn ssh_add_port_forward(
     label: Option<String>,
 ) -> Result<(), String> {
     let info = get_ssh_params(&state, &session_id)?;
-    let socket_path = ssh_control_dir().join(format!("{}@{}:{}", info.user, info.host, info.port));
+    let socket_path = ssh_socket_path(&info.user, &info.host, info.port);
 
     let spec = format!("{}:{}:{}", local_port, remote_host, remote_port);
     let output = std::process::Command::new("ssh")
@@ -3117,7 +4091,8 @@ pub fn ssh_add_port_forward(
         .arg(&spec)
         .arg("-S")
         .arg(socket_path.to_string_lossy().as_ref())
-        .arg(format!("{}@{}", info.user, info.host))
+        .arg("--")
+        .arg(ssh_destination(&info.user, &info.host))
         .output()
         .map_err(|e| format!("Failed to add port forward: {}", e))?;
 
@@ -3156,7 +4131,7 @@ pub fn ssh_remove_port_forward(
     local_port: u16,
 ) -> Result<(), String> {
     let info = get_ssh_params(&state, &session_id)?;
-    let socket_path = ssh_control_dir().join(format!("{}@{}:{}", info.user, info.host, info.port));
+    let socket_path = ssh_socket_path(&info.user, &info.host, info.port);
 
     // Find the forward to cancel
     let forward = info
@@ -3176,7 +4151,8 @@ pub fn ssh_remove_port_forward(
         .arg(&spec)
         .arg("-S")
         .arg(socket_path.to_string_lossy().as_ref())
-        .arg(format!("{}@{}", info.user, info.host))
+        .arg("--")
+        .arg(ssh_destination(&info.user, &info.host))
         .output()
         .map_err(|e| format!("Failed to remove port forward: {}", e))?;
 
@@ -3230,7 +4206,13 @@ pub fn ssh_get_remote_cwd(
         "pwd".to_string()
     };
 
-    let (stdout, stderr, success) = ssh_exec(&info.user, &info.host, info.port, &remote_cmd)?;
+    let (stdout, stderr, success) = ssh_exec(
+        &info.user,
+        &info.host,
+        info.port,
+        info.jump_host.as_deref(),
+        &remote_cmd,
+    )?;
     if !success {
         return Err(format!("Failed to get remote CWD: {}", stderr.trim()));
     }
@@ -3251,7 +4233,13 @@ pub fn ssh_get_remote_git_info(
         remote_path.replace('\'', "'\\''")
     );
 
-    let (stdout, _stderr, _success) = ssh_exec(&info.user, &info.host, info.port, &remote_cmd)?;
+    let (stdout, _stderr, _success) = ssh_exec(
+        &info.user,
+        &info.host,
+        info.port,
+        info.jump_host.as_deref(),
+        &remote_cmd,
+    )?;
     let lines: Vec<&str> = stdout.lines().collect();
 
     let branch = lines.first().and_then(|l| {
@@ -3277,9 +4265,91 @@ pub fn ssh_get_remote_git_info(
 // ─── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod write_and_shell_list_tests {
+    use super::{available_shells, writes_in_background, BACKGROUND_WRITE_BYTES};
+
+    #[test]
+    fn typing_is_written_right_away_and_a_big_paste_in_the_background() {
+        // CHAOS-05: a paste over 64 KiB would hold the window while the
+        // program reads it.
+        assert_eq!(BACKGROUND_WRITE_BYTES, 65_536);
+        assert!(!writes_in_background(1));
+        assert!(!writes_in_background(4 * 1024));
+        assert!(!writes_in_background(BACKGROUND_WRITE_BYTES));
+        assert!(writes_in_background(BACKGROUND_WRITE_BYTES + 1));
+        assert!(writes_in_background(1024 * 1024));
+    }
+
+    #[test]
+    fn the_shell_list_offers_the_shells_this_machine_has_once_each() {
+        let shells = available_shells();
+        assert!(!shells.is_empty());
+        let mut names: Vec<&str> = shells.iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(names.len(), before, "a shell listed twice: {names:?}");
+        #[cfg(unix)]
+        {
+            // Every Unix has /bin/sh.
+            assert!(shells.iter().any(|s| s.name == "sh" && s.path == "/bin/sh"));
+            for s in &shells {
+                assert!(std::path::Path::new(&s.path).exists(), "{}", s.path);
+            }
+        }
+        #[cfg(windows)]
+        assert!(shells.iter().any(|s| s.name == "Command Prompt"));
+    }
+}
+
+#[cfg(test)]
+mod shell_kind_tests {
+    use super::{git_bash_candidates, reg_install_path, shell_type_of};
+
+    #[test]
+    fn the_shell_kind_comes_from_the_file_name_in_any_case() {
+        assert_eq!(shell_type_of("/bin/zsh"), "zsh");
+        assert_eq!(shell_type_of("bash"), "bash");
+        assert_eq!(
+            shell_type_of(r"C:\Windows\System32\WindowsPowerShell\v1.0\PowerShell.exe"),
+            "powershell"
+        );
+        assert_eq!(
+            shell_type_of(r"C:\Program Files\PowerShell\7\PWSH.EXE"),
+            "powershell"
+        );
+        assert_eq!(shell_type_of(r"C:\WINDOWS\system32\CMD.EXE"), "cmd");
+        assert_eq!(shell_type_of(r"C:\Program Files\Git\bin\bash.exe"), "bash");
+        // A folder name never decides it.
+        assert_eq!(shell_type_of("/opt/zsh-tools/bin/fish"), "fish");
+        assert_eq!(shell_type_of(r"C:\cmdtools\nu.exe"), "unknown");
+    }
+
+    #[test]
+    fn git_bash_is_found_where_git_for_windows_put_it() {
+        let reg = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\GitForWindows\r\n    InstallPath    REG_SZ    D:\\Tools\\Git\r\n";
+        let install = reg_install_path(reg);
+        assert_eq!(install.as_deref(), Some(r"D:\Tools\Git"));
+        let where_out = "C:\\Windows\\System32\\bash.exe\r\nD:\\Tools\\Git\\usr\\bin\\bash.exe\r\n";
+        let found = git_bash_candidates(where_out, install.as_deref());
+        assert_eq!(found[0], r"D:\Tools\Git\bin\bash.exe");
+        assert_eq!(found[1], r"D:\Tools\Git\usr\bin\bash.exe");
+        assert!(
+            !found
+                .iter()
+                .any(|p| p.to_ascii_lowercase().contains("system32")),
+            "the WSL launcher is not Git Bash"
+        );
+        assert!(found.contains(&r"C:\Program Files\Git\bin\bash.exe".to_string()));
+        assert_eq!(reg_install_path("ERROR: not found"), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use super::drain_session_db_state;
+    use super::{drain_session_db_state, resolve_session_cwd};
     use crate::db::Database;
+    use std::sync::Mutex;
     use tempfile::NamedTempFile;
 
     fn test_db() -> Database {
@@ -3308,7 +4378,7 @@ mod tests {
             "wt1",
             "agent-1",
             "proj-1",
-            "/tmp/wt-agent-1",
+            "/tmp/hermes-worktrees/wt-agent-1",
             Some("feature-x"),
             false,
         )
@@ -3321,7 +4391,10 @@ mod tests {
             1,
             "owned non-main worktree must be returned for git worktree remove"
         );
-        assert_eq!(needs_disk[0].worktree_path, "/tmp/wt-agent-1");
+        assert_eq!(
+            needs_disk[0].worktree_path,
+            "/tmp/hermes-worktrees/wt-agent-1"
+        );
 
         // DB row is kept so the caller can delete it AFTER successful disk
         // removal — failures stay in the table for retry on next startup.
@@ -3353,7 +4426,7 @@ mod tests {
             "wt-shared-a",
             "agent-1",
             "proj-1",
-            "/tmp/wt-shared",
+            "/tmp/hermes-worktrees/wt-shared",
             Some("feature-x"),
             false,
         )
@@ -3362,7 +4435,7 @@ mod tests {
             "wt-shared-b",
             "agent-2",
             "proj-1",
-            "/tmp/wt-shared",
+            "/tmp/hermes-worktrees/wt-shared",
             Some("feature-x"),
             false,
         )
@@ -3389,6 +4462,293 @@ mod tests {
         let db = test_db();
         let needs_disk = drain_session_db_state(&db, "ghost-session");
         assert!(needs_disk.is_empty());
+    }
+
+    // ── F09 edge cases ──────────────────────────────────────────────
+
+    #[test]
+    fn drain_unlinks_a_checkout_made_outside_hermes_without_touching_disk() {
+        // The session reused a worktree made by hand (`git worktree add`),
+        // which is not under hermes-worktrees/. Closing must drop the link
+        // only: never schedule it for removal (which would fail on the
+        // safety guard and warn "retry on next startup" every time).
+        let db = test_db();
+        db.insert_session_worktree(
+            "wt-ext",
+            "s-ext",
+            "proj-1",
+            "/work/repo-external-wt",
+            Some("external"),
+            false,
+        )
+        .unwrap();
+
+        let needs_disk = drain_session_db_state(&db, "s-ext");
+
+        assert!(
+            needs_disk.is_empty(),
+            "not ours: nothing to remove from disk"
+        );
+        assert!(
+            db.get_session_worktrees("s-ext").unwrap().is_empty(),
+            "the link row is gone"
+        );
+    }
+
+    /// A git repository with one commit, a registered project row and a
+    /// worktree Hermes made for session `s1` on `hermes/task`.
+    fn repo_with_hermes_worktree(db: &Database) -> (tempfile::TempDir, tempfile::TempDir, String) {
+        let repo = tempfile::tempdir().unwrap();
+        let app_data = tempfile::tempdir().unwrap();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&repo_path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Hermes Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.path().join("README.md"), "# test\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "initial"]);
+        db.insert_project("proj-1", &repo_path, "repo", "[]", "[]")
+            .unwrap();
+        let wt = crate::git::worktree::create_worktree(
+            app_data.path(),
+            &repo_path,
+            "s1",
+            "hermes/task",
+            true,
+            None,
+        )
+        .unwrap();
+        db.insert_session_worktree(
+            "wt1",
+            "s1",
+            "proj-1",
+            &wt.worktree_path,
+            Some("hermes/task"),
+            false,
+        )
+        .unwrap();
+        (repo, app_data, wt.worktree_path)
+    }
+
+    #[test]
+    fn a_session_in_a_folder_that_is_not_git_starts_and_restores_in_that_folder() {
+        // A plain folder, a parent folder holding several repositories, and a
+        // mixed session (a repository and a plain folder, no worktree asked):
+        // the session runs in the folder it was given, at creation and on
+        // restore alike, and no worktree is made anywhere.
+        let root = tempfile::tempdir().unwrap();
+        let plain = root.path().join("notes");
+        let parent = root.path().join("code");
+        std::fs::create_dir_all(&plain).unwrap();
+        for name in ["api", "web"] {
+            std::fs::create_dir_all(parent.join(name)).unwrap();
+            git2::Repository::init(parent.join(name)).unwrap();
+        }
+        let repo = root.path().join("app");
+        git2::Repository::init(&repo).unwrap();
+        let db = test_db();
+        for (id, path) in [("plain", &plain), ("parent", &parent), ("repo", &repo)] {
+            db.insert_project(id, path.to_str().unwrap(), id, "[]", "[]")
+                .unwrap();
+        }
+        let db = Mutex::new(db);
+        let cases: [(&str, &std::path::Path, Vec<String>); 3] = [
+            ("s-plain", &plain, vec!["plain".into()]),
+            ("s-parent", &parent, vec!["parent".into()]),
+            ("s-mixed", &plain, vec!["plain".into(), "repo".into()]),
+        ];
+        for (sid, folder, projects) in cases {
+            let wanted = folder.to_string_lossy().to_string();
+            for _start_and_restore in 0..2 {
+                let (cwd, recovery) =
+                    resolve_session_cwd(&db, sid, wanted.clone(), Some(&projects));
+                assert_eq!(cwd, wanted, "{sid}");
+                assert_eq!(recovery, None, "{sid}");
+            }
+            let db = db.lock().unwrap();
+            assert!(db.get_session_worktrees(sid).unwrap().is_empty(), "{sid}");
+        }
+        for nested in [parent.join("api"), parent.join("web"), repo.clone()] {
+            let r = git2::Repository::open(&nested).unwrap();
+            assert_eq!(r.worktrees().unwrap().len(), 0, "{}", nested.display());
+        }
+        assert!(!plain.join(".git").exists() && !parent.join(".git").exists());
+    }
+
+    #[test]
+    fn resolve_session_cwd_uses_the_worktree_when_it_exists() {
+        let db = test_db();
+        let (_repo, _app_data, wt_path) = repo_with_hermes_worktree(&db);
+        let db = Mutex::new(db);
+        let (cwd, recovery) = resolve_session_cwd(&db, "s1", "/nowhere".into(), None);
+        assert_eq!(cwd, wt_path);
+        assert_eq!(recovery, None);
+    }
+
+    #[test]
+    fn resolve_session_cwd_recreates_a_deleted_worktree_on_its_branch() {
+        let db = test_db();
+        let (repo, _app_data, wt_path) = repo_with_hermes_worktree(&db);
+        std::fs::remove_dir_all(&wt_path).unwrap();
+        let db = Mutex::new(db);
+
+        let (cwd, recovery) = resolve_session_cwd(&db, "s1", wt_path.clone(), None);
+        let db = db.into_inner().unwrap();
+
+        assert_eq!(cwd, wt_path);
+        assert!(
+            std::path::Path::new(&wt_path).join("README.md").is_file(),
+            "the folder is back"
+        );
+        assert_eq!(
+            crate::git::worktree::get_worktree_branch(&wt_path)
+                .unwrap()
+                .as_deref(),
+            Some("hermes/task")
+        );
+        let r = recovery.expect("says what happened");
+        assert_eq!(
+            (r.outcome, r.branch_name.as_deref()),
+            ("recreated", Some("hermes/task"))
+        );
+        assert_eq!(r.missing_path, wt_path);
+        assert_eq!(
+            db.get_session_worktrees("s1").unwrap().len(),
+            1,
+            "the link is kept"
+        );
+        drop(repo);
+    }
+
+    #[test]
+    fn resolve_session_cwd_falls_back_to_the_project_folder_when_the_branch_is_gone() {
+        let db = test_db();
+        let (repo, _app_data, wt_path) = repo_with_hermes_worktree(&db);
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        std::fs::remove_dir_all(&wt_path).unwrap();
+        for args in [
+            &["worktree", "prune"][..],
+            &["branch", "-D", "hermes/task"][..],
+        ] {
+            assert!(std::process::Command::new("git")
+                .current_dir(&repo_path)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        let db = Mutex::new(db);
+        let (cwd, recovery) = resolve_session_cwd(&db, "s1", wt_path.clone(), None);
+        let db = db.into_inner().unwrap();
+
+        assert_eq!(cwd, repo_path);
+        assert!(
+            !std::path::Path::new(&wt_path).exists(),
+            "nothing was recreated"
+        );
+        let r = recovery.expect("says what happened");
+        assert_eq!(r.outcome, "project-folder");
+        assert_eq!(r.branch_name.as_deref(), Some("hermes/task"));
+        assert!(
+            db.get_session_worktrees("s1").unwrap().is_empty(),
+            "the stale link is dropped"
+        );
+    }
+
+    #[test]
+    fn resolve_session_cwd_says_which_folder_replaced_a_gone_worktree() {
+        // The branch is gone, and the folder the session asked for exists
+        // but is not the project folder: the message must not call it the
+        // project folder.
+        let db = test_db();
+        let (repo, _app_data, wt_path) = repo_with_hermes_worktree(&db);
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        std::fs::remove_dir_all(&wt_path).unwrap();
+        for args in [
+            &["worktree", "prune"][..],
+            &["branch", "-D", "hermes/task"][..],
+        ] {
+            assert!(std::process::Command::new("git")
+                .current_dir(&repo_path)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let elsewhere = tempfile::tempdir().unwrap();
+        let elsewhere_path = elsewhere.path().to_str().unwrap().to_string();
+
+        let db = Mutex::new(db);
+        let (cwd, recovery) = resolve_session_cwd(&db, "s1", elsewhere_path.clone(), None);
+        assert_eq!(cwd, elsewhere_path);
+        assert_eq!(recovery.unwrap().outcome, "folder");
+
+        // The same, asked for the project folder itself.
+        db.lock()
+            .unwrap()
+            .insert_session_worktree("wt2", "s2", "proj-1", &wt_path, Some("hermes/task"), false)
+            .unwrap();
+        let (cwd, recovery) = resolve_session_cwd(&db, "s2", repo_path.clone(), None);
+        assert_eq!(cwd, repo_path);
+        assert_eq!(recovery.unwrap().outcome, "project-folder");
+    }
+
+    #[test]
+    fn resolve_session_cwd_never_returns_a_missing_folder() {
+        // No worktree link (the startup cleanup dropped it) and the saved
+        // folder is gone: the first attached project that exists wins, and
+        // failing that the home folder. Never the missing one.
+        let db = test_db();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        db.insert_project("proj-1", &repo_path, "repo", "[]", "[]")
+            .unwrap();
+        let db = Mutex::new(db);
+        let ids = vec!["proj-1".to_string()];
+
+        let gone = repo.path().join("hermes-worktrees").join("x").join("gone");
+        let gone = gone.to_str().unwrap().to_string();
+        let (cwd, recovery) = resolve_session_cwd(&db, "s9", gone.clone(), Some(&ids));
+        assert_eq!(cwd, repo_path);
+        let r = recovery.unwrap();
+        assert_eq!(
+            (r.outcome, r.missing_path.as_str()),
+            ("project-folder", gone.as_str())
+        );
+
+        let (cwd, recovery) = resolve_session_cwd(&db, "s9", gone.clone(), None);
+        assert!(
+            std::path::Path::new(&cwd).is_dir(),
+            "the fallback folder exists: {}",
+            cwd
+        );
+        // Other tests point HOME at temp folders they then delete, so the
+        // home folder may not exist while this test runs: then another
+        // folder that exists is used, and named as such.
+        let home_exists = crate::platform::home_dir().is_some_and(|h| h.is_dir());
+        assert_eq!(
+            recovery.unwrap().outcome,
+            if home_exists { "home" } else { "folder" }
+        );
+
+        // A folder that exists is used as asked, quietly.
+        let (cwd, recovery) = resolve_session_cwd(&db, "s9", repo_path.clone(), None);
+        assert_eq!((cwd, recovery), (repo_path, None));
     }
 
     // ── Regression suite for the close path (Bug 1) ─────────────────
@@ -3475,7 +4835,7 @@ mod tests {
             "wt-feat",
             "term-mix",
             "proj-B",
-            "/tmp/wt-feat",
+            "/tmp/hermes-worktrees/wt-feat",
             Some("feature-y"),
             false,
         )
@@ -3511,7 +4871,7 @@ mod tests {
             "wt-retry",
             "agent-retry",
             "proj-1",
-            "/tmp/wt-retry",
+            "/tmp/hermes-worktrees/wt-retry",
             Some("feature-z"),
             false,
         )
@@ -3543,7 +4903,7 @@ mod tests {
             "wt-c",
             "closing",
             "proj-1",
-            "/tmp/wt-c",
+            "/tmp/hermes-worktrees/wt-c",
             Some("feat-c"),
             false,
         )
@@ -3552,7 +4912,7 @@ mod tests {
             "wt-s",
             "surviving",
             "proj-1",
-            "/tmp/wt-s",
+            "/tmp/hermes-worktrees/wt-s",
             Some("feat-s"),
             false,
         )
@@ -3634,5 +4994,691 @@ mod tests {
             count, 0,
             "agent-session pin must be cleaned (Bug 1 regression)"
         );
+    }
+
+    // ── #317 — terminal-mode model changes must reach the UI ────────
+
+    fn agent(model: Option<&str>) -> Option<crate::pty::models::AgentInfo> {
+        Some(crate::pty::models::AgentInfo {
+            name: "Claude Code".into(),
+            provider: "anthropic".into(),
+            model: model.map(Into::into),
+            detected_at: String::new(),
+            confidence: 1.0,
+        })
+    }
+
+    #[test]
+    fn agent_model_emit_on_first_detection_and_enrichment() {
+        assert!(super::agent_model_needs_emit(&None, &agent(None)));
+        assert!(super::agent_model_needs_emit(
+            &agent(None),
+            &agent(Some("opus"))
+        ));
+    }
+
+    #[test]
+    fn agent_model_emit_on_some_to_some_change() {
+        assert!(super::agent_model_needs_emit(
+            &agent(Some("sonnet")),
+            &agent(Some("opus"))
+        ));
+    }
+
+    #[test]
+    fn agent_model_no_emit_when_unchanged_or_lost() {
+        assert!(!super::agent_model_needs_emit(
+            &agent(Some("opus")),
+            &agent(Some("opus"))
+        ));
+        assert!(!super::agent_model_needs_emit(
+            &agent(Some("opus")),
+            &agent(None)
+        ));
+        assert!(!super::agent_model_needs_emit(&agent(None), &None));
+    }
+
+    // ─── SSH command construction ───────────────────────────────────
+
+    fn ssh_info(jump_host: Option<&str>) -> super::SshConnectionInfo {
+        super::SshConnectionInfo {
+            host: "db.internal".to_string(),
+            port: 2222,
+            user: "alice".to_string(),
+            tmux_session: None,
+            identity_file: None,
+            jump_host: jump_host.map(str::to_string),
+            port_forwards: Vec::new(),
+        }
+    }
+
+    fn pty_argv(info: &super::SshConnectionInfo) -> Vec<String> {
+        super::ssh_pty_command(info, 80, 24)
+            .get_argv()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn exec_argv(jump_host: Option<&str>) -> Vec<String> {
+        super::ssh_command("alice", "db.internal", 2222, jump_host)
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// `-J <jump>` must appear before the destination so ssh treats it as
+    /// an option rather than part of the remote command.
+    fn assert_jump_before_dest(argv: &[String], jump: &str) {
+        let j = argv.iter().position(|a| a == "-J").expect("missing -J");
+        assert_eq!(argv[j + 1], jump);
+        let dest = argv.iter().position(|a| a == "alice@db.internal").unwrap();
+        assert!(j < dest, "-J must precede destination: {:?}", argv);
+    }
+
+    #[test]
+    fn pty_ssh_command_passes_jump_host() {
+        let argv = pty_argv(&ssh_info(Some("bastion.example.com")));
+        assert_jump_before_dest(&argv, "bastion.example.com");
+    }
+
+    #[test]
+    fn pty_ssh_command_without_jump_host_has_no_j_flag() {
+        for jump in [None, Some(""), Some("   ")] {
+            let argv = pty_argv(&ssh_info(jump));
+            assert!(!argv.iter().any(|a| a == "-J"), "{:?}", argv);
+            assert_eq!(argv.last().unwrap(), "alice@db.internal");
+        }
+    }
+
+    #[test]
+    fn exec_ssh_command_passes_jump_host() {
+        let argv = exec_argv(Some(" admin@bastion:2200 "));
+        assert_jump_before_dest(&argv, "admin@bastion:2200");
+    }
+
+    #[test]
+    fn exec_ssh_command_without_jump_host_has_no_j_flag() {
+        for jump in [None, Some("")] {
+            let argv = exec_argv(jump);
+            assert!(!argv.iter().any(|a| a == "-J"), "{:?}", argv);
+            assert_eq!(argv.last().unwrap(), "alice@db.internal");
+        }
+    }
+
+    #[test]
+    fn ssh_info_without_jump_host_deserializes() {
+        // ssh_info rows persisted before jump_host existed must still load.
+        let info: super::SshConnectionInfo =
+            serde_json::from_str(r#"{"host":"h","port":22,"user":"u"}"#).unwrap();
+        assert!(info.jump_host.is_none());
+    }
+
+    // ── #117 — per-session Hermes suggestions flag reaches the frontend ──
+    //
+    // The frontend's `ShellEnvironment.hermesSuggestions` gates ghost text,
+    // the suggestion list and Tab per session, so the wire name must match.
+    #[test]
+    fn shell_environment_serializes_hermes_suggestions_for_frontend() {
+        let env = crate::pty::models::ShellEnvironment {
+            shell_type: "zsh".into(),
+            plugins_detected: vec![],
+            has_native_autosuggest: true,
+            has_oh_my_zsh: false,
+            has_syntax_highlighting: false,
+            has_starship: false,
+            has_powerlevel10k: false,
+            shell_integration_active: true,
+            hermes_suggestions: false,
+        };
+        let json = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["hermesSuggestions"], serde_json::json!(false));
+    }
+
+    // The frontend `ShellEnvironment` type reads every field camelCase. A
+    // snake_case name reaches it as `undefined` (shell type unknown to
+    // history loading, integration/autosuggest checks never taken).
+    #[test]
+    fn shell_environment_serializes_every_field_camel_case() {
+        let env = crate::pty::models::ShellEnvironment {
+            shell_type: "zsh".into(),
+            plugins_detected: vec!["zsh-autosuggestions".into()],
+            has_native_autosuggest: true,
+            has_oh_my_zsh: true,
+            has_syntax_highlighting: false,
+            has_starship: true,
+            has_powerlevel10k: false,
+            shell_integration_active: true,
+            hermes_suggestions: true,
+        };
+        let json = serde_json::to_value(&env).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "shellType": "zsh",
+                "pluginsDetected": ["zsh-autosuggestions"],
+                "hasNativeAutosuggest": true,
+                "hasOhMyZsh": true,
+                "hasSyntaxHighlighting": false,
+                "hasStarship": true,
+                "hasPowerlevel10k": false,
+                "shellIntegrationActive": true,
+                "hermesSuggestions": true,
+            })
+        );
+    }
+
+    // ── SSH sessions: the local shell environment must not apply ──
+
+    /// A home dir whose .zshrc loads zsh-autosuggestions, plus oh-my-zsh.
+    fn home_with_zsh_autosuggestions() -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".zshrc"),
+            "plugins=(git zsh-autosuggestions zsh-syntax-highlighting)\n",
+        )
+        .unwrap();
+        std::fs::create_dir(home.path().join(".oh-my-zsh")).unwrap();
+        home
+    }
+
+    #[test]
+    fn ssh_session_ignores_local_shell_config() {
+        let home = home_with_zsh_autosuggestions();
+        for hermes_suggestions in [true, false] {
+            let env = super::build_shell_environment(
+                "/bin/zsh",
+                true,
+                home.path(),
+                false,
+                hermes_suggestions,
+            );
+            assert_eq!(env.shell_type, super::REMOTE_SHELL_TYPE);
+            assert!(!env.has_native_autosuggest);
+            assert!(!env.has_oh_my_zsh);
+            assert!(!env.has_syntax_highlighting);
+            assert!(!env.has_starship);
+            assert!(!env.has_powerlevel10k);
+            assert!(env.plugins_detected.is_empty());
+            assert!(!env.shell_integration_active);
+            // The user's Hermes-suggestions choice still applies over SSH.
+            assert_eq!(env.hermes_suggestions, hermes_suggestions);
+        }
+    }
+
+    #[test]
+    fn local_zsh_session_still_reads_local_shell_config() {
+        let home = home_with_zsh_autosuggestions();
+        let env = super::build_shell_environment("/bin/zsh", false, home.path(), true, true);
+        assert_eq!(env.shell_type, "zsh");
+        assert!(env.has_native_autosuggest);
+        assert!(env.has_oh_my_zsh);
+        assert!(env.has_syntax_highlighting);
+        assert!(env.shell_integration_active);
+        assert!(env
+            .plugins_detected
+            .contains(&"zsh-autosuggestions".to_string()));
+    }
+
+    #[test]
+    fn ssh_session_environment_serializes_remote_shell_type() {
+        let home = tempfile::tempdir().unwrap();
+        let env = super::build_shell_environment("/bin/zsh", true, home.path(), false, true);
+        let json = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["shellType"], serde_json::json!("remote"));
+        assert_eq!(json["hasNativeAutosuggest"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn remote_shell_history_is_empty() {
+        // Never falls back to a local history file for an SSH session.
+        let history = super::read_shell_history(super::REMOTE_SHELL_TYPE.to_string(), 500);
+        assert_eq!(history, Ok(Vec::new()));
+    }
+}
+
+/// PSReadLine inline prediction is on by default only in PowerShell 7
+/// (`pwsh`). Windows PowerShell 5.1 ships an older PSReadLine with
+/// prediction off, so Hermes suggestions must stay on there.
+fn powershell_predicts_by_default(shell: &str) -> bool {
+    shell.to_ascii_lowercase().contains("pwsh")
+}
+
+#[cfg(test)]
+mod powershell_prediction_tests {
+    use super::powershell_predicts_by_default;
+
+    #[test]
+    fn only_pwsh_counts_as_native_autosuggest() {
+        assert!(powershell_predicts_by_default("pwsh"));
+        assert!(powershell_predicts_by_default(
+            r"C:\Program Files\PowerShell\7\pwsh.exe"
+        ));
+        assert!(!powershell_predicts_by_default("powershell"));
+        assert!(!powershell_predicts_by_default(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod ssh_command_tests {
+    use super::{resolve_ssh_user, ssh_command, ssh_destination, ssh_pty_command};
+
+    #[test]
+    fn jump_host_goes_before_end_of_options_and_destination() {
+        let args = std_args(&ssh_command("alice", "example.com", 22, Some("bastion")));
+        let j = args.iter().position(|a| a == "-J").expect("-J present");
+        let dd = args.iter().position(|a| a == "--").expect("-- present");
+        assert_eq!(args[j + 1], "bastion");
+        assert!(j < dd);
+        assert_eq!(args[dd + 1], "alice@example.com");
+
+        let mut i = info("", "lima-test-agent");
+        i.jump_host = Some("  bastion  ".to_string());
+        let pty: Vec<String> = ssh_pty_command(&i, 80, 24)
+            .get_argv()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let j = pty.iter().position(|a| a == "-J").expect("-J present");
+        let dd = pty.iter().position(|a| a == "--").expect("-- present");
+        assert_eq!(pty[j + 1], "bastion");
+        assert!(j < dd);
+        assert_eq!(pty[dd + 1], "lima-test-agent");
+    }
+    use crate::pty::models::SshConnectionInfo;
+
+    fn info(user: &str, host: &str) -> SshConnectionInfo {
+        SshConnectionInfo {
+            host: host.to_string(),
+            port: 22,
+            user: user.to_string(),
+            tmux_session: None,
+            identity_file: None,
+            port_forwards: Vec::new(),
+            jump_host: None,
+        }
+    }
+
+    fn std_args(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn pty_args(info: &SshConnectionInfo) -> Vec<String> {
+        ssh_pty_command(info, 80, 24)
+            .get_argv()
+            .iter()
+            .skip(1) // program name
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn blank_user_is_left_to_ssh_config() {
+        assert_eq!(resolve_ssh_user(None), "");
+        assert_eq!(resolve_ssh_user(Some("   ".to_string())), "");
+        assert_eq!(resolve_ssh_user(Some(" alice ".to_string())), "alice");
+    }
+
+    #[test]
+    fn destination_is_bare_host_without_user() {
+        assert_eq!(ssh_destination("", "lima-test-agent"), "lima-test-agent");
+        assert_eq!(ssh_destination("alice", "example.com"), "alice@example.com");
+    }
+
+    #[test]
+    fn exec_command_passes_bare_alias_when_user_blank() {
+        let args = std_args(&ssh_command("", "lima-test-agent", 22, None));
+        assert_eq!(args.last().unwrap(), "lima-test-agent");
+        assert!(!args.iter().any(|a| a.contains("@lima-test-agent")));
+    }
+
+    #[test]
+    fn exec_command_keeps_user_at_host_when_user_given() {
+        let args = std_args(&ssh_command("alice", "example.com", 2222, None));
+        assert_eq!(args.last().unwrap(), "alice@example.com");
+        assert!(args.windows(2).any(|w| w[0] == "-p" && w[1] == "2222"));
+    }
+
+    #[test]
+    fn pty_command_passes_bare_alias_when_user_blank() {
+        let args = pty_args(&info("", "lima-test-agent"));
+        assert_eq!(args.last().unwrap(), "lima-test-agent");
+        assert!(!args.iter().any(|a| a.contains("@lima-test-agent")));
+    }
+
+    #[test]
+    fn pty_command_keeps_user_at_host_and_appends_tmux() {
+        let mut i = info("alice", "example.com");
+        i.tmux_session = Some("main".to_string());
+        let args = pty_args(&i);
+        let dest = args.iter().position(|a| a == "alice@example.com").unwrap();
+        assert_eq!(args[dest + 1], "tmux new-session -A -s 'main' -x 80 -y 24");
+    }
+
+    #[test]
+    fn destination_follows_end_of_options_marker() {
+        let exec = std_args(&ssh_command("", "-oProxyCommand=x", 22, None));
+        assert_eq!(exec[exec.len() - 2], "--");
+        let mut i = info("", "-oProxyCommand=x");
+        i.tmux_session = Some("main".to_string());
+        let pty = pty_args(&i);
+        let dest = pty.iter().position(|a| a == "-oProxyCommand=x").unwrap();
+        assert_eq!(pty[dest - 1], "--");
+    }
+}
+
+// These tests drive foreground_lock_released_for_scan with injected probe and
+// scan closures (plus the real probe and process scan where noted). The wiring
+// in is_shell_foreground itself (probe_foreground, then
+// shell_at_prompt_by_process_table on spawn_blocking) is covered by the
+// real-app scenario e2e/app/scenarios/F03-foreground-check-lock.mjs.
+#[cfg(test)]
+mod foreground_tests {
+    use super::{
+        counts_as_shell_child, foreground_lock_released_for_scan, has_child_process,
+        probe_foreground,
+    };
+    use crate::pty::PtyManager;
+    #[cfg(unix)]
+    use std::io::Write;
+    use std::process::{Child, Command};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// A process that starts a child of its own and waits for it.
+    fn parent_with_child() -> Child {
+        #[cfg(windows)]
+        let child = Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+            .spawn();
+        #[cfg(not(windows))]
+        let child = Command::new("sh").args(["-c", "sleep 30; true"]).spawn();
+        child.unwrap()
+    }
+
+    /// A process that starts nothing.
+    fn lone_process() -> Child {
+        #[cfg(windows)]
+        let child = Command::new("ping").args(["-n", "30", "127.0.0.1"]).spawn();
+        #[cfg(not(windows))]
+        let child = Command::new("sleep").arg("30").spawn();
+        child.unwrap()
+    }
+
+    fn eventually(mut check: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if check() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// The process-table scan hosted terminals rely on (the session host
+    /// owns their master, so the terminal cannot say who owns it).
+    #[cfg(unix)]
+    #[test]
+    fn enumerate_child_pids_finds_a_single_child() {
+        let mut shell = parent_with_child();
+        let seen = eventually(|| !super::enumerate_child_pids(shell.id()).is_empty());
+        let _ = shell.kill();
+        let _ = shell.wait();
+        assert!(seen, "the one running child was not listed");
+        let mut lone = lone_process();
+        let none = super::enumerate_child_pids(lone.id()).is_empty();
+        let _ = lone.kill();
+        let _ = lone.wait();
+        assert!(none, "a process with no child has none listed");
+    }
+
+    #[test]
+    fn a_program_the_shell_started_is_seen_as_its_child() {
+        let mut shell = parent_with_child();
+        let seen = eventually(|| has_child_process(shell.id()));
+        let _ = shell.kill();
+        let _ = shell.wait();
+        assert!(seen, "the running child was not found");
+    }
+
+    /// An interactive shell in a PTY, started the way sessions start it.
+    #[cfg(unix)]
+    fn interactive_shell() -> (
+        portable_pty::PtyPair,
+        Box<dyn portable_pty::Child + Send + Sync>,
+        Box<dyn std::io::Write + Send>,
+    ) {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-i");
+        cmd.env("PS1", "$ ");
+        cmd.cwd(std::env::temp_dir());
+        #[cfg(target_os = "macos")]
+        let child = {
+            let tty = pair.master.tty_name().unwrap();
+            crate::pty::spawn::posix_spawn_in_pty(&cmd, &tty).unwrap()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let child = pair.slave.spawn_command(cmd).unwrap();
+        // Keep the PTY drained so the shell never blocks on output.
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = std::io::Read::read(&mut reader, &mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        let writer = pair.master.take_writer().unwrap();
+        (pair, child, writer)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_started_at_the_prompt_owns_the_terminal_until_it_exits() {
+        use super::shell_group_is_foreground;
+        let (pair, mut shell, mut input) = interactive_shell();
+        let pid = shell.process_id().unwrap();
+        let owns = || shell_group_is_foreground(pair.master.as_ref(), pid);
+
+        let at_prompt = eventually(|| owns() == Some(true));
+        input.write_all(b"sleep 3\n").unwrap();
+        input.flush().unwrap();
+        let while_running = eventually(|| owns() == Some(false));
+        let after_exit = eventually(|| owns() == Some(true));
+
+        let _ = shell.kill();
+        let _ = shell.wait();
+        assert!(at_prompt, "the shell owns the terminal at its prompt");
+        assert!(while_running, "the program owns the terminal while it runs");
+        assert!(
+            after_exit,
+            "the shell owns the terminal again after it exits"
+        );
+    }
+
+    /// Whether another thread can take the lock right now.
+    fn free_for_another_thread<T: Send>(lock: &Mutex<T>) -> bool {
+        std::thread::scope(|s| s.spawn(|| lock.try_lock().is_ok()).join().unwrap())
+    }
+
+    #[test]
+    fn the_process_table_scan_runs_with_the_pty_manager_lock_released() {
+        let manager = Mutex::new(PtyManager::new());
+        // A "shell" at its prompt: a process that starts nothing.
+        let mut shell = lone_process();
+        let mut free_during_probe = None;
+        let mut free_during_scan = None;
+        let at_prompt = foreground_lock_released_for_scan(
+            &manager,
+            |_| {
+                free_during_probe = Some(free_for_another_thread(&manager));
+                Ok((shell.id(), None))
+            },
+            |pid| {
+                free_during_scan = Some(free_for_another_thread(&manager));
+                // The real scan: keystrokes must not wait for it.
+                !has_child_process(pid)
+            },
+        );
+        let _ = shell.kill();
+        let _ = shell.wait();
+        // The probe really does run under the lock, so this check can fail.
+        assert_eq!(free_during_probe, Some(false));
+        assert_eq!(
+            free_during_scan,
+            Some(true),
+            "another thread could not take the PTY manager lock during the scan"
+        );
+        assert_eq!(at_prompt, Ok(true), "the real scan found no child");
+    }
+
+    #[test]
+    fn a_keystroke_waiting_for_the_lock_does_not_wait_for_the_scan() {
+        let manager = Mutex::new(PtyManager::new());
+        let scan_started = AtomicBool::new(false);
+        let scan_done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let typist = s.spawn(|| {
+                while !scan_started.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                // What write_to_session does for each keystroke.
+                let _guard = manager.lock().unwrap();
+                scan_done.load(Ordering::SeqCst)
+            });
+            let _ = foreground_lock_released_for_scan(
+                &manager,
+                |_| Ok((1, None)),
+                |_| {
+                    scan_started.store(true, Ordering::SeqCst);
+                    // A slow enumerator: long enough for the keystroke to be
+                    // written first unless the lock is still held.
+                    std::thread::sleep(Duration::from_millis(500));
+                    scan_done.store(true, Ordering::SeqCst);
+                    true
+                },
+            );
+            let waited_for_scan = typist.join().unwrap();
+            assert!(!waited_for_scan, "the keystroke waited for the scan");
+        });
+    }
+
+    #[test]
+    fn an_answer_from_the_terminal_skips_the_scan() {
+        let manager = Mutex::new(PtyManager::new());
+        for owns in [true, false] {
+            let mut scanned = false;
+            let got = foreground_lock_released_for_scan(
+                &manager,
+                |_| Ok((1, Some(owns))),
+                |_| {
+                    scanned = true;
+                    !owns
+                },
+            );
+            assert_eq!(got, Ok(owns));
+            assert!(!scanned);
+        }
+    }
+
+    #[test]
+    fn an_unknown_session_is_an_error_and_nothing_is_scanned() {
+        let manager = Mutex::new(PtyManager::new());
+        let mut scanned = false;
+        let got = foreground_lock_released_for_scan(
+            &manager,
+            |mgr| probe_foreground(mgr, "no-such-session"),
+            |_| {
+                scanned = true;
+                true
+            },
+        );
+        assert_eq!(got, Err("Session no-such-session not found".to_string()));
+        assert!(!scanned);
+        assert!(free_for_another_thread(&manager), "the lock was left held");
+    }
+
+    // Start times are whole seconds since the epoch, as the OS reports them.
+    const SHELL_STARTED: u64 = 1_800_000_000;
+
+    #[test]
+    fn a_program_started_after_the_shell_is_its_child() {
+        assert!(counts_as_shell_child(
+            SHELL_STARTED,
+            SHELL_STARTED + 5,
+            "node.exe"
+        ));
+    }
+
+    #[test]
+    fn a_program_started_in_the_same_second_as_the_shell_is_its_child() {
+        // One-second clock: an agent launched right away must not be missed.
+        assert!(counts_as_shell_child(
+            SHELL_STARTED,
+            SHELL_STARTED,
+            "claude.exe"
+        ));
+    }
+
+    #[test]
+    fn an_orphan_of_an_earlier_process_with_the_reused_pid_is_not_a_child() {
+        // Windows reused the shell's pid; the orphan still names it as its
+        // parent but started before the shell existed.
+        assert!(!counts_as_shell_child(
+            SHELL_STARTED,
+            SHELL_STARTED - 1,
+            "node.exe"
+        ));
+        assert!(!counts_as_shell_child(
+            SHELL_STARTED,
+            1_700_000_000,
+            "node.exe"
+        ));
+    }
+
+    #[test]
+    fn an_unknown_start_time_counts_as_a_child() {
+        // Windows cannot open some processes: err towards "an agent may be
+        // running", which only keeps suggestions off.
+        assert!(counts_as_shell_child(SHELL_STARTED, 0, "elevated.exe"));
+        assert!(counts_as_shell_child(0, SHELL_STARTED - 60, "node.exe"));
+    }
+
+    #[test]
+    fn the_console_host_is_not_a_program_the_user_ran() {
+        for name in ["conhost.exe", "CONHOST.EXE", "OpenConsole.exe"] {
+            assert!(!counts_as_shell_child(
+                SHELL_STARTED,
+                SHELL_STARTED + 1,
+                name
+            ));
+        }
+    }
+
+    #[test]
+    fn a_process_with_nothing_running_has_no_child() {
+        let mut lone = lone_process();
+        // Give it time to start; it never gains a child.
+        std::thread::sleep(Duration::from_millis(300));
+        let found = has_child_process(lone.id());
+        let _ = lone.kill();
+        let _ = lone.wait();
+        assert!(!found, "found a child that does not exist");
     }
 }

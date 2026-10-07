@@ -1,4 +1,7 @@
-import { createContext, useContext, useReducer, useEffect, useCallback, useMemo, useRef, useState, ReactNode } from "react";
+import { useContext, useReducer, useEffect, useCallback, useMemo, useRef, useState, Suspense, ReactNode } from "react";
+import { SessionContextObject } from "./sessionContextObject";
+import { lazyView } from "../utils/lazyView";
+import { markStartupSession } from "../attention/startupSessions";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AgentEvent } from "../agent/types";
 import { isInitEvent, isStateChangedEvent } from "../agent/types";
@@ -10,20 +13,51 @@ let workspaceRestoreInProgress = false;
 // Dirty flag — set when layout/sessions change in ways worth persisting.
 // Cleared after each successful save. Prevents redundant saves every 10s.
 let workspaceDirty = false;
+// Set once the launch's restore has settled. Before that the session list is
+// not loaded yet, so a save would write an empty or partial workspace over
+// the one about to be restored.
+let workspaceLoaded = false;
+// Set when this launch restored no session from a saved workspace (restore
+// turned off, every session failed to start, unreadable data). Until a
+// session exists, a save leaves that saved workspace alone instead of
+// writing an empty one over it.
+let keepSavedWorkspace = false;
+// Saves run one after another, so an older snapshot of the state can never
+// land after a newer one.
+let saveChain: Promise<void> = Promise.resolve();
 import {
   createSession as apiCreateSession, closeSession as apiCloseSession,
   getSessions, getRecentSessions, getSessionSnapshot,
-  updateSessionDescription, updateSessionGroup,
+  updateSessionDescription, updateSessionGroup, updateSessionLabel,
   saveAllSnapshots,
   addWorkspacePath,
+  sessionHostStatus,
 } from "../api/sessions";
+import { deriveSessionLabelFromMessage, isDefaultSessionLabel } from "../utils/autoSessionLabel";
 import { getProjects, getSessionProjects, attachSessionProject } from "../api/projects";
 import { autoAttachInsideProject } from "../utils/autoAttach";
 import { hasAddDirDrift } from "../utils/agentDrift";
-import { createWorktree, worktreeHasChanges, stashWorktree, getSessionWorktreeInfo } from "../api/git";
-import type { SessionWorktree } from "../types/git";
+import {
+  createWorktree, worktreeHasChanges, stashWorktree, getSessionWorktreeInfo,
+  attachWorktree, detachWorktree, removeWorktree,
+  gitListBranchesForProject, keepWorktree, commitKeptWorktree, saveKeptDetachedHead, removeLeftoverWorktree,
+} from "../api/git";
+import { parseHookRefusal, plainGitError } from "../utils/gitErrors";
+import { isFeatureFlagEnabled } from "../featureFlags";
+import {
+  createSessionWorktrees, pickRestoreId, closeCommitMessage, shouldAskAboutChangesOnClose, describeBranchHolder,
+  withUnrestoredSessions,
+  type BranchConflictChoice, type BranchInUse, type ReusedCheckout,
+} from "./isolation";
+import { useSaveWorkspaceOnChange } from "./useSaveWorkspaceOnChange";
+import { nestUnderParents } from "../limits/handoff";
+import { useWorkspaceFlushOnQuit } from "./useWorkspaceFlushOnQuit";
+import { runWorktreeRecipes, type CreatedWorktree } from "./worktreeRecipes";
+// Shown only when a branch is in use elsewhere: its code loads on demand.
+const BranchConflictDialog = lazyView("BranchConflictDialog", () => import("../components/BranchConflictDialog").then((m) => m.BranchConflictDialog));
+import type { SessionWorktree, WorktreeChanges } from "../types/git";
 import { getSettings, getSetting, setSetting } from "../api/settings";
-import { createTerminal, destroy as destroyTerminal, writeScrollback, estimateInitialDimensions } from "../terminal/TerminalPool";
+import { createTerminal, destroy as destroyTerminal, writeScrollback, releaseOutput, estimateInitialDimensions } from "../terminal/TerminalPool";
 import { applyTheme, applyAgentTimelineStyle } from "../utils/themeManager";
 import { restoreWindowState } from "../utils/windowState";
 import { initNotifications, notifyLongRunningDone } from "../utils/notifications";
@@ -34,21 +68,23 @@ import {
   replaceNode, removePane, collectPanes, updateSplitRatio,
   setPaneSession, removePanesBySession,
 } from "./layoutTypes";
-import { DirtyWorktreeDialog } from "../components/DirtyWorktreeDialog";
+import { tileLayout } from "./tileLayout";
 import type { DirtyWorktreeChange } from "../components/DirtyWorktreeDialog";
+// Shown only when a closing session has work left: its code loads on demand.
+const DirtyWorktreeDialog = lazyView("DirtyWorktreeDialog", () => import("../components/DirtyWorktreeDialog").then((m) => m.DirtyWorktreeDialog));
 
 // ─── Re-export shared types for backward compatibility ──────────────
 export type {
-  AgentInfo, ToolCall, ProviderTokens, ActionEvent, ActionTemplate,
-  MemoryFact, SessionMetrics, SessionData, SessionHistoryEntry,
-  ExecutionMode, CreateSessionOpts, SessionAction, SessionMode,
+  ActionEvent, ActionTemplate, SessionData, SessionHistoryEntry,
+  CreateSessionOpts, SessionAction, SessionMode,
 } from "../types/session";
 
 import type {
-  SessionData, SessionHistoryEntry, ExecutionMode, CreateSessionOpts, SessionAction,
+  SessionData, SessionHistoryEntry, CreateSessionOpts, SessionAction,
   SavedWorkspace, SavedSessionInfo, SessionMode,
 } from "../types/session";
 import { SAVED_WORKSPACE_VERSION, validateSavedWorkspace } from "../types/session";
+import { hasAgentView } from "../utils/sessionModePref";
 import {
   clampWorkbenchRatio,
   clampFilesNotesSplit,
@@ -58,11 +94,13 @@ import {
   loadNotesMap,
   serializeNotesMap,
 } from "../utils/workbenchLayout";
-import { spawnAgentSession, closeAgentSession, sendAgentInput, updateHermesState, setAgentPermissionMode } from "../api/agent";
+import { spawnAgentSession, restartAgentSession, closeAgentSession, sendAgentInput, updateHermesState, setAgentPermissionMode, getAgentHistory } from "../api/agent";
 import { reportAgentSpawnFailure } from "../utils/agentSpawnFailure";
-import { destroyAgentSessionStore } from "../agent/agentSessionStore";
+import { createRespawnQueue, respawnJoinDisabledForTest } from "../utils/respawnQueue";
+import { destroyAgentSessionStore, getOrCreateAgentSessionStore } from "../agent/agentSessionStore";
 import { cleanupSessionRefs } from "../utils/sessionRefCleanup";
 import { cacheAgentInit, clearAgentInitCache, peekAgentInitCache } from "../agent/useAgentInit";
+import { clearSessionEvents } from "../agent/contract/sessionEventStore";
 import {
   buildUserEnvelope,
   echoUserEnvelope,
@@ -70,6 +108,7 @@ import {
   type AgentAttachment,
 } from "../utils/submitToAgent";
 import { sendAgentEnvelopeWithRevive } from "../utils/sendAgentEnvelope";
+import { setE2ESessionBridge } from "../e2e/sessionBridge";
 
 // ─── Mode-conversion worktree-preservation helper ────────────────────
 
@@ -214,6 +253,84 @@ export function worktreeFailureIsFatal(args: {
   return args.errorCount > 0 && args.succeeded === 0;
 }
 
+/** id → name of the given projects (empty when they cannot be read). */
+async function projectNamesById(ids: readonly string[]): Promise<Record<string, string>> {
+  try {
+    const all = await getProjects();
+    const out: Record<string, string> = {};
+    for (const p of all) if (ids.includes(p.id)) out[p.id] = p.name;
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+// ─── Sessions that end on their own ─────────────────────────────────
+
+/** Sessions that end within this window of each other ended together. */
+export const ENDED_BURST_MS = 1200;
+
+/**
+ * What to do with sessions whose terminal ended without Hermes closing
+ * them. One program that ended while the terminal service runs (`exit` in
+ * the shell) closes as it always did. Several at once, or with the terminal
+ * service gone, is a crash: the rows stay, ended, with their output and a
+ * way to restart them — and their worktrees are not deleted behind the
+ * person's back.
+ */
+export function endedSessionsVerdict(args: { count: number; hostGone: boolean }): "close" | "keep" {
+  return args.hostGone || args.count > 1 ? "keep" : "close";
+}
+
+// ─── Close: what to ask about a session's worktree ──────────────────
+
+/** A commit hook that refused while closing, for the dialog. */
+export interface PendingHookRefusal {
+  projectName: string;
+  hook: string;
+  output: string;
+}
+
+/**
+ * The close dialog's entry for one project, or null when closing can go
+ * ahead without asking: uncommitted files, commits on a detached HEAD that
+ * no branch has, an operation in progress, edits inside a submodule, the
+ * branch HEAD is really on — and, when the check itself fails, an entry
+ * that says so (closing never deletes a worktree it could not check).
+ */
+export async function closeCheckEntry(
+  sessionId: string,
+  project: { id: string; name: string },
+  recordedBranch: string | null,
+  check: (sessionId: string, projectId: string) => Promise<WorktreeChanges>,
+): Promise<DirtyWorktreeChange | null> {
+  try {
+    const changes = await check(sessionId, project.id);
+    const head = changes.head ?? null;
+    const entry: DirtyWorktreeChange = {
+      projectId: project.id,
+      projectName: project.name,
+      branchName: recordedBranch,
+      files: changes.files,
+      actualBranch: head ? head.branch : null,
+      detached: head?.detached ?? false,
+      lostCommits: head?.lostCommits ?? 0,
+      operation: head?.operation ?? null,
+      dirtySubmodules: head?.dirtySubmodules ?? [],
+    };
+    const ask = entry.files.length > 0 || (entry.lostCommits ?? 0) > 0 || !!entry.operation || (entry.dirtySubmodules?.length ?? 0) > 0;
+    return ask ? entry : null;
+  } catch (e) {
+    return {
+      projectId: project.id,
+      projectName: project.name,
+      branchName: recordedBranch,
+      files: [],
+      checkError: plainGitError(e) || "unknown error",
+    };
+  }
+}
+
 // ─── Agent-aware close helper ────────────────────────────────────────
 
 /**
@@ -301,9 +418,9 @@ function remapPaneFocusId(layout: LayoutNode, _oldFocusId: string | null): strin
 /**
  * Resolve the runtime mode for a new session.
  *
- * Rules (1.0.0 — agent mode is Claude-only):
- *   1. Non-Claude providers (and shell-only) are always "terminal".
- *   2. Claude defaults to "agent" unless the caller explicitly passed "terminal".
+ * Terminal first (ADR 003): every session runs in terminal mode unless the
+ * caller explicitly asked for the Agent view AND the provider has one.
+ * There is no provider-specific default any more — Claude included.
  *
  * Exported for testability.
  */
@@ -311,8 +428,7 @@ export function resolveSessionMode(
   requested: SessionMode | undefined,
   aiProvider: string | null | undefined,
 ): SessionMode {
-  if (aiProvider !== "claude") return "terminal";
-  return requested ?? "agent";
+  return requested === "agent" && hasAgentView(aiProvider) ? "agent" : "terminal";
 }
 
 // ─── State ──────────────────────────────────────────────────────────
@@ -321,12 +437,6 @@ interface SessionState {
   sessions: Record<string, SessionData>;
   activeSessionId: string | null;
   recentSessions: SessionHistoryEntry[];
-  defaultMode: ExecutionMode;
-  executionModes: Record<string, ExecutionMode>;
-  autonomousSettings: {
-    commandMinFrequency: number;
-    cancelDelayMs: number;
-  };
   autoApplyEnabled: boolean;
   injectionLocks: Record<string, boolean>;
   composers: Record<string, { draft: string; height: number; expanded: boolean }>;
@@ -343,10 +453,12 @@ interface SessionState {
     /** Usage panel — shows account info + rate limits + per-session cost.
      *  Lives on the right activity bar, below the Context tab. */
     usagePanelOpen: boolean;
+    /** Track panel (F28, flag `featureTracks`) — the Feature Track of the
+     *  active session's worktree. Mutex with Context and Usage. */
+    trackPanelOpen: boolean;
     sessionListCollapsed: boolean;
     commandPaletteOpen: boolean;
     flowMode: boolean;
-    autoToast: { command: string; reason: string; sessionId: string } | null;
     processPanelOpen: boolean;
     gitPanelOpen: boolean;
     fileExplorerOpen: boolean;
@@ -402,6 +514,10 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
         // it MUST be part of the dedup check or the update is silently
         // dropped and the auto-allow effect never re-fires.
         && existing.permission_mode === action.session.permission_mode
+        // The conversation id is what a restore resumes, and the startup
+        // state is what the session list shows while an agent starts.
+        && (existing.vendor_session_id ?? null) === (action.session.vendor_session_id ?? null)
+        && (existing.agent_startup?.state ?? null) === (action.session.agent_startup?.state ?? null)
         && existing.detected_agent?.name === action.session.detected_agent?.name
         && existing.detected_agent?.model === action.session.detected_agent?.model
         && existing.metrics.output_lines === action.session.metrics.output_lines
@@ -447,9 +563,21 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
       workspaceDirty = true;
       const { [action.id]: _, ...rest } = state.sessions;
       const ids = Object.keys(rest);
-      // Remove panes displaying this session from layout
+      // Remove panes displaying this session from layout — except the
+      // focused one: it shows the session that becomes active instead
+      // (when no other pane shows it), so the window never falls back to
+      // the empty welcome page while the title and the list name another
+      // session as active.
       let newRoot = state.layout.root;
       if (newRoot) {
+        const panes = collectPanes(newRoot);
+        const focused = panes.find((p) => p.id === state.layout.focusedPaneId);
+        const next = state.activeSessionId && state.activeSessionId !== action.id && rest[state.activeSessionId]
+          ? state.activeSessionId
+          : (ids.length > 0 ? ids[ids.length - 1] : null);
+        if (focused && focused.sessionId === action.id && next && !panes.some((p) => p.sessionId === next)) {
+          newRoot = setPaneSession(newRoot, focused.id, next);
+        }
         newRoot = removePanesBySession(newRoot, action.id);
       }
       // Determine new focused pane
@@ -471,8 +599,7 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
         : (state.activeSessionId === action.id
           ? (ids.length > 0 ? ids[ids.length - 1] : null)
           : state.activeSessionId);
-      // Clean per-session execution mode and injection lock
-      const { [action.id]: _mode, ...restModes } = state.executionModes;
+      // Clean per-session injection lock
       const { [action.id]: _lock, ...restLocks } = state.injectionLocks;
       const { [action.id]: _composer, ...restComposers } = state.composers;
       // Drop the closed session's notes — keeps saved_workspace.json
@@ -481,10 +608,6 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
       // strings, but that path only fires when the user clears a note;
       // SESSION_REMOVED is the canonical "this id no longer exists").
       const { [action.id]: _note, ...restNotes } = state.notes;
-      // Clear autoToast if it references the removed session
-      const newAutoToast = state.ui.autoToast?.sessionId === action.id
-        ? null
-        : state.ui.autoToast;
       // Clear pending close dialog if the removed session is the one being confirmed
       const newPendingClose = state.pendingCloseSessionId === action.id
         ? null
@@ -495,7 +618,6 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
         ...state,
         sessions: rest,
         activeSessionId: newActive,
-        executionModes: restModes,
         injectionLocks: restLocks,
         composers: restComposers,
         notes: restNotes,
@@ -503,7 +625,6 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
         layout: { root: newRoot, focusedPaneId: newFocused },
         ui: {
           ...state.ui,
-          autoToast: newAutoToast,
           ...(noSessionsLeft && {
             sessionListCollapsed: true,
             contextPanelOpen: false,
@@ -554,13 +675,14 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
     case "SET_RECENT":
       return { ...state, recentSessions: action.entries };
     case "TOGGLE_CONTEXT":
-      // Right rail is single-panel: opening Context closes Usage.
+      // Right rail is single-panel: opening Context closes Usage and Track.
       return {
         ...state,
         ui: {
           ...state.ui,
           contextPanelOpen: !state.ui.contextPanelOpen,
           usagePanelOpen: state.ui.contextPanelOpen ? state.ui.usagePanelOpen : false,
+          trackPanelOpen: state.ui.contextPanelOpen ? state.ui.trackPanelOpen : false,
         },
       };
     case "TOGGLE_USAGE":
@@ -570,6 +692,18 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
           ...state.ui,
           usagePanelOpen: !state.ui.usagePanelOpen,
           contextPanelOpen: state.ui.usagePanelOpen ? state.ui.contextPanelOpen : false,
+          trackPanelOpen: state.ui.usagePanelOpen ? state.ui.trackPanelOpen : false,
+        },
+      };
+    case "TOGGLE_TRACK":
+      // Opening the Track panel closes Context and Usage (same column).
+      return {
+        ...state,
+        ui: {
+          ...state.ui,
+          trackPanelOpen: !state.ui.trackPanelOpen,
+          contextPanelOpen: state.ui.trackPanelOpen ? state.ui.contextPanelOpen : false,
+          usagePanelOpen: state.ui.trackPanelOpen ? state.ui.usagePanelOpen : false,
         },
       };
     case "TOGGLE_SIDEBAR":
@@ -591,10 +725,6 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
       return state.ui.commandPaletteOpen
         ? { ...state, ui: { ...state.ui, commandPaletteOpen: false } }
         : state;
-    case "SET_EXECUTION_MODE":
-      return { ...state, executionModes: { ...state.executionModes, [action.sessionId]: action.mode } };
-    case "SET_DEFAULT_MODE":
-      return { ...state, defaultMode: action.mode };
     case "SET_SESSION_MODE": {
       const existing = state.sessions[action.sessionId];
       if (!existing || existing.mode === action.mode) return state;
@@ -609,14 +739,8 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
     }
     case "TOGGLE_FLOW_MODE":
       return { ...state, ui: { ...state.ui, flowMode: !state.ui.flowMode } };
-    case "SHOW_AUTO_TOAST":
-      return { ...state, ui: { ...state.ui, autoToast: { command: action.command, reason: action.reason, sessionId: action.sessionId } } };
-    case "DISMISS_AUTO_TOAST":
-      return { ...state, ui: { ...state.ui, autoToast: null } };
     case "TOGGLE_AUTO_APPLY":
       return { ...state, autoApplyEnabled: !state.autoApplyEnabled };
-    case "SET_AUTONOMOUS_SETTINGS":
-      return { ...state, autonomousSettings: { ...state.autonomousSettings, ...action.settings } };
     case "ACQUIRE_INJECTION_LOCK": {
       if (state.injectionLocks[action.sessionId]) return state; // Already locked
       return { ...state, injectionLocks: { ...state.injectionLocks, [action.sessionId]: true } };
@@ -764,6 +888,18 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
       return {
         ...state,
         layout: { ...state.layout, root: resized },
+      };
+    }
+    case "TILE_SESSIONS": {
+      const ids = action.sessionIds.filter((id) => !!state.sessions[id]);
+      const root = tileLayout(ids);
+      if (!root) return state;
+      workspaceDirty = true;
+      const first = collectPanes(root)[0];
+      return {
+        ...state,
+        activeSessionId: first.sessionId,
+        layout: { root, focusedPaneId: first.id },
       };
     }
     case "SET_PANE_SESSION": {
@@ -1036,12 +1172,6 @@ export const initialState: SessionState = {
   sessions: {},
   activeSessionId: null,
   recentSessions: [],
-  defaultMode: "manual" as ExecutionMode,
-  executionModes: {},
-  autonomousSettings: {
-    commandMinFrequency: 5,
-    cancelDelayMs: 3000,
-  },
   autoApplyEnabled: true,
   injectionLocks: {},
   composers: {},
@@ -1061,10 +1191,10 @@ export const initialState: SessionState = {
     // they need it.
     contextPanelOpen: false,
     usagePanelOpen: false,
+    trackPanelOpen: false,
     sessionListCollapsed: false,
     commandPaletteOpen: false,
     flowMode: false,
-    autoToast: null,
     processPanelOpen: false,
     gitPanelOpen: false,
     fileExplorerOpen: false,
@@ -1135,14 +1265,30 @@ interface SessionContextValue {
   respawnAgent: (sessionId: string) => Promise<boolean>;
 }
 
-const SessionContext = createContext<SessionContextValue | null>(null);
+// The context object lives in its own module (see sessionContextObject.ts).
+const SessionContext = SessionContextObject as React.Context<SessionContextValue | null>;
 
 export function SessionProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(sessionReducer, initialState);
+  // Mirrors `workspaceLoaded` for the hooks that save on a change.
+  const [workspaceReady, setWorkspaceReady] = useState(workspaceLoaded);
   const busyTimestamps = useRef<Map<string, number>>(new Map());
   const lastAutoAttachCwd = useRef<Map<string, string>>(new Map());
   const closingSessionIds = useRef<Set<string>>(new Set());
   const closeTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  // Saved sessions that could not be restored this launch. They go back
+  // into the saved workspace (tried again next start) unless the user
+  // chooses to forget one from the error message.
+  const unrestoredSessions = useRef<SavedSessionInfo[]>([]);
+  useEffect(() => {
+    const onForget = (e: Event) => {
+      const { id } = (e as CustomEvent<{ id: string }>).detail;
+      unrestoredSessions.current = unrestoredSessions.current.filter((s) => s.id !== id);
+      workspaceDirty = true;
+    };
+    window.addEventListener("hermes:session-restore-forget", onForget);
+    return () => window.removeEventListener("hermes:session-restore-forget", onForget);
+  }, []);
   /** sessionId → Claude session UUID returned by spawn_agent_session.
    *  Captured on first spawn (and on every successful respawn) so that a
    *  later model swap can pass `--resume <uuid>` to preserve conversation. */
@@ -1163,6 +1309,13 @@ export function SessionProvider({ children }: { children: ReactNode }) {
    *  detects the diff and triggers a respawn so Read/Edit tools can
    *  actually access files in newly-attached paths. */
   const claudeAddDirs = useRef<Map<string, string[]>>(new Map());
+  /** Per-session respawn lock: overlapping plain restarts join one restart
+   *  (see utils/respawnQueue.ts). */
+  const respawnQueue = useRef(createRespawnQueue());
+  /** sessionId → "already auto-named, don't try again". Prevents racing
+   *  duplicate label writes if the user submits two messages in quick
+   *  succession before the first persist round-trip completes. */
+  const autoNamedSessions = useRef<Set<string>>(new Set());
   /** sessionId → flag changes the user has *requested* but not yet applied,
    *  because applying them requires a fresh fork-respawn AND a user message
    *  for the new subprocess to actually persist its session.
@@ -1291,13 +1444,68 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  // ─── Branch-in-use choice (honest isolation) ─────────────────────────
+  // createSession awaits the user's answer; the dialog resolves it.
+  const [pendingBranchConflict, setPendingBranchConflict] = useState<{
+    conflict: BranchInUse & { projectId: string };
+    heldBy: string;
+    /** The repository's local branches, so a new name that is one is refused. */
+    localBranches: string[];
+    resolve: (choice: BranchConflictChoice) => void;
+  } | null>(null);
+
   // ─── Dirty worktree close state ─────────────────────────────────────
   const [pendingDirtyClose, setPendingDirtyClose] = useState<{
     sessionId: string;
     label: string;
     changes: DirtyWorktreeChange[];
     stashErrors?: Array<{ projectName: string; error: string }>;
+    /** The session's program was running when the dialog opened. */
+    agentWorking?: boolean;
+    /** The session was already stopped; these folders (project → path) are still to be saved. */
+    closed?: boolean;
+    kept?: Record<string, string>;
+    /** A commit hook refused the commit (shown with "Archive instead"). */
+    hookRefusal?: PendingHookRefusal | null;
   } | null>(null);
+
+  // ─── Sessions that ended without Hermes closing them ────────────────
+  const endedBurst = useRef<{ ids: Set<string>; sessions: Map<string, SessionData>; timer: ReturnType<typeof setTimeout> | null }>({
+    ids: new Set(),
+    sessions: new Map(),
+    timer: null,
+  });
+  const settleEndedBurst = useCallback(async () => {
+    const burst = endedBurst.current;
+    const ended = [...burst.ids].map((id) => burst.sessions.get(id)).filter((s): s is SessionData => !!s);
+    burst.ids.clear();
+    burst.sessions.clear();
+    burst.timer = null;
+    const live = ended.filter((s) => stateRef.current.sessions[s.id] && !closingSessionIds.current.has(s.id));
+    if (live.length === 0) return;
+    let hostGone = false;
+    try {
+      const st = await sessionHostStatus();
+      hostGone = st.supported && !st.running && live.some((s) => st.hosted_session_ids.length === 0 || !st.hosted_session_ids.includes(s.id));
+    } catch {
+      // Unknown: decide by the count alone.
+    }
+    if (endedSessionsVerdict({ count: live.length, hostGone }) === "close") {
+      for (const s of live) {
+        closingSessionIds.current.add(s.id);
+        apiCloseSession(s.id).catch(() => closingSessionIds.current.delete(s.id));
+      }
+      return;
+    }
+    // Keep them, ended, with their output; one notice for all of them.
+    for (const s of live) dispatch({ type: "SESSION_UPDATED", session: s });
+    window.dispatchEvent(new CustomEvent("hermes:sessions-ended", {
+      detail: { sessions: live.map((s) => ({ id: s.id, label: s.label })), reason: "service" },
+    }));
+  }, []);
+  // Read from the mount-once event listener below.
+  const settleEndedBurstRef = useRef(settleEndedBurst);
+  settleEndedBurstRef.current = settleEndedBurst;
 
   // Long-running threshold: 30 seconds of busy before notification on idle
   const LONG_RUNNING_THRESHOLD_MS = 30_000;
@@ -1319,11 +1527,23 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         // Trigger cleanup and wait for SESSION_REMOVED instead.
         // Disconnected SSH sessions are kept in the UI for reconnection.
         if (session.phase === "destroyed") {
-          if (!closingSessionIds.current.has(session.id)) {
+          if (closingSessionIds.current.has(session.id)) return;
+          if (!stateRef.current.sessions[session.id]) {
+            // Never shown: nothing to keep.
             closingSessionIds.current.add(session.id);
             apiCloseSession(session.id).catch(() => {
               closingSessionIds.current.delete(session.id);
             });
+            return;
+          }
+          // It ended without Hermes closing it. Decide once the burst is
+          // over: several at once, or the terminal service gone, is a crash
+          // (the rows stay, ended, with their output); one program that
+          // ended on its own closes as before.
+          endedBurst.current.ids.add(session.id);
+          endedBurst.current.sessions.set(session.id, session);
+          if (!endedBurst.current.timer) {
+            endedBurst.current.timer = setTimeout(() => void settleEndedBurstRef.current(), ENDED_BURST_MS);
           }
           return;
         }
@@ -1356,8 +1576,10 @@ export function SessionProvider({ children }: { children: ReactNode }) {
           const startedAt = busyTimestamps.current.get(session.id);
           busyTimestamps.current.delete(session.id);
           if (startedAt && (Date.now() - startedAt) > LONG_RUNNING_THRESHOLD_MS) {
-            // Only notify if the window is not focused
-            if (document.hidden) {
+            // Only notify if the window is not focused. With the attention
+            // inbox on, "done" notifications come from the inbox instead
+            // (grouped per session, never for the session you look at).
+            if (document.hidden && !isFeatureFlagEnabled("attentionInbox")) {
               notifyLongRunningDone(session.label);
             }
           }
@@ -1458,6 +1680,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
             claudeAddDirs: claudeAddDirs.current,
             pendingFlags: pendingFlags.current,
             lastIdeStateHash: lastIdeStateHash.current,
+            autoNamedSessions: autoNamedSessions.current,
           },
           event.payload,
         );
@@ -1470,6 +1693,9 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         // otherwise the Map grows unbounded across long-running app
         // sessions.
         clearAgentInitCache(event.payload);
+        // Forget its 2.0 session events: whatever waited on it (a usage
+        // limit in the inbox, N19) goes with it.
+        clearSessionEvents(event.payload);
         dispatch({ type: "SESSION_REMOVED", id: event.payload });
       });
       unlisteners.push(u2);
@@ -1480,6 +1706,11 @@ export function SessionProvider({ children }: { children: ReactNode }) {
 
     setup().catch((err) => console.error("[SessionContext] Failed to setup event listeners:", err));
 
+    const markWorkspaceLoaded = () => {
+      workspaceLoaded = true;
+      setWorkspaceReady(true);
+    };
+
     // Load settings first, THEN sessions (so terminals use correct settings)
     getSettings()
       .then((s) => {
@@ -1487,16 +1718,6 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         applyTheme(theme, s);
         applyAgentTimelineStyle(s.agent_timeline_style);
         restoreWindowState(s).catch(console.error);
-        if (s.execution_mode === "assisted" || s.execution_mode === "autonomous") {
-          dispatch({ type: "SET_DEFAULT_MODE", mode: s.execution_mode as ExecutionMode });
-        }
-        dispatch({
-          type: "SET_AUTONOMOUS_SETTINGS",
-          settings: {
-            commandMinFrequency: s.auto_command_min_frequency ? parseInt(s.auto_command_min_frequency, 10) || 5 : 5,
-            cancelDelayMs: s.auto_cancel_delay_ms ? parseInt(s.auto_cancel_delay_ms, 10) || 3000 : 3000,
-          },
-        });
 
         // Now load sessions after settings are applied
         return getSessions().then((arr) => ({ arr, settings: s }));
@@ -1510,20 +1731,29 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         const live = arr.filter((session) => session.phase !== "destroyed");
 
         // If there are live sessions (hot reload / dev), use them as-is
+        for (const session of live) markStartupSession(session.id);
         if (live.length > 0) {
           dispatch({ type: "SET_ACTIVE", id: live[0].id });
+          markWorkspaceLoaded();
           return;
         }
+
+        // Guard against React StrictMode double-mount: the first mount's
+        // load marks the workspace loaded when it is done.
+        if (workspaceRestoreStarted) return;
+        workspaceRestoreStarted = true;
 
         // No live sessions — attempt workspace restore
         const restorePref = s.restore_sessions || "always";
         const savedJson = s.saved_workspace;
-        if (restorePref === "never" || !savedJson) return;
-
-        // Guard against React StrictMode double-mount
-        if (workspaceRestoreStarted) return;
-        workspaceRestoreStarted = true;
+        if (restorePref === "never" || !savedJson) {
+          if (savedJson) keepSavedWorkspace = true;
+          markWorkspaceLoaded();
+          return;
+        }
         workspaceRestoreInProgress = true;
+        // Cleared below once a session is restored.
+        keepSavedWorkspace = true;
 
         try {
           let parsed: unknown;
@@ -1546,12 +1776,25 @@ export function SessionProvider({ children }: { children: ReactNode }) {
 
           // Re-create each saved session
           const oldToNew = new Map<string, string>();
+          const usedRestoreIds = new Set<string>();
           for (const saved of workspace.sessions) {
-            const restoreId = crypto.randomUUID();
+            // Keep the saved id so the session keeps its worktree link
+            // (session_worktrees rows are keyed by it) and its history.
+            const restoreId = pickRestoreId(saved.id, usedRestoreIds);
+            usedRestoreIds.add(restoreId);
             try {
+              // Read the scrollback BEFORE creating the session: creating it
+              // under the same id rewrites its row, snapshot included.
+              let savedSnapshot: string | null = null;
+              try {
+                savedSnapshot = await getSessionSnapshot(saved.id);
+              } catch {
+                console.warn("[SessionContext] Failed to read scrollback for", saved.label);
+              }
               // Pre-generate ID and set up listener before PTY starts
-              // (same race-prevention as createSession above)
-              await createTerminal(restoreId, saved.color);
+              // (same race-prevention as createSession above). What the new
+              // shell prints is held until the restored scrollback is in.
+              await createTerminal(restoreId, saved.color, { holdOutput: true });
 
               const restoreDims = estimateInitialDimensions();
               // Default missing `mode` to "terminal" so existing 0.6.16 saved
@@ -1569,15 +1812,36 @@ export function SessionProvider({ children }: { children: ReactNode }) {
                 permissionMode: saved.permission_mode ?? (saved.auto_approve ? "bypassPermissions" : "default"),
                 customPrefix: saved.custom_prefix ?? "",
                 customSuffix: saved.custom_suffix ?? "",
+                agentName: saved.agent_name || null,
+                agentCommand: saved.agent_command || null,
                 sshHost: saved.ssh_info?.host || null,
                 sshPort: saved.ssh_info?.port || null,
                 sshUser: saved.ssh_info?.user || null,
                 tmuxSession: saved.ssh_info?.tmux_session || null,
                 sshIdentityFile: saved.ssh_info?.identity_file || null,
+                sshJumpHost: saved.ssh_info?.jump_host || null,
                 initialRows: restoreDims.rows,
                 initialCols: restoreDims.cols,
                 mode: restoredMode,
+                // Terminal-agent resume (launchHelper flag): hand the saved
+                // conversation id back so the agent continues it.
+                launchHelper: isFeatureFlagEnabled("launchHelper"),
+                launchHelperRequired: isFeatureFlagEnabled("launchHelper"),
+                featureTracks: isFeatureFlagEnabled("featureTracks"),
+                vendorSessionId: saved.vendor_session_id ?? null,
+                // 2.0: resume in the same profile with the same model and effort.
+                agentLaunch: saved.agent_launch ? { ...saved.agent_launch, purpose: "agent" } : null,
+                // Session host (sessionHost flag): reattach to the program
+                // the host kept running under this id, if it still has it.
+                sessionHost: isFeatureFlagEnabled("sessionHost"),
+                parentSessionId: saved.parent_session_id ? (oldToNew.get(saved.parent_session_id) ?? saved.parent_session_id) : null,
               });
+              // The restored scrollback first, then what the new shell has
+              // printed so far — unless the session host replayed the real
+              // output (N20): the terminal then shows everything, live.
+              releaseOutput(restoreId, savedSnapshot && !newSession.reattached ? savedSnapshot : null);
+              // Restored at startup: an agent of it already waiting opens the morning view.
+              markStartupSession(newSession.id);
 
               // Agent-mode restore: spawn the Claude subprocess that the
               // backend `create_session` deliberately skipped.  Honor the
@@ -1594,6 +1858,16 @@ export function SessionProvider({ children }: { children: ReactNode }) {
                 if (saved.agent_effort) claudeEfforts.current.set(newSession.id, saved.agent_effort);
                 const restoredDirs = saved.agent_add_dirs ?? newSession.workspace_paths;
                 claudeAddDirs.current.set(newSession.id, [...restoredDirs]);
+                // Claude resumes with the context but streams only what comes
+                // next: draw the earlier conversation from its transcript.
+                if (saved.claude_session_uuid) {
+                  getAgentHistory(newSession.working_directory, saved.claude_session_uuid)
+                    .then((history) => {
+                      if (history.length === 0) return;
+                      getOrCreateAgentSessionStore(newSession.id, listen).seedHistory(history as AgentEvent[]);
+                    })
+                    .catch((err) => console.warn("[SessionContext] Failed to read the earlier conversation:", err));
+                }
                 spawnAgentSession({
                   sessionId: newSession.id,
                   workingDir: newSession.working_directory,
@@ -1632,26 +1906,36 @@ export function SessionProvider({ children }: { children: ReactNode }) {
               }
               await Promise.all(metaPromises);
 
-              // Restore scrollback from the old session's snapshot
-              try {
-                const snapshot = await getSessionSnapshot(saved.id);
-                if (snapshot) {
-                  writeScrollback(newSession.id, snapshot);
-                }
-              } catch {
-                console.warn("[SessionContext] Failed to restore scrollback for", saved.label);
-              }
-
               dispatch({ type: "SESSION_UPDATED", session: newSession });
+              if (newSession.reattached) {
+                // The replayed output may already have moved the phase on
+                // (the program is busy); the create result is stale by now.
+                getSessions()
+                  .then((all) => {
+                    const fresh = all.find((x) => x.id === newSession.id);
+                    if (fresh) dispatch({ type: "SESSION_UPDATED", session: fresh });
+                  })
+                  .catch(() => {});
+              }
               oldToNew.set(saved.id, newSession.id);
             } catch (err) {
               console.warn("[SessionContext] Failed to restore session:", saved.label, err);
               // Clean up the terminal that was pre-created for this failed session
               destroyTerminal(restoreId);
+              // The backend announces a session before its shell starts; if
+              // the start failed, that entry would stay at "starting" for
+              // ever. Drop it from the list, keep its saved entry for the
+              // next launch, and say why.
+              dispatch({ type: "SESSION_REMOVED", id: restoreId });
+              unrestoredSessions.current = [...unrestoredSessions.current.filter((s) => s.id !== saved.id), saved];
+              window.dispatchEvent(new CustomEvent("hermes:session-restore-failed", {
+                detail: { id: saved.id, label: saved.label, error: err instanceof Error ? err.message : String(err) },
+              }));
             }
           }
 
           if (oldToNew.size === 0) return;
+          keepSavedWorkspace = false;
 
           // Restore the right-rail Workbench layout + per-session notes
           // (1.1.14).  Notes are remapped through the same old→new id
@@ -1690,16 +1974,21 @@ export function SessionProvider({ children }: { children: ReactNode }) {
             if (firstNewId) dispatch({ type: "SET_ACTIVE", id: firstNewId });
           }
 
-          // Restore completed successfully — NOW clear the saved workspace to prevent
-          // double-restore on next launch. This is the key safety improvement: if the
-          // app crashed before reaching this point, the data would still be intact.
-          await setSetting("saved_workspace", "").catch(console.error);
+          // The saved workspace is NOT cleared here: sessions keep their
+          // saved ids, so restoring it again is harmless, and a quit before
+          // the next write must still find it. Marking the workspace loaded
+          // writes the restored state right away (useSaveWorkspaceOnChange).
         } finally {
           workspaceRestoreInProgress = false;
+          markWorkspaceLoaded();
         }
       })
       .catch((err) => {
         workspaceRestoreInProgress = false;
+        // The launch could not even read what was saved: never write an
+        // empty workspace over it (a session opened later clears this).
+        keepSavedWorkspace = true;
+        markWorkspaceLoaded();
         console.error("[SessionContext] Workspace restore failed:", err);
       });
 
@@ -1723,28 +2012,62 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     try {
 
       // Create worktrees for each git project with a branch selection
-      const sharedBranches: string[] = [];
-      const worktreeErrors: string[] = [];
+      let reusedCheckouts: ReusedCheckout[] = [];
+      let worktreeErrors: string[] = [];
       // Bug 3 (1.2.x): count successes so we can abort if EVERY worktree
       // failed.  Previously the loop swallowed every error and let
       // `apiCreateSession` proceed; the backend silently used the
       // project root and the agent session booted with no isolation.
       let worktreesSucceeded = 0;
       if (opts?.branchSelections && opts?.projectIds?.length) {
-        for (const projectId of opts.projectIds) {
-          const sel = opts.branchSelections[projectId];
-          if (!sel) continue; // Non-git project or user skipped branches for this project
-          try {
-            const wtResult = await createWorktree(preSessionId, projectId, sel.branch, sel.createNew, sel.fromRemote, opts?.worktreeBasePath);
-            if (wtResult.isShared) {
-              sharedBranches.push(sel.branch);
-            }
-            worktreesSucceeded++;
-          } catch (wtErr) {
-            console.warn(`[SessionContext] Failed to create worktree for project ${projectId}:`, wtErr);
-            worktreeErrors.push(`${projectId}: ${wtErr}`);
-          }
+        // A branch that is checked out elsewhere is never shared silently:
+        // the backend refuses, and with honest isolation on the user
+        // chooses (reuse / new branch / cancel). With the flag off, stable
+        // keeps its old behaviour of sharing that checkout — now recorded
+        // as shared, so closing this session can never delete it.
+        const askUser = isFeatureFlagEnabled("honestIsolation");
+        const created: CreatedWorktree[] = [];
+        const worktreeWarnings: Array<{ projectId: string; warning: string }> = [];
+        const outcome = await createSessionWorktrees(preSessionId, opts.projectIds, opts.branchSelections, {
+          createWorktree: async (sessionId, projectId, branch, createNew, fromRemote, baseBranch) => {
+            const r = await createWorktree(sessionId, projectId, branch, createNew, fromRemote, baseBranch);
+            if (!r.isMainWorktree) created.push({ projectId, branch: r.branchName, worktreePath: r.worktreePath });
+            // Made, but a hook failed after git checked it out: say so.
+            if (r.warning) worktreeWarnings.push({ projectId, warning: r.warning });
+            return r;
+          },
+          attachWorktree,
+          removeWorktree,
+          detachWorktree,
+          removeLeftover: (projectId, path) => removeLeftoverWorktree(projectId, path, null),
+          resolveConflict: async (conflict) => {
+            if (!askUser) return { kind: "reuse" };
+            const holder = conflict.sessionId ? stateRef.current.sessions[conflict.sessionId] : undefined;
+            const heldBy = describeBranchHolder(conflict, holder?.label ?? null);
+            // Without the list the backend still refuses such a name.
+            const localBranches = await gitListBranchesForProject(conflict.projectId)
+              .then((all) => all.filter((b) => !b.is_remote).map((b) => b.name))
+              .catch(() => [] as string[]);
+            return new Promise<BranchConflictChoice>((resolve) => {
+              setPendingBranchConflict({ conflict, heldBy, localBranches, resolve });
+            });
+          },
+        });
+        if (outcome.cancelled) {
+          destroyTerminal(preSessionId);
+          return null;
         }
+        worktreesSucceeded = outcome.succeeded;
+        // People read project names, not ids, and sentences, not libgit2 codes.
+        const names = await projectNamesById(opts.projectIds);
+        worktreeErrors = outcome.errors.map((e) => plainGitError(e, names));
+        reusedCheckouts = outcome.reused;
+        if (worktreeWarnings.length > 0) {
+          window.dispatchEvent(new CustomEvent("hermes:worktree-warnings", {
+            detail: { warnings: worktreeWarnings.map((w) => `${names[w.projectId] ?? "A project"}: ${w.warning}`) },
+          }));
+        }
+        for (const e of worktreeErrors) console.warn(`[SessionContext] Failed to create worktree: ${e}`);
 
         // Hard-abort when every selected worktree failed.  Returning
         // null here surfaces the failure to the caller (command palette
@@ -1762,6 +2085,13 @@ export function SessionProvider({ children }: { children: ReactNode }) {
             detail: { errors: worktreeErrors, sessionLabel: opts?.label, fatal: true },
           }));
           return null;
+        }
+
+        // Worktree recipes (.hermes/worktree.toml): prepare each new
+        // worktree before anything starts in it. Part of honest isolation,
+        // so it ships behind the same flag. No file: nothing happens.
+        if (created.length > 0 && isFeatureFlagEnabled("honestIsolation")) {
+          await runWorktreeRecipes(preSessionId, created);
         }
       } else if (opts?.branchName && opts?.projectIds?.length) {
         // Legacy: single branch for first project (backward compatibility)
@@ -1797,10 +2127,9 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       // the shell starts at 80x24 and misses the initial resize from attach().
       const initialDims = estimateInitialDimensions();
 
-      // Pick the runtime mode.  If the caller passed an explicit mode, use it;
-      // otherwise default to "agent" for Claude and "terminal" for everything
-      // else.  Agent mode is Claude-only in 1.0.0 — non-Claude providers are
-      // forced back to "terminal" even if the caller requested "agent".
+      // Pick the runtime mode.  Terminal is the default for every provider;
+      // the Agent view is used only when the caller asked for it and the
+      // provider has one (Claude today).
       const mode = resolveSessionMode(opts?.mode, opts?.aiProvider);
 
       const session = await apiCreateSession({
@@ -1815,15 +2144,31 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         permissionMode: opts?.permissionMode || null,
         customPrefix: opts?.customPrefix || null,
         customSuffix: opts?.customSuffix || null,
+        agentName: opts?.agentName || null,
+        agentCommand: opts?.agentCommand || null,
         channels: opts?.channels || null,
         sshHost: opts?.sshHost || null,
         sshPort: opts?.sshPort || null,
         sshUser: opts?.sshUser || null,
         tmuxSession: opts?.tmuxSession || null,
         sshIdentityFile: opts?.sshIdentityFile || null,
+        sshJumpHost: opts?.sshJumpHost || null,
         initialRows: initialDims.rows,
         initialCols: initialDims.cols,
         mode,
+        // A launcher task travels as an argument, which only the helper can
+        // pass without any shell quoting.
+        launchHelper: isFeatureFlagEnabled("launchHelper") || (mode === "terminal" && (!!opts?.initialPrompt?.trim() || !!opts?.systemPrompt?.trim() || !!opts?.agentLaunch)),
+        launchHelperRequired: isFeatureFlagEnabled("launchHelper"),
+        featureTracks: isFeatureFlagEnabled("featureTracks"),
+        sessionHost: isFeatureFlagEnabled("sessionHost"),
+        initialPrompt: mode === "terminal" ? opts?.initialPrompt?.trim() || null : null,
+        systemPrompt: mode === "terminal" ? opts?.systemPrompt?.trim() || null : null,
+        seedPrompt: opts?.seedPrompt || null,
+        parentSessionId: opts?.parentSessionId || null,
+        // 2.0: the model, effort and account (and "login" for Add account)
+        // travel in the launch file, so only the helper can carry them.
+        agentLaunch: mode === "terminal" ? opts?.agentLaunch ?? null : null,
       });
 
       // Agent mode: the backend `create_session` skipped PTY spawn for us.
@@ -1845,12 +2190,24 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         // the SDK hasn't yet persisted (the visible failure was the
         // "No conversation found with session ID" stderr).
         claudeAddDirs.current.set(session.id, [...session.workspace_paths]);
+        // Task launcher (F15): the task is the conversation's first message,
+        // sent once the agent is up.
+        const firstMessage = opts?.initialPrompt?.trim() ? buildUserEnvelope(opts.initialPrompt.trim(), []) : null;
         spawnAgentSession({
           sessionId: session.id,
           workingDir: session.working_directory,
           addDirs: session.workspace_paths,
         })
-          .then((uuid) => { claudeUuids.current.set(session.id, uuid); })
+          .then(async (uuid) => {
+            claudeUuids.current.set(session.id, uuid);
+            if (!firstMessage) return;
+            try {
+              await echoUserEnvelope(session.id, firstMessage);
+              await sendUserEnvelope(session.id, firstMessage);
+            } catch (err) {
+              console.warn("[SessionContext] Failed to send the task as the first message:", err);
+            }
+          })
           .catch((err) => {
             console.error("[SessionContext] Failed to spawn Claude agent:", err);
             void reportAgentSpawnFailure({
@@ -1882,14 +2239,13 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       dispatch({ type: "SESSION_UPDATED", session });
       dispatch({ type: "SET_ACTIVE", id: session.id });
       trackSessionCreated({
-        execution_mode: defaultModeRef.current,
         has_ai_provider: !!opts?.aiProvider,
       });
 
-      // Warn about shared worktrees via custom event (App.tsx listens for this)
-      if (sharedBranches.length > 0) {
+      // Say what reusing a checkout means via custom event (App.tsx listens for this)
+      if (reusedCheckouts.length > 0) {
         window.dispatchEvent(new CustomEvent("hermes:shared-worktree", {
-          detail: { branches: sharedBranches, sessionLabel: session.label },
+          detail: { reused: reusedCheckouts, sessionLabel: session.label },
         }));
       }
 
@@ -1935,9 +2291,6 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     }
   }, [dispatch]);
 
-  const defaultModeRef = useRef(state.defaultMode);
-  defaultModeRef.current = state.defaultMode;
-
   const skipCloseConfirmRef = useRef(state.skipCloseConfirm);
   skipCloseConfirmRef.current = state.skipCloseConfirm;
 
@@ -1948,33 +2301,28 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         const projects = await getSessionProjects(id);
         const dirtyChanges: DirtyWorktreeChange[] = [];
 
+        const honest = isFeatureFlagEnabled("honestIsolation");
         for (const project of projects) {
+          // Only a checkout this session owns alone is deleted on close,
+          // so only its changes need a decision. A checkout shared with
+          // another session (or, with honest isolation, the project
+          // folder) is left as it is, changes included.
+          let wtInfo: SessionWorktree | null = null;
           try {
-            const changes = await worktreeHasChanges(id, project.id);
-            if (changes.has_changes) {
-              let branchName: string | null = null;
-              try {
-                const wtInfo = await getSessionWorktreeInfo(id, project.id);
-                branchName = wtInfo?.branchName ?? null;
-              } catch {
-                // Worktree info not available — continue without branch name
-              }
-              dirtyChanges.push({
-                projectId: project.id,
-                projectName: project.name,
-                branchName,
-                files: changes.files,
-              });
-            }
+            wtInfo = await getSessionWorktreeInfo(id, project.id);
           } catch {
-            // IPC failure for this project — don't block close
+            // Worktree info not available — continue without it
           }
+          if (!shouldAskAboutChangesOnClose(wtInfo, honest)) continue;
+          // A check that fails is a question too (never a silent delete).
+          const entry = await closeCheckEntry(id, project, wtInfo?.branchName ?? null, worktreeHasChanges);
+          if (entry) dirtyChanges.push(entry);
         }
 
         if (dirtyChanges.length > 0) {
           const session = stateRef.current.sessions[id];
           const label = session?.label || id;
-          setPendingDirtyClose({ sessionId: id, label, changes: dirtyChanges });
+          setPendingDirtyClose({ sessionId: id, label, changes: dirtyChanges, agentWorking: session?.phase === "busy" });
           return;
         }
       } catch {
@@ -1995,18 +2343,26 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   }, [closeSession, dispatch]);
 
   // ─── Dirty worktree dialog handlers ─────────────────────────────────
+  // The choice made in the Uncommitted Changes dialog is the confirmation:
+  // no second "Close session?" follows it.
+
+  /** Folders kept on disk (not deleted on close): say where they are. */
+  const announceKept = useCallback((paths: string[]) => {
+    if (paths.length === 0) return;
+    window.dispatchEvent(new CustomEvent("hermes:worktrees-kept", { detail: { paths } }));
+  }, []);
 
   const handleDirtyStashAndClose = useCallback(async () => {
     if (!pendingDirtyClose) return;
     const { sessionId, changes } = pendingDirtyClose;
     const failures: Array<{ projectName: string; error: string }> = [];
     for (const change of changes) {
+      if (change.files.length === 0) continue;
       try {
         await stashWorktree(sessionId, change.projectId, "Auto-stash before closing session");
       } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
         console.warn("[SessionContext] Failed to stash worktree:", e);
-        failures.push({ projectName: change.projectName, error: message });
+        failures.push({ projectName: change.projectName, error: plainGitError(e) });
       }
     }
     if (failures.length > 0) {
@@ -2015,29 +2371,138 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       return;
     }
     setPendingDirtyClose(null);
-    // All stashes succeeded — proceed with close
-    if (skipCloseConfirmRef.current) {
-      closeSession(sessionId);
-    } else {
-      dispatch({ type: "REQUEST_CLOSE_SESSION", id: sessionId });
+    closeSession(sessionId);
+  }, [pendingDirtyClose, closeSession]);
+
+  /**
+   * Save the work, then close: the session's link to each worktree goes
+   * first (so stopping it leaves the folders), the session — and the agent
+   * in it — stops, and only then is each folder committed ("session" on the
+   * branch the dialog named, "archive" on a new hermes-archive/ branch,
+   * "detached" keeping a detached HEAD's commits on a branch) and removed.
+   * Nothing the agent writes after the choice is lost. What cannot be
+   * saved stays on disk and the dialog says why.
+   */
+  const saveDirtyAndClose = useCallback(async (kind: "session" | "archive" | "detached") => {
+    if (!pendingDirtyClose) return;
+    const pending = pendingDirtyClose;
+    const { sessionId, label, changes } = pending;
+    const message = closeCommitMessage(label, kind === "archive" ? "archive" : "session");
+    const kept: Record<string, string> = { ...(pending.kept ?? {}) };
+    if (!pending.closed) {
+      const failures: Array<{ projectName: string; error: string }> = [];
+      for (const c of changes) {
+        if (kept[c.projectId]) continue;
+        try {
+          kept[c.projectId] = await keepWorktree(sessionId, c.projectId);
+        } catch (e) {
+          failures.push({ projectName: c.projectName, error: plainGitError(e) });
+        }
+      }
+      if (failures.length > 0) {
+        setPendingDirtyClose((prev) => prev ? { ...prev, kept, stashErrors: failures } : null);
+        return;
+      }
+      await closeSession(sessionId);
     }
-  }, [pendingDirtyClose, closeSession, dispatch]);
+
+    const remaining: Record<string, string> = {};
+    const keptForGood: string[] = [];
+    const failures: Array<{ projectName: string; error: string }> = [];
+    let refusal: PendingHookRefusal | null = null;
+    for (const c of changes) {
+      const path = kept[c.projectId];
+      if (!path) continue;
+      // Edits inside a submodule cannot be committed from here, and a
+      // worktree that could not be checked is never deleted.
+      if (c.checkError || (c.dirtySubmodules?.length ?? 0) > 0) {
+        keptForGood.push(path);
+        continue;
+      }
+      try {
+        if (c.detached && ((c.lostCommits ?? 0) > 0 || c.files.length > 0)) {
+          await saveKeptDetachedHead(c.projectId, path, c.branchName, c.files.length > 0 ? message : null);
+        } else if (c.files.length > 0) {
+          await commitKeptWorktree(
+            c.projectId,
+            path,
+            message,
+            kind === "archive" ? "archive" : "session",
+            kind === "archive" ? null : (c.actualBranch ?? c.branchName),
+          );
+        }
+        // An archive leaves the files as they were (they are on the
+        // hermes-archive/ branch now): the folder may go with them.
+        await removeLeftoverWorktree(c.projectId, path, sessionId, kind === "archive" && c.files.length > 0);
+      } catch (e) {
+        remaining[c.projectId] = path;
+        const hook = parseHookRefusal(e);
+        if (hook && !refusal) refusal = { projectName: c.projectName, ...hook };
+        else failures.push({ projectName: c.projectName, error: plainGitError(e) });
+      }
+    }
+    announceKept(keptForGood);
+    if (Object.keys(remaining).length > 0) {
+      setPendingDirtyClose((prev) => prev ? {
+        ...prev,
+        closed: true,
+        kept: remaining,
+        changes: prev.changes.filter((c) => remaining[c.projectId]),
+        hookRefusal: refusal,
+        stashErrors: failures.length > 0 ? failures : undefined,
+      } : null);
+      return;
+    }
+    setPendingDirtyClose(null);
+  }, [pendingDirtyClose, closeSession, announceKept]);
+
+  const handleDirtyCommitAndClose = useCallback(() => saveDirtyAndClose("session"), [saveDirtyAndClose]);
+  const handleDirtyArchiveAndClose = useCallback(() => saveDirtyAndClose("archive"), [saveDirtyAndClose]);
+  const handleDirtySaveDetachedAndClose = useCallback(() => saveDirtyAndClose("detached"), [saveDirtyAndClose]);
+
+  /** Keep every worktree in the dialog on disk (with its branch) and close. */
+  const handleDirtyKeepAndClose = useCallback(async () => {
+    if (!pendingDirtyClose) return;
+    const { sessionId, changes } = pendingDirtyClose;
+    const paths: string[] = Object.values(pendingDirtyClose.kept ?? {});
+    if (!pendingDirtyClose.closed) {
+      const failures: Array<{ projectName: string; error: string }> = [];
+      for (const c of changes) {
+        try {
+          paths.push(await keepWorktree(sessionId, c.projectId));
+        } catch (e) {
+          failures.push({ projectName: c.projectName, error: plainGitError(e) });
+        }
+      }
+      if (failures.length > 0) {
+        setPendingDirtyClose((prev) => prev ? { ...prev, stashErrors: failures } : null);
+        return;
+      }
+      setPendingDirtyClose(null);
+      await closeSession(sessionId);
+    } else {
+      setPendingDirtyClose(null);
+    }
+    announceKept(paths);
+  }, [pendingDirtyClose, closeSession, announceKept]);
 
   const handleDirtyCloseAnyway = useCallback(() => {
     if (!pendingDirtyClose) return;
-    const { sessionId } = pendingDirtyClose;
+    const { sessionId, closed } = pendingDirtyClose;
     setPendingDirtyClose(null);
-    // Proceed with close without stashing
-    if (skipCloseConfirmRef.current) {
-      closeSession(sessionId);
-    } else {
-      dispatch({ type: "REQUEST_CLOSE_SESSION", id: sessionId });
+    if (closed) {
+      announceKept(Object.values(pendingDirtyClose.kept ?? {}));
+      return;
     }
-  }, [pendingDirtyClose, closeSession, dispatch]);
+    // Discard: closing removes the worktree with everything in it.
+    closeSession(sessionId);
+  }, [pendingDirtyClose, closeSession, announceKept]);
 
   const handleDirtyCancelClose = useCallback(() => {
+    // After the session was stopped, its folders stay where they are.
+    if (pendingDirtyClose?.closed) announceKept(Object.values(pendingDirtyClose.kept ?? {}));
     setPendingDirtyClose(null);
-  }, []);
+  }, [pendingDirtyClose, announceKept]);
 
   const setActive = useCallback((id: string | null) => {
     dispatch({ type: "SET_ACTIVE", id });
@@ -2046,13 +2511,19 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   // stateRef is declared above closeSession
   stateRef.current = state;
 
-  const saveWorkspace = useCallback(async () => {
-    // Never save during an active restore — we'd overwrite partial state
-    if (workspaceRestoreInProgress) return;
+  const writeWorkspace = useCallback(async () => {
+    // Never save before the launch's restore has settled or during it —
+    // we'd overwrite the saved workspace with an empty or partial one.
+    if (!workspaceLoaded || workspaceRestoreInProgress) return;
 
     const current = stateRef.current;
     const liveSessions = Object.values(current.sessions).filter((s) => s.phase !== "destroyed");
     if (liveSessions.length === 0) {
+      // Nothing was restored and no session was opened since: the saved
+      // workspace is still the user's, not a stale one.
+      if (keepSavedWorkspace) return;
+    }
+    if (liveSessions.length === 0 && unrestoredSessions.current.length === 0) {
       // Clear stale workspace so closed sessions don't reappear on next launch
       await setSetting("saved_workspace", "").catch(console.error);
       return;
@@ -2089,6 +2560,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
             permission_mode: s.permission_mode ?? "default",
             custom_prefix: s.custom_prefix ?? "",
             custom_suffix: s.custom_suffix ?? "",
+            ...(s.agent_command ? { agent_name: s.agent_name ?? "", agent_command: s.agent_command } : {}),
             project_ids: projectIds,
             ssh_info: s.ssh_info || null,
             mode: s.mode ?? "terminal",
@@ -2096,6 +2568,12 @@ export function SessionProvider({ children }: { children: ReactNode }) {
             // saved JSON small and avoids stamping stale defaults on
             // terminal-mode sessions.
             ...(claudeUuid ? { claude_session_uuid: claudeUuid } : {}),
+            ...(s.vendor_session_id ? { vendor_session_id: s.vendor_session_id } : {}),
+            ...(s.parent_session_id ? { parent_session_id: s.parent_session_id } : {}),
+            // 2.0: a terminal agent's model, effort and account (not a sign-in session).
+            ...(s.agent_launch && !s.agent_launch.login && (s.agent_launch.modelId || s.agent_launch.effort || s.agent_launch.accountId)
+              ? { agent_launch: { modelId: s.agent_launch.modelId ?? null, effort: s.agent_launch.effort ?? null, accountId: s.agent_launch.accountId ?? null } }
+              : {}),
             ...(agentModel ? { agent_model: agentModel } : {}),
             ...(agentPerm ? { agent_permission_mode: agentPerm } : {}),
             ...(agentEffort ? { agent_effort: agentEffort } : {}),
@@ -2107,7 +2585,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       // 3. Serialize workspace state with version stamp
       const workspace: SavedWorkspace = {
         version: SAVED_WORKSPACE_VERSION,
-        sessions: sessionInfos,
+        sessions: withUnrestoredSessions(sessionInfos, unrestoredSessions.current),
         layout: current.layout.root,
         focused_pane_id: current.layout.focusedPaneId,
         active_session_id: current.activeSessionId,
@@ -2127,6 +2605,12 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       console.error("[SessionContext] Failed to save workspace:", err);
     }
   }, []);
+
+  const saveWorkspace = useCallback((): Promise<void> => {
+    const run = saveChain.then(() => writeWorkspace());
+    saveChain = run.catch(() => {});
+    return run;
+  }, [writeWorkspace]);
 
   // ─── Mode conversion (right-click "Convert to ...") ─────────────────
   // Tears down the existing subprocess for the current mode, flips the
@@ -2218,13 +2702,21 @@ export function SessionProvider({ children }: { children: ReactNode }) {
           permissionMode: session.permission_mode,
           customPrefix: session.custom_prefix,
           customSuffix: session.custom_suffix,
+          agentName: session.agent_name || null,
+          agentCommand: session.agent_command || null,
           channels: session.channels.length > 0 ? session.channels : null,
           sshHost: session.ssh_info?.host || null,
           sshPort: session.ssh_info?.port || null,
           sshUser: session.ssh_info?.user || null,
           tmuxSession: session.ssh_info?.tmux_session || null,
           sshIdentityFile: session.ssh_info?.identity_file || null,
+          sshJumpHost: session.ssh_info?.jump_host || null,
           mode: "terminal",
+          launchHelper: isFeatureFlagEnabled("launchHelper"),
+          launchHelperRequired: isFeatureFlagEnabled("launchHelper"),
+          featureTracks: isFeatureFlagEnabled("featureTracks"),
+          vendorSessionId: session.vendor_session_id ?? null,
+          sessionHost: isFeatureFlagEnabled("sessionHost"),
         });
       }
       return true;
@@ -2252,7 +2744,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
    *  The `claudeUuids` map is updated to whichever id Claude returned
    *  (same id on plain resume, new id on fork) so subsequent respawns
    *  continue from the latest active session. */
-  const respawnAgent = useCallback(async (
+  const respawnAgentNow = useCallback(async (
     sessionId: string,
     overrides: {
       model?: string | null;
@@ -2309,11 +2801,10 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     try {
       void attachInitListener(sessionId);
 
-      await closeAgentSession(sessionId).catch((err) => {
-        console.warn("[SessionContext] closeAgentSession during respawn:", err);
-      });
-
-      const newUuid = await spawnAgentSession({
+      // One backend call stops the old process and starts the new one under
+      // the session's spawn lock: restarts that overlap (a double-clicked
+      // Retry, a submit racing a card's reply) start a single process.
+      const newUuid = await restartAgentSession({
         sessionId,
         workingDir: session.working_directory,
         priorUuid,
@@ -2342,6 +2833,26 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       return false;
     }
   }, [attachInitListener]);
+
+  /** `respawnAgentNow` behind the per-session respawn lock. */
+  const respawnAgent = useCallback((
+    sessionId: string,
+    overrides: {
+      model?: string | null;
+      permissionMode?: string | null;
+      effort?: string | null;
+    },
+  ): Promise<boolean> => {
+    const carriesSettings =
+      overrides.model !== undefined ||
+      overrides.permissionMode !== undefined ||
+      overrides.effort !== undefined;
+    return respawnQueue.current.run(
+      sessionId,
+      { joinable: !carriesSettings && !respawnJoinDisabledForTest() },
+      () => respawnAgentNow(sessionId, overrides),
+    );
+  }, [respawnAgentNow]);
 
   // Switch the active model on a live agent-mode session.  Claude's
   // stream-json subprocess takes the model as a spawn-time flag, and the
@@ -2410,10 +2921,10 @@ export function SessionProvider({ children }: { children: ReactNode }) {
    * Send a user message to a Claude agent session, auto-respawning the
    * subprocess if it has exited between turns.
    *
-   * Claude's `claude --print --output-format stream-json --input-format stream-json`
-   * is one-shot per spawn — after each turn the subprocess emits its
-   * `result` event and exits.  To keep a multi-turn conversation alive we
-   * have to spawn a fresh child for every user message, passing
+   * The Agent view runs a per-session Node bridge (the Claude Agent SDK
+   * behind a stream-json wire format, see `src-tauri/bridge/`), and that
+   * subprocess can exit between turns.  To keep a multi-turn conversation
+   * alive we spawn a fresh child when needed, passing
    * `--resume <claude-session-uuid>` so the same conversation thread is
    * loaded.  This function papers over that lifecycle: callers just submit;
    * we transparently bring the subprocess back if it's gone.
@@ -2432,6 +2943,23 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     // Echo first so the user sees their own message immediately even if
     // we're about to respawn the subprocess.
     await echoUserEnvelope(sessionId, envelope);
+
+    // Auto-name unnamed agent sessions from the first user message
+    // (issue #1). Cheap heuristic — no model round-trip; the first
+    // message is already a great summary. Fire-and-forget so the
+    // persist doesn't block the send.
+    if (!autoNamedSessions.current.has(sessionId)) {
+      const sess = stateRef.current.sessions[sessionId];
+      if (sess?.mode === "agent" && isDefaultSessionLabel(sess.label)) {
+        const derived = deriveSessionLabelFromMessage(draft);
+        if (derived) {
+          autoNamedSessions.current.add(sessionId);
+          updateSessionLabel(sessionId, derived).catch((err) =>
+            console.warn(`[SessionContext] auto-name failed for ${sessionId}:`, err),
+          );
+        }
+      }
+    }
 
     // Apply any queued flag changes (model / permission mode / effort)
     // BEFORE the send.  This is the production-bug fix: forking with no
@@ -2564,19 +3092,87 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     return () => clearInterval(interval);
   }, []);
 
+  // Once loaded, and whenever a session opens or closes, the saved workspace
+  // is rewritten right away, not on the next 10 s tick, so a quit or crash
+  // right after neither loses a session nor brings a closed one back.
+  useSaveWorkspaceOnChange(Object.keys(state.sessions), workspaceReady, saveWorkspace);
+  // Once a session exists in this run, the workspace saved before the launch
+  // is replaced by what the user has now, even when that is nothing.
+  const hasLiveSession = Object.values(state.sessions).some((s) => s.phase !== "destroyed");
+  useEffect(() => {
+    if (workspaceReady && hasLiveSession) keepSavedWorkspace = false;
+  });
+  // Every quit the backend can hold waits for this write first.
+  useWorkspaceFlushOnQuit(saveWorkspace);
+  // Test builds only: a scenario starts a terminal agent with a launch choice.
+  useEffect(() => {
+    if (import.meta.env.VITE_HERMES_E2E !== "1") return;
+    setE2ESessionBridge({
+      createSession: (opts) => createSession(opts),
+      show: (id) => {
+        const layout = stateRef.current.layout;
+        if (!layout.root) dispatch({ type: "INIT_PANE", sessionId: id });
+        else if (layout.focusedPaneId) dispatch({ type: "SET_PANE_SESSION", paneId: layout.focusedPaneId, sessionId: id });
+      },
+    });
+    return () => setE2ESessionBridge(null);
+  }, [createSession]);
+
   return (
     <SessionContext.Provider value={{ state, dispatch, createSession, closeSession, requestCloseSession, setActive, saveWorkspace, convertSessionMode, switchAgentModel, switchAgentPermissionMode, switchAgentEffort, submitAgentMessage, sendAgentEnvelope, respawnAgent: (sessionId) => respawnAgent(sessionId, {}) }}>
       {children}
       {pendingDirtyClose && (
+        <Suspense fallback={null}>
         <DirtyWorktreeDialog
           sessionId={pendingDirtyClose.sessionId}
           sessionLabel={pendingDirtyClose.label}
           changes={pendingDirtyClose.changes}
           stashErrors={pendingDirtyClose.stashErrors}
+          variant={isFeatureFlagEnabled("honestIsolation") ? "commit" : "stash"}
+          agentWorking={pendingDirtyClose.agentWorking}
+          closed={pendingDirtyClose.closed}
+          keptPaths={pendingDirtyClose.kept}
+          hookRefusal={pendingDirtyClose.hookRefusal ?? null}
           onStashAndClose={handleDirtyStashAndClose}
+          onCommitAndClose={handleDirtyCommitAndClose}
+          onArchiveAndClose={handleDirtyArchiveAndClose}
+          onSaveDetachedAndClose={handleDirtySaveDetachedAndClose}
+          onKeepAndClose={handleDirtyKeepAndClose}
           onCloseAnyway={handleDirtyCloseAnyway}
           onCancel={handleDirtyCancelClose}
         />
+        </Suspense>
+      )}
+      {pendingBranchConflict && (
+        <Suspense fallback={null}>
+        <BranchConflictDialog
+          key={`${pendingBranchConflict.conflict.projectId}:${pendingBranchConflict.conflict.branch}`}
+          branchName={pendingBranchConflict.conflict.branch}
+          heldBy={pendingBranchConflict.heldBy}
+          path={pendingBranchConflict.conflict.path}
+          localBranches={pendingBranchConflict.localBranches}
+          onUseExisting={(name) => {
+            setPendingBranchConflict(null);
+            pendingBranchConflict.resolve({ kind: "existing-branch", name });
+          }}
+          onReuse={() => {
+            setPendingBranchConflict(null);
+            pendingBranchConflict.resolve({ kind: "reuse" });
+          }}
+          onCreateNewBranch={(name) => {
+            setPendingBranchConflict(null);
+            pendingBranchConflict.resolve({ kind: "new-branch", name });
+          }}
+          onRemoveLeftover={pendingBranchConflict.conflict.leftover ? () => {
+            setPendingBranchConflict(null);
+            pendingBranchConflict.resolve({ kind: "remove-leftover" });
+          } : undefined}
+          onCancel={() => {
+            setPendingBranchConflict(null);
+            pendingBranchConflict.resolve({ kind: "cancel" });
+          }}
+        />
+        </Suspense>
       )}
     </SessionContext.Provider>
   );
@@ -2587,7 +3183,6 @@ export function useSession() {
   if (!ctx) throw new Error("useSession must be used within SessionProvider");
   return ctx;
 }
-
 // ─── Derived hooks (memoized) ───────────────────────────────────────
 
 export function useActiveSession(): SessionData | null {
@@ -2602,7 +3197,9 @@ export function useSessionList(): SessionData[] {
 
 /**
  * Orders sessions to match the sidebar visual order:
- * named groups (alphabetically) → ungrouped, with destroyed sessions last within each group.
+ * named groups (alphabetically) → ungrouped, with destroyed sessions last
+ * within each group and a handed-off session right under the one it came
+ * from. ⌘1–9, the palette's ⌘1–9 labels and the sidebar all use this order.
  */
 export function sidebarOrderSessions(sessions: SessionData[]): SessionData[] {
   const grouped = new Map<string | null, SessionData[]>();
@@ -2614,11 +3211,13 @@ export function sidebarOrderSessions(sessions: SessionData[]): SessionData[] {
   }
   // Sort within each group: destroyed sessions last
   const sortGroup = (list: SessionData[]) =>
-    [...list].sort((a, b) => {
-      const aD = a.phase === "destroyed" ? 1 : 0;
-      const bD = b.phase === "destroyed" ? 1 : 0;
-      return aD - bD;
-    });
+    nestUnderParents(
+      [...list].sort((a, b) => {
+        const aD = a.phase === "destroyed" ? 1 : 0;
+        const bD = b.phase === "destroyed" ? 1 : 0;
+        return aD - bD;
+      }),
+    );
   // Named groups alphabetically, then ungrouped
   const namedKeys = Array.from(grouped.keys())
     .filter((g): g is string => g !== null)
@@ -2667,12 +3266,6 @@ export function useTotalTokens(): { input: number; output: number } {
   }, [state.sessions]);
 }
 
-export function useExecutionMode(sessionId: string | null): ExecutionMode {
-  const { state } = useSession();
-  if (!sessionId) return state.defaultMode;
-  return state.executionModes[sessionId] || state.defaultMode;
-}
-
 /**
  * Read this session's composer draft + height + expanded flag. Returns
  * sensible defaults (empty draft, 120px height, collapsed) when the session
@@ -2692,7 +3285,3 @@ export function useComposer(sessionId: string): { draft: string; height: number;
   return { draft: "", height: 120, expanded: expandedDefault };
 }
 
-export function useAutonomousSettings() {
-  const { state } = useSession();
-  return state.autonomousSettings;
-}

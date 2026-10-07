@@ -1,87 +1,47 @@
 import "../styles/components/ShortcutsPanel.css";
-import { useEffect } from "react";
+import { useRef } from "react";
+import { useFocusTrap } from "../hooks/useFocusTrap";
 import { fmt } from "../utils/platform";
+import { useI18n } from "../i18n/I18nProvider";
+import { CloseButton } from "./ui";
+import { isFeatureFlagEnabled } from "../featureFlags";
+import { GENERATED_SHORTCUT_GROUPS } from "../generated/shortcuts";
+import { visibleShortcutGroups } from "../utils/shortcuts";
 
-export interface Shortcut {
-  keys: string;
-  action: string;
-}
-
-export interface ShortcutGroup {
-  label: string;
-  shortcuts: Shortcut[];
-}
-
-export const SHORTCUT_GROUPS: ShortcutGroup[] = [
-  {
-    label: "General",
-    shortcuts: [
-      { keys: "{mod}N", action: "New Session" },
-      { keys: "{mod}W", action: "Close Pane / Session" },
-      { keys: "{mod}K / {mod}{shift}P", action: "Command Palette" },
-      { keys: "{mod},", action: "Settings" },
-      { keys: "{mod}/", action: "Keyboard Shortcuts" },
-      { keys: "{mod}J", action: "Prompt Composer" },
-      { keys: "{mod}{shift}C", action: "Copy Context" },
-      { keys: "{mod}{shift}F", action: "Search in Folder" },
-      { keys: "{mod}{shift}Z", action: "Toggle Flow Mode" },
-    ],
-  },
-  {
-    label: "Panels",
-    shortcuts: [
-      { keys: "{mod}B", action: "Toggle Sidebar" },
-      { keys: "{mod}E", action: "Toggle Context Panel" },
-      { keys: "{mod}P", action: "Processes" },
-      { keys: "{mod}G", action: "Git" },
-      { keys: "{mod}F", action: "Files" },
-      { keys: "{mod}T", action: "Toggle Timeline" },
-      { keys: "{mod}$", action: "Cost Dashboard" },
-    ],
-  },
-  {
-    label: "Panes & Sessions",
-    shortcuts: [
-      { keys: "{mod}D", action: "Split Horizontal" },
-      { keys: "{mod}{shift}D", action: "Split Vertical" },
-      { keys: "{mod}{alt}→", action: "Focus Next Pane" },
-      { keys: "{mod}{alt}←", action: "Focus Previous Pane" },
-      { keys: "{mod}1-9", action: "Switch to Session" },
-    ],
-  },
-];
+// The shortcuts shown here are generated from src-tauri/src/menu/mod.rs (the
+// app's native menu bar) and src/shortcuts/app-shortcuts.json (the bindings
+// the app handles itself) by `node scripts/generate-shortcuts.mjs` — see
+// src/generated/shortcuts.ts. Regenerate that file instead of editing shortcuts
+// by hand here; a shortcut added, changed or removed in either source is what
+// changes what this panel and docs/shortcuts.md show.
+const VISIBLE_SHORTCUT_GROUPS = visibleShortcutGroups(GENERATED_SHORTCUT_GROUPS);
 
 interface ShortcutsPanelProps {
   onClose: () => void;
 }
 
 export function ShortcutsPanel({ onClose }: ShortcutsPanelProps) {
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopImmediatePropagation();
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [onClose]);
+  const { t } = useI18n();
+  // The keyboard is the panel's while it is open (not the terminal behind
+  // it); Esc closes it.
+  const panelRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(panelRef, { onEscape: onClose });
 
   return (
-    <div className="shortcuts-overlay" onClick={onClose} role="dialog" aria-modal="true">
-      <div className="shortcuts-panel" onClick={(e) => e.stopPropagation()}>
+    <div className="shortcuts-overlay" onClick={onClose} role="dialog" aria-modal="true" aria-label={t("shortcuts.title")}>
+      <div ref={panelRef} className="shortcuts-panel" tabIndex={-1} onClick={(e) => e.stopPropagation()}>
         <div className="shortcuts-header">
-          <span className="shortcuts-title">Keyboard Shortcuts</span>
-          <button className="close-btn shortcuts-close" onClick={onClose} aria-label="Close">&times;</button>
+          <span className="shortcuts-title">{t("shortcuts.title")}</span>
+          <CloseButton className="shortcuts-close" onClick={onClose} label={t("common.close")} />
         </div>
         <div className="shortcuts-body">
-          {SHORTCUT_GROUPS.map((group) => (
-            <div key={group.label} className="shortcuts-group">
-              <div className="shortcuts-group-label">{group.label}</div>
+          {VISIBLE_SHORTCUT_GROUPS.map((group) => (
+            <div key={group.group} className="shortcuts-group">
+              <div className="shortcuts-group-label">{t(group.groupKey)}</div>
               <div className="shortcuts-table">
                 {group.shortcuts.map((s) => (
-                  <div key={s.keys} className="shortcuts-row">
-                    <span className="shortcuts-action">{s.action}</span>
+                  <div key={s.id} className="shortcuts-row" data-shortcut-id={s.id}>
+                    <span className="shortcuts-action">{s.id === "view.git-panel" && isFeatureFlagEnabled("reviewDesk") ? t("palette.reviewDesk") : t(s.labelKey)}</span>
                     <kbd className="shortcuts-kbd">{fmt(s.keys)}</kbd>
                   </div>
                 ))}

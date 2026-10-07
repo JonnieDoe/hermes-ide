@@ -7,7 +7,6 @@
  * - Mutual-exclusion tests (search closes other panels, other panels close search)
  * - Race condition guard (sequence counter logic)
  * - UI state guards (min chars, no session)
- * - ShortcutsPanel accuracy
  */
 import { describe, it, expect, vi } from "vitest";
 
@@ -34,7 +33,6 @@ vi.mock("../utils/notifications", () => ({
 // ─── Imports ─────────────────────────────────────────────────────────
 import { sessionReducer, initialState } from "../state/SessionContext";
 import { highlightMatch, formatResultCount, debounce } from "../components/SearchPanel";
-import { SHORTCUT_GROUPS } from "../components/ShortcutsPanel";
 import type { SearchMatch, SearchFileResult, SearchResponse } from "../types/git";
 
 // ─── highlightMatch ──────────────────────────────────────────────────
@@ -384,38 +382,6 @@ describe("UI state guards", () => {
 describe("Initial state includes search", () => {
   it("has searchPanelOpen=false", () => {
     expect(initialState.ui.searchPanelOpen).toBe(false);
-  });
-});
-
-// ─── ShortcutsPanel accuracy ─────────────────────────────────────────
-
-describe("ShortcutsPanel accuracy", () => {
-  const allShortcuts = SHORTCUT_GROUPS.flatMap((g) => g.shortcuts);
-  const findShortcut = (keys: string) => allShortcuts.find((s) => s.keys === keys);
-
-  it("{mod}{shift}F is mapped to Search in Folder, not Flow Mode", () => {
-    const s = findShortcut("{mod}{shift}F");
-    expect(s).toBeDefined();
-    expect(s!.action).toBe("Search in Folder");
-    expect(s!.action).not.toContain("Flow");
-  });
-
-  it("{mod}{shift}Z is mapped to Toggle Flow Mode", () => {
-    const s = findShortcut("{mod}{shift}Z");
-    expect(s).toBeDefined();
-    expect(s!.action).toBe("Toggle Flow Mode");
-  });
-
-  it("left-panel tabs are listed ({mod}P, {mod}G, {mod}F)", () => {
-    expect(findShortcut("{mod}P")).toBeDefined();
-    expect(findShortcut("{mod}G")).toBeDefined();
-    expect(findShortcut("{mod}F")).toBeDefined();
-  });
-
-  it("no duplicate key bindings", () => {
-    const keys = allShortcuts.map((s) => s.keys);
-    const unique = new Set(keys);
-    expect(unique.size).toBe(keys.length);
   });
 });
 

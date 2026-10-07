@@ -3,6 +3,8 @@ import "../styles/components/UsagePanel.css";
 import type { SessionData } from "../types/session";
 import { useAgentUsage } from "../agent/useAgentUsage";
 import type { RateLimitInfo } from "../agent/types";
+import { useI18n } from "../i18n/I18nProvider";
+import { getAgent } from "../catalog/agentCatalog";
 
 interface UsagePanelProps {
   session: SessionData;
@@ -11,16 +13,16 @@ interface UsagePanelProps {
 // Match Claude.ai Settings → Usage labels.  The SDK's `rateLimitType`
 // strings vary across plans / model tiers; we map the known ones to the
 // website's wording and fall through to a humanized fallback otherwise.
-const RATE_LIMIT_LABELS: Record<string, string> = {
-  five_hour: "Current session",
-  five_hour_limit: "Current session",
-  weekly: "Weekly · all models",
-  weekly_all_models: "Weekly · all models",
-  weekly_sonnet: "Weekly · Sonnet only",
-  weekly_opus: "Weekly · Opus only",
-  weekly_haiku: "Weekly · Haiku only",
-  daily: "Daily window",
-  default: "Active window",
+const RATE_LIMIT_LABEL_KEYS: Record<string, string> = {
+  five_hour: "usage.currentSession",
+  five_hour_limit: "usage.currentSession",
+  weekly: "usage.weeklyAllModels",
+  weekly_all_models: "usage.weeklyAllModels",
+  weekly_sonnet: "usage.weeklySonnet",
+  weekly_opus: "usage.weeklyOpus",
+  weekly_haiku: "usage.weeklyHaiku",
+  daily: "usage.dailyWindow",
+  default: "usage.activeWindow",
 };
 
 const RATE_LIMIT_ORDER = [
@@ -53,7 +55,9 @@ function formatNumber(n: number | undefined): string {
  * "resets in 2h 14m" or "resets in 4d 2h", and "now" once the deadline
  * has passed.
  */
-function formatCountdown(target: number | string | undefined, now: number): string {
+type Translate = (key: string, values?: Record<string, string | number>) => string;
+
+function formatCountdown(target: number | string | undefined, now: number, t: Translate): string {
   if (target === undefined) return "—";
   let ts: number;
   if (typeof target === "number") ts = target;
@@ -68,15 +72,15 @@ function formatCountdown(target: number | string | undefined, now: number): stri
   // until the next limit check.  "fresh window" reads accurately;
   // "resets now" implied the user was about to be unlocked, which was
   // the wrong mental model.
-  if (ms <= 0) return "fresh window";
+  if (ms <= 0) return t("usage.freshWindow");
   const sec = Math.floor(ms / 1000);
   const days = Math.floor(sec / 86400);
   const hours = Math.floor((sec % 86400) / 3600);
   const mins = Math.floor((sec % 3600) / 60);
-  if (days > 0) return `resets in ${days}d ${hours}h`;
-  if (hours > 0) return `resets in ${hours}h ${mins}m`;
-  if (mins > 0) return `resets in ${mins}m`;
-  return `resets in ${sec}s`;
+  if (days > 0) return t("usage.resetsInDaysHours", { days, hours });
+  if (hours > 0) return t("usage.resetsInHoursMinutes", { hours, minutes: mins });
+  if (mins > 0) return t("usage.resetsInMinutes", { minutes: mins });
+  return t("usage.resetsInSeconds", { seconds: sec });
 }
 
 function formatAbsolute(target: number | string | undefined): string {
@@ -134,10 +138,12 @@ function formatStatus(status: string | undefined): string {
 }
 
 function RateLimitRow({ kind, info, now }: { kind: string; info: RateLimitInfo; now: number }) {
-  const label = RATE_LIMIT_LABELS[kind] ?? formatStatus(kind);
+  const { t } = useI18n();
+  const labelKey = RATE_LIMIT_LABEL_KEYS[kind];
+  const label = labelKey ? t(labelKey) : formatStatus(kind);
   const pct = extractUtilizationPct(info);
   const tone = pct === null ? "neutral" : pct >= 95 ? "danger" : pct >= 80 ? "warn" : "ok";
-  const countdown = formatCountdown(info.resetsAt, now);
+  const countdown = formatCountdown(info.resetsAt, now, t);
   const absolute = formatAbsolute(info.resetsAt);
   const overage = info.isUsingOverage === true;
 
@@ -173,9 +179,9 @@ function RateLimitRow({ kind, info, now }: { kind: string; info: RateLimitInfo; 
         <div className="usage-overage">
           <span className="usage-overage-glyph" aria-hidden="true">⟳</span>
           <span>
-            Extra usage active
+            {t("usage.extraActive")}
             {info.overageResetsAt !== undefined &&
-              ` · ${formatCountdown(info.overageResetsAt, now)}`}
+              ` · ${formatCountdown(info.overageResetsAt, now, t)}`}
           </span>
         </div>
       )}
@@ -183,7 +189,32 @@ function RateLimitRow({ kind, info, now }: { kind: string; info: RateLimitInfo; 
   );
 }
 
+/** The agent a session runs (chosen at launch, else detected in its terminal); null for a plain shell. */
+export function usageAgentId(session: Pick<SessionData, "ai_provider" | "detected_agent">): string | null {
+  return session.ai_provider || session.detected_agent?.provider || null;
+}
+
+/** The panel's subtitle: which agent, and how it runs ("Claude Code · terminal"); "Shell" without one. */
+export function usageSubtitle(session: Pick<SessionData, "ai_provider" | "detected_agent" | "mode">, t: Translate): string {
+  const id = usageAgentId(session);
+  if (!id) return t("usage.shell");
+  const name = getAgent(id)?.name ?? id;
+  return `${name} · ${session.mode === "agent" ? t("usage.live") : t("usage.terminal")}`;
+}
+
+/** Why there is nothing to show for a session that does not run in Agent view, and what to do. */
+export function usageEmptyText(session: Pick<SessionData, "ai_provider" | "detected_agent">, t: Translate): string {
+  const id = usageAgentId(session);
+  if (!id) return t("usage.noAgent");
+  // Agent view (where usage is reported) exists for agents Hermes runs through their SDK.
+  if (getAgent(id)?.structured?.protocol === "claude-agent-sdk") {
+    return t("usage.terminalTask", { options: t("launcher.moreOptions", { shortcut: "" }).replace(/\s+/g, " ").trim(), runsIn: t("launcher.viewLabel"), agentView: t("launcher.viewAgent") });
+  }
+  return t("usage.claudeOnly", { agent: getAgent(id)?.name ?? id });
+}
+
 export function UsagePanel({ session }: UsagePanelProps) {
+  const { t } = useI18n();
   const isAgent = session.mode === "agent";
   const { accountInfo, rateLimits, cumulativeCostUsd, cumulativeInputTokens, cumulativeOutputTokens } =
     useAgentUsage(isAgent ? session.id : null);
@@ -218,8 +249,8 @@ export function UsagePanel({ session }: UsagePanelProps) {
   return (
     <div className="usage-panel">
       <div className="usage-panel-header">
-        <span className="usage-panel-title">USAGE</span>
-        <span className="usage-panel-subtitle">claude · live</span>
+        <span className="usage-panel-title">{t("usage.title")}</span>
+        <span className="usage-panel-subtitle">{usageSubtitle(session, t)}</span>
       </div>
 
       <div className="usage-panel-body">
@@ -227,7 +258,7 @@ export function UsagePanel({ session }: UsagePanelProps) {
           <div className="usage-empty">
             <span className="usage-empty-glyph" aria-hidden="true">∅</span>
             <span className="usage-empty-text">
-              Usage telemetry is only available for agent-mode sessions.
+              {usageEmptyText(session, t)}
             </span>
           </div>
         )}
@@ -235,12 +266,12 @@ export function UsagePanel({ session }: UsagePanelProps) {
         {isAgent && (
           <>
             <section className="usage-section">
-              <div className="usage-section-title">Account</div>
+              <div className="usage-section-title">{t("usage.account")}</div>
               {accountInfo ? (
                 <dl className="usage-kv">
                   {accountInfo.subscriptionType && (
                     <>
-                      <dt>Plan</dt>
+                      <dt>{t("usage.plan")}</dt>
                       <dd className="usage-plan">
                         {formatStatus(accountInfo.subscriptionType)}
                       </dd>
@@ -248,25 +279,25 @@ export function UsagePanel({ session }: UsagePanelProps) {
                   )}
                   {accountInfo.email && (
                     <>
-                      <dt>Email</dt>
+                      <dt>{t("usage.email")}</dt>
                       <dd className="mono">{accountInfo.email}</dd>
                     </>
                   )}
                   {accountInfo.organization && (
                     <>
-                      <dt>Org</dt>
+                      <dt>{t("usage.org")}</dt>
                       <dd>{accountInfo.organization}</dd>
                     </>
                   )}
                   {accountInfo.apiProvider && (
                     <>
-                      <dt>Provider</dt>
+                      <dt>{t("usage.provider")}</dt>
                       <dd className="mono">{accountInfo.apiProvider}</dd>
                     </>
                   )}
                   {accountInfo.tokenSource && (
                     <>
-                      <dt>Auth</dt>
+                      <dt>{t("usage.auth")}</dt>
                       <dd className="mono">{accountInfo.tokenSource}</dd>
                     </>
                   )}
@@ -274,17 +305,17 @@ export function UsagePanel({ session }: UsagePanelProps) {
               ) : (
                 <div className="usage-pending">
                   <span className="usage-pending-glyph" aria-hidden="true">⠿</span>
-                  <span>waiting for account probe…</span>
+                  <span>{t("usage.waitingAccount")}</span>
                 </div>
               )}
             </section>
 
             <section className="usage-section">
-              <div className="usage-section-title">Rate limits</div>
+              <div className="usage-section-title">{t("usage.rateLimits")}</div>
               {sortedKinds.length === 0 ? (
                 <div className="usage-pending">
                   <span className="usage-pending-glyph" aria-hidden="true">·</span>
-                  <span>no limits reported yet — sent any messages?</span>
+                  <span>{t("usage.noLimits")}</span>
                 </div>
               ) : (
                 <div className="usage-windows">
@@ -301,19 +332,19 @@ export function UsagePanel({ session }: UsagePanelProps) {
             </section>
 
             <section className="usage-section">
-              <div className="usage-section-title">This session</div>
+              <div className="usage-section-title">{t("usage.thisSession")}</div>
               <dl className="usage-kv">
-                <dt>Cost</dt>
+                <dt>{t("usage.cost")}</dt>
                 <dd className="usage-cost-value">{formatCost(totalCost)}</dd>
-                <dt>Input</dt>
+                <dt>{t("usage.input")}</dt>
                 <dd className="mono">{formatNumber(totalIn)}</dd>
-                <dt>Output</dt>
+                <dt>{t("usage.output")}</dt>
                 <dd className="mono">{formatNumber(totalOut)}</dd>
               </dl>
             </section>
 
             <div className="usage-footnote">
-              Snapshot updated on every turn. Limits reported by Claude.
+              {t("usage.footnote")}
             </div>
           </>
         )}

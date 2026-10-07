@@ -1,13 +1,29 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, Suspense } from "react";
+import { lazyView } from "../utils/lazyView";
 import "../styles/components/FilePreview.css";
 import { readFileContent, openFileInEditor, sshReadFile } from "../api/git";
 import { writeToSession } from "../api/sessions";
 import { getSetting } from "../api/settings";
 import { useSession } from "../state/SessionContext";
 import { useFileEditor } from "../hooks/useFileEditor";
-import { EditorPane } from "../editor/EditorPane";
 import type { CursorInfo, IndentConfig } from "../editor/EditorPane";
 import type { FileContent } from "../types/git";
+import { Button, IconButton } from "./ui";
+
+// The code editor (CodeMirror) loads the first time a file is edited.
+const EditorPane = lazyView("EditorPane", () => import("../editor/EditorPane").then((m) => m.EditorPane));
+
+function BackGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+      <path d="M10 3.5L5.5 8l4.5 4.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function BackButton({ onClick }: { onClick: () => void }) {
+  return <IconButton size="sm" className="file-preview-back" label="Back to files" icon={<BackGlyph />} onClick={onClick} />;
+}
 
 import type { FileHandlerProps } from "../plugins/types";
 
@@ -242,14 +258,14 @@ export function FilePreviewPanel({ sessionId, projectId, filePath, onBack, fileH
 
           if (SSH_GUI_EDITORS.has(cmd) && sshInfo) {
             // GUI editors: run locally with remote connection args
-            const host = sshInfo.port !== 22
-              ? `${sshInfo.user}@${sshInfo.host}:${sshInfo.port}`
-              : `${sshInfo.user}@${sshInfo.host}`;
+            // Blank user → bare host/alias, so ~/.ssh/config decides the user.
+            const dest = sshInfo.user ? `${sshInfo.user}@${sshInfo.host}` : sshInfo.host;
+            const host = sshInfo.port !== 22 ? `${dest}:${sshInfo.port}` : dest;
 
             if (cmd === "zed") {
               // zed ssh://user@host:port/path
               const port = sshInfo.port !== 22 ? `:${sshInfo.port}` : "";
-              return openFileInEditor(sessionId, "__ssh_local__", `ssh://${sshInfo.user}@${sshInfo.host}${port}${filePath}`, "zed");
+              return openFileInEditor(sessionId, "__ssh_local__", `ssh://${dest}${port}${filePath}`, "zed");
             } else {
               // VS Code / Cursor: --remote ssh-remote+user@host:port /path
               return openFileInEditor(sessionId, "__ssh_local__", filePath, `${cmd} --remote ssh-remote+${host}`);
@@ -315,7 +331,7 @@ export function FilePreviewPanel({ sessionId, projectId, filePath, onBack, fileH
     return (
       <div className="file-preview">
         <div className="file-preview-header">
-          <button className="file-preview-back" onClick={onBack} title="Back to files">&#9666;</button>
+          <BackButton onClick={onBack} />
           <span className="file-preview-filename">Loading...</span>
         </div>
         <div className="file-preview-placeholder">Loading file...</div>
@@ -327,7 +343,7 @@ export function FilePreviewPanel({ sessionId, projectId, filePath, onBack, fileH
     return (
       <div className="file-preview">
         <div className="file-preview-header">
-          <button className="file-preview-back" onClick={onBack} title="Back to files">&#9666;</button>
+          <BackButton onClick={onBack} />
           <span className="file-preview-filename">Error</span>
         </div>
         <div className="file-preview-placeholder">{error}</div>
@@ -355,20 +371,20 @@ export function FilePreviewPanel({ sessionId, projectId, filePath, onBack, fileH
   return (
     <div className="file-preview">
       <div className="file-preview-header">
-        <button className="file-preview-back" onClick={handleBack} title="Back to files">&#9666;</button>
+        <BackButton onClick={handleBack} />
         <span className="file-preview-filename" title={filePath}>{file.file_name}</span>
         {editMode && editor.isDirty && <span className="file-editor-dirty-dot" title="Unsaved changes" />}
         {editMode && editor.isSaving && <span className="file-editor-saving">Saving...</span>}
         {editMode && editor.saveError && <span className="file-editor-error" title={editor.saveError}>Save failed</span>}
         <span className="file-preview-lang">{file.language}</span>
         {editMode && (
-          <button className="file-preview-open-btn" onClick={() => editor.save()} disabled={!editor.isDirty} title="Save (Cmd+S)">
+          <Button size="sm" className="file-preview-open-btn" onClick={() => editor.save()} disabled={!editor.isDirty} title="Save (Cmd+S)">
             Save
-          </button>
+          </Button>
         )}
-        <button className="file-preview-open-btn" onClick={handleOpenInEditor} title={`Open in ${editorLabel}`}>
+        <Button size="sm" variant="quiet" className="file-preview-open-btn" onClick={handleOpenInEditor} title={`Open in ${editorLabel}`}>
           {editorLabel}
-        </button>
+        </Button>
       </div>
 
       {file.is_binary ? (
@@ -386,16 +402,18 @@ export function FilePreviewPanel({ sessionId, projectId, filePath, onBack, fileH
       ) : editMode ? (
         <>
           <div className="file-preview-content file-editor-content">
-            <EditorPane
-              content={editor.content}
-              language={file.language}
-              onContentChange={editor.setContent}
-              onSave={editor.save}
-              onCursorChange={setCursorInfo}
-              wordWrap={wordWrap}
-              indentConfig={indentConfig}
-              minimap={showMinimap}
-            />
+            <Suspense fallback={null}>
+              <EditorPane
+                content={editor.content}
+                language={file.language}
+                onContentChange={editor.setContent}
+                onSave={editor.save}
+                onCursorChange={setCursorInfo}
+                wordWrap={wordWrap}
+                indentConfig={indentConfig}
+                minimap={showMinimap}
+              />
+            </Suspense>
           </div>
           <div className="editor-statusbar">
             <div className="editor-statusbar-left">
@@ -504,9 +522,9 @@ export function FilePreviewPanel({ sessionId, projectId, filePath, onBack, fileH
               You have unsaved changes in {file.file_name}. What would you like to do?
             </div>
             <div className="file-editor-confirm-actions">
-              <button className="file-editor-confirm-btn" onClick={() => setShowCloseConfirm(false)}>Cancel</button>
-              <button className="file-editor-confirm-btn file-editor-confirm-discard" onClick={() => { setShowCloseConfirm(false); onBack(); }}>Discard</button>
-              <button className="file-editor-confirm-btn file-editor-confirm-save" onClick={async () => { const ok = await editor.save(); setShowCloseConfirm(false); if (ok) { onBack(); } }}>Save &amp; Close</button>
+              <Button className="file-editor-confirm-cancel" onClick={() => setShowCloseConfirm(false)}>Cancel</Button>
+              <Button variant="danger" className="file-editor-confirm-discard" onClick={() => { setShowCloseConfirm(false); onBack(); }}>Discard</Button>
+              <Button variant="primary" className="file-editor-confirm-save" onClick={async () => { const ok = await editor.save(); setShowCloseConfirm(false); if (ok) { onBack(); } }}>Save &amp; Close</Button>
             </div>
           </div>
         </div>

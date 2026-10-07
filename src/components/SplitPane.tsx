@@ -1,15 +1,50 @@
 import "../styles/components/SplitPane.css";
-import { useEffect, useRef, useState, useCallback } from "react";
+import { Suspense, useEffect, useRef, useState, useCallback } from "react";
+import { lazyView } from "../utils/lazyView";
 import { useSession } from "../state/SessionContext";
 import { ScopeBar } from "./ScopeBar";
 import { ProviderActionsBar } from "./ProviderActionsBar";
+import { AgentSetupChips } from "./AgentSetupChips";
 import { TerminalPane } from "./TerminalPane";
-import { AgentSessionView } from "../agent/AgentSessionView";
-import { focusTerminal, terminalHasSelection, terminalGetSelection, insertFilePaths, writeTextToTerminal, clearTerminal } from "../terminal/TerminalPool";
+import { SessionStatusStrip } from "./SessionStatusStrip";
+import { useSessionEvents } from "../agent/contract/sessionEventStore";
+import type { SessionData } from "../types/session";
+import { splitAfterCreateActions } from "../state/splitAfterCreate";
+import { getAgent } from "../catalog/agentCatalog";
+import { useStatusStripEnabled } from "../statusStrip/preference";
+import { TurnBar } from "./TurnBar";
+import { isFeatureFlagEnabled } from "../featureFlags";
+import { ContainedErrorBoundary } from "./ContainedErrorBoundary";
+import { translate } from "../i18n/registry";
+import { CrashProbe } from "./CrashProbe";
+import { DoneWhenChip } from "./DoneWhenChip";
+import { focusTerminal, terminalHasSelection, terminalGetSelection, insertFilePaths, writeTextToTerminal, clearTerminal, pasteIntoSession } from "../terminal/TerminalPool";
+import { AgentStatusTag } from "./AgentStatusTag";
 import { copyImageToClipboard } from "../api/clipboard";
 import { SplitDirection, collectPanes } from "../state/layoutTypes";
 import { useContextMenu, buildTerminalMenuItems, buildPaneHeaderMenuItems } from "../hooks/useContextMenu";
+import { triggerMenuBarAction } from "../hooks/nativeMenuBridge";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { agentDisplayName } from "../catalog/agentCatalog";
+import { Button, CloseButton } from "./ui/Button";
+
+// The agent view (and everything it pulls in: markdown, syntax
+// highlighting, tool cards) loads on demand, the first time an
+// Agent-mode session is shown.
+const AgentSessionView = lazyView("AgentSessionView", () => import("../agent/AgentSessionView").then((m) => m.AgentSessionView));
+// 2.0: the refused-launch banner loads only when a launch was refused.
+const LaunchRejectedBanner = lazyView("LaunchRejectedBanner", () => import("./LaunchRejectedBanner").then((m) => m.LaunchRejectedBanner));
+
+/** Mounts the refused-launch banner (and loads its code) only for a session whose launch was refused. */
+function LaunchRejectedSlot({ session, onSignIn }: { session: SessionData; onSignIn: (agentId: string, accountId: string | null) => void }) {
+  const { rejection } = useSessionEvents(session.id);
+  if (!rejection) return null;
+  return (
+    <Suspense fallback={null}>
+      <LaunchRejectedBanner session={session} onSignIn={onSignIn} />
+    </Suspense>
+  );
+}
 
 // Use text/plain with a prefix so it works in all WebViews
 const DRAG_PREFIX = "hermes-session:";
@@ -76,7 +111,7 @@ function hasImageFiles(paths: string[]): boolean {
 }
 
 export function SplitPane({ paneId, sessionId }: SplitPaneProps) {
-  const { state, dispatch, convertSessionMode } = useSession();
+  const { state, dispatch, convertSessionMode, createSession } = useSession();
   const session = state.sessions[sessionId];
   const isFocused = state.layout.focusedPaneId === paneId;
   const paneRef = useRef<HTMLDivElement>(null);
@@ -245,14 +280,18 @@ export function SplitPane({ paneId, sessionId }: SplitPaneProps) {
         if (sel) navigator.clipboard.writeText(sel).catch(console.error);
         break;
       }
-      case "terminal.paste": document.execCommand("paste"); break;
+      // The app reads the clipboard: the web view's own paste hangs (macOS)
+      // or does nothing (WebView2, WebKitGTK) (XP-11).
+      case "terminal.paste": pasteIntoSession(sessionId); break;
       case "terminal.select-all": /* handled by terminal */ break;
       case "terminal.clear": clearTerminal(sessionId); break;
+      // Same flow as the menu bar / Cmd+D: pick a new session for the new pane.
+      // (Re-using this pane's session would move its terminal out of this pane.)
       case "terminal.split-right":
-        dispatch({ type: "SPLIT_PANE", paneId, direction: "horizontal", newSessionId: sessionId });
+        triggerMenuBarAction("view.split-horizontal");
         break;
       case "terminal.split-down":
-        dispatch({ type: "SPLIT_PANE", paneId, direction: "vertical", newSessionId: sessionId });
+        triggerMenuBarAction("view.split-vertical");
         break;
     }
   }, [dispatch, paneId, sessionId]);
@@ -261,11 +300,13 @@ export function SplitPane({ paneId, sessionId }: SplitPaneProps) {
 
   const handlePaneHeaderAction = useCallback((actionId: string) => {
     switch (actionId) {
+      // Same flow as the menu bar / Cmd+D: pick a new session for the new pane.
+      // (Re-using this pane's session would move its terminal out of this pane.)
       case "pane.split-right":
-        dispatch({ type: "SPLIT_PANE", paneId, direction: "horizontal", newSessionId: sessionId });
+        triggerMenuBarAction("view.split-horizontal");
         break;
       case "pane.split-down":
-        dispatch({ type: "SPLIT_PANE", paneId, direction: "vertical", newSessionId: sessionId });
+        triggerMenuBarAction("view.split-vertical");
         break;
       case "pane.close":
         dispatch({ type: "CLOSE_PANE", paneId });
@@ -288,6 +329,7 @@ export function SplitPane({ paneId, sessionId }: SplitPaneProps) {
   }, [dispatch, paneId, sessionId, state.layout.root]);
 
   const { showMenu: showPaneMenu } = useContextMenu(handlePaneHeaderAction);
+  const statusStripOn = useStatusStripEnabled();
 
   if (!session) return null;
 
@@ -301,12 +343,18 @@ export function SplitPane({ paneId, sessionId }: SplitPaneProps) {
       <div className="split-pane-header" onContextMenu={(e) => showPaneMenu(e, buildPaneHeaderMenuItems(paneId, hasSiblings, { mode: session.mode, ai_provider: session.ai_provider }))}>
         <div className="split-pane-label">
           <span>{session.label}</span>
-          <span className="split-pane-phase">{session.phase}</span>
-          <button
+          {/* The status people read everywhere else (the sidebar, the
+              strip), never the backend's raw phase (LEAD-05); with the
+              strip on, it already says it right below. */}
+          {!statusStripOn && <AgentStatusTag sessionId={sessionId} />}
+          {session.mode !== "agent" && <AgentSetupChips session={session} />}
+          {/* Done-When checks (F27), with the launch helper that runs them. */}
+          {session.mode !== "agent" && isFeatureFlagEnabled("launchHelper") && <DoneWhenChip sessionId={sessionId} />}
+          <CloseButton
             className="split-pane-close"
+            label="Close pane"
             onClick={(e) => { e.stopPropagation(); dispatch({ type: "CLOSE_PANE", paneId }); }}
-            title="Close pane"
-          >&times;</button>
+          />
         </div>
         <ScopeBar sessionId={sessionId} />
         {/* ProviderActionsBar is the legacy TUI quick-actions row. Hide it
@@ -327,11 +375,56 @@ export function SplitPane({ paneId, sessionId }: SplitPaneProps) {
           className="split-pane-terminal"
           onContextMenu={(e) => showTerminalMenu(e, buildTerminalMenuItems(terminalHasSelection(sessionId)))}
         >
-          {session.mode === "agent"
-            ? <AgentSessionView sessionId={sessionId} workspacePathCount={session.workspace_paths.length} />
-            : <TerminalPane sessionId={sessionId} phase={session.phase} color={session.color} />}
+          {/* A crash inside this pane stays in this pane: the other panes
+              keep running and this one offers Reload / Close. */}
+          <ContainedErrorBoundary
+            key={sessionId}
+            scope="pane"
+            label={session.label}
+            actions={
+              <Button onClick={() => dispatch({ type: "CLOSE_PANE", paneId })}>
+                {translate("crash.closePane")}
+              </Button>
+            }
+          >
+            {import.meta.env.VITE_HERMES_E2E === "1" && <CrashProbe target={`pane:${sessionId}`} />}
+            {session.mode !== "agent" && session.ai_provider && statusStripOn && isFeatureFlagEnabled("launchHelper") && (
+              <SessionStatusStrip
+                sessionId={sessionId}
+                phase={session.phase}
+                agentName={agentDisplayName(session) ?? getAgent(session.ai_provider)?.name ?? session.ai_provider}
+              />
+            )}
+            {/* 2.0: the CLI refused the launch; Hermes stopped it and says why. */}
+            {session.mode !== "agent" && session.ai_provider && (
+              <LaunchRejectedSlot
+                session={session}
+                onSignIn={(agentId, accountId) => {
+                  void createSession({
+                    aiProvider: agentId,
+                    mode: "terminal",
+                    label: translate("agentError.signInSessionLabel", { agent: getAgent(agentId)?.name ?? agentId }),
+                    agentLaunch: { accountId, purpose: "login" },
+                  }).then((created) => {
+                    if (!created) return;
+                    for (const action of splitAfterCreateActions({ paneId, sessionId }, { paneId, direction: "horizontal" }, created.id)) dispatch(action);
+                  });
+                }}
+              />
+            )}
+            {session.mode === "agent" ? (
+              <Suspense fallback={<div className="split-pane-loading" aria-busy="true" />}>
+                <AgentSessionView sessionId={sessionId} workspacePathCount={session.workspace_paths.length} />
+              </Suspense>
+            ) : (
+              <TerminalPane sessionId={sessionId} phase={session.phase} color={session.color} />
+            )}
+          </ContainedErrorBoundary>
         </div>
       </div>
+      {/* F20: the turn bar (Diff / Restore per agent turn) under a terminal
+          session, behind the turnLedger flag. */}
+      {session.mode !== "agent" && isFeatureFlagEnabled("turnLedger") && <TurnBar sessionId={sessionId} />}
 
       {/* Drag capture overlay — sits above xterm canvas during drags */}
       <div className="split-pane-drag-capture" />
@@ -363,15 +456,11 @@ export function SplitPane({ paneId, sessionId }: SplitPaneProps) {
               This cannot be undone.
             </div>
             <div className="split-pane-mode-confirm-actions">
-              <button
-                className="session-creator-btn-secondary"
-                onClick={() => setPendingModeConvert(null)}
-                disabled={converting}
-              >
+              <Button onClick={() => setPendingModeConvert(null)} disabled={converting}>
                 Cancel
-              </button>
-              <button
-                className="session-creator-btn-primary"
+              </Button>
+              <Button
+                variant="primary"
                 onClick={async () => {
                   if (converting || !pendingModeConvert) return;
                   setConverting(true);
@@ -385,7 +474,7 @@ export function SplitPane({ paneId, sessionId }: SplitPaneProps) {
                 disabled={converting}
               >
                 {converting ? "Converting..." : "Convert"}
-              </button>
+              </Button>
             </div>
           </div>
         </div>

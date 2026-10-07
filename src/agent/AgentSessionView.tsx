@@ -1,5 +1,5 @@
 import "../styles/components/agent/AgentSessionView.css";
-import { memo, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type {
   AgentEvent,
@@ -13,10 +13,11 @@ import {
   isToolUseBlock,
   isImageBlock,
 } from "./types";
-import { softInterruptAgent } from "../api/agent";
+import { forceStopAgent, softInterruptAgent } from "../api/agent";
+import { Button } from "../components/ui";
 import { useSession } from "../state/SessionContext";
 import { deriveActivity } from "./messageStore";
-import type { AgentSessionState, RenderedMessage } from "./messageStore";
+import type { AgentSessionState, CompactionMark, RenderedMessage } from "./messageStore";
 import { getOrCreateAgentSessionStore } from "./agentSessionStore";
 import { TextBlock } from "./blocks/TextBlock";
 import { ThinkingBlock } from "./blocks/ThinkingBlock";
@@ -38,8 +39,14 @@ import {
   buildPermResponse,
   type PermissionDecision,
 } from "../utils/permissionRequest";
+import { PERMISSION_RULES_CHANGED_EVENT } from "../utils/permissionsRules";
 import { extractTodoSnapshot } from "../utils/todoStore";
 import { selectFatalError } from "./errorSelector";
+import { agentDisplayName, classifyAgentError } from "./agentErrors";
+import { AgentErrorBanner, useAgentErrorTranslate } from "./AgentErrorBanner";
+import { isFeatureFlagEnabled } from "../featureFlags";
+import { ContainedErrorBoundary } from "../components/ContainedErrorBoundary";
+import { CrashProbe } from "../components/CrashProbe";
 import {
   slashReceiptAfterUserMessage,
   slashReceiptForMessage,
@@ -86,6 +93,38 @@ function useAgentSessionSnapshot(sessionId: string) {
  *   - agent-stderr-{sessionId} — stderr text chunks (surfaced on error)
  *   - agent-exit-{sessionId}   — process exit
  */
+/**
+ * CHAOS-20: where an agent stopped unexpectedly (its process crashed or was
+ * killed mid-answer): the id of the last message at that moment, per
+ * session. The live notice goes once the agent starts again; this marker
+ * stays in the conversation, so nothing hides that the answer above it is
+ * incomplete. Module-level so it survives switching sessions.
+ */
+const crashMarks = new Map<string, Set<string>>();
+/** Sessions whose agent the person force-stopped: that exit is no crash. */
+const forcedStops = new Set<string>();
+
+/** Whether an exit means the agent stopped unexpectedly. */
+export function isUnexpectedExit(exit: { code: number | null; signal: string | null } | null): boolean {
+  return !!exit && (!!exit.signal || (exit.code !== null && exit.code !== 0));
+}
+
+/** How long after ◼ Stop a turn that is still running counts as hung. */
+export const FORCE_STOP_AFTER_MS = 5_000;
+
+/**
+ * The working timer's start: never before the person's latest message, so a
+ * new turn after a crash counts from 0, not from the dead turn (CHAOS-20).
+ */
+export function turnTimerStart(since: number | null, messages: readonly { role: string; timestamp?: number }[]): number | null {
+  if (since === null) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === "user") return Math.max(since, m.timestamp ?? since);
+  }
+  return since;
+}
+
 export function AgentSessionView({ sessionId, workspacePathCount }: AgentSessionViewProps) {
   // Resilient envelope sender — wraps `send_agent_input` IPC with a
   // respawn-on-not-found retry.  Used by the interactive cards
@@ -109,18 +148,37 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
   // event with a small tolerance — momentum scroll, sub-pixel rounding,
   // and cross-platform scrollbar sizes can leave a few pixels of error
   // even when the user is "at the bottom", so 24px is a safe margin.
-  useEffect(() => {
+  //
+  // Re-runs whenever the timeline opens a conversation: on mount (tab
+  // switch back from a terminal remounts us), when the pane swaps to a
+  // different session in place (same instance, same scroll element), and
+  // when the scroll element first appears after the empty state.  Each
+  // time, start at the latest message (#327/#328) — measuring on mount
+  // saw scrollTop 0, cleared the sticky flag, and left the view at the top.
+  const hasTimeline = state.initialized || !!exitInfo || state.messages.length > 0;
+  useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const STICKY_THRESHOLD = 24;
+    // Only an UPWARD move can unstick.  Scroll events land a frame after
+    // our own `scrollTop = scrollHeight`; if streaming grew the content in
+    // that gap, the echo measures distance > threshold even though nobody
+    // touched anything.  Content growth never changes scrollTop and our
+    // programmatic scrolls only move down, so a decrease means the user.
+    let lastTop = 0;
     const onScroll = () => {
-      const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
-      stickyBottomRef.current = distance <= STICKY_THRESHOLD;
+      const top = el.scrollTop;
+      const distance = el.scrollHeight - top - el.clientHeight;
+      if (distance <= STICKY_THRESHOLD) stickyBottomRef.current = true;
+      else if (top < lastTop) stickyBottomRef.current = false;
+      lastTop = top;
     };
     el.addEventListener("scroll", onScroll, { passive: true });
-    onScroll();
+    stickyBottomRef.current = true;
+    el.scrollTop = el.scrollHeight;
+    lastTop = el.scrollTop;
     return () => el.removeEventListener("scroll", onScroll);
-  }, []);
+  }, [sessionId, hasTimeline]);
 
   // Auto-scroll on new messages — but only when the user is at the bottom.
   // If they've scrolled up to re-read history, never yank them back.
@@ -165,8 +223,8 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
   // empty-state early return so the hook count never changes between
   // pre-init and post-first-message renders (see React #310).
   const todoSnapshot = useMemo(
-    () => extractTodoSnapshot(state.messages),
-    [state.messages],
+    () => extractTodoSnapshot(state.messages, state.toolResults),
+    [state.messages, state.toolResults],
   );
   // AGENT-09: turn-number assignment is memoized so it doesn't recompute
   // on every reducer notification (it only depends on `state.messages`).
@@ -183,6 +241,12 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
     [state.messages],
   );
   const turnCount = numbered.length === 0 ? 0 : numbered[numbered.length - 1].turn;
+  // F14: context compactions, drawn after the message that preceded them.
+  const compactionsAfter = useMemo(() => {
+    const byMessage = new Map<string | null, CompactionMark[]>();
+    for (const c of state.compactions) byMessage.set(c.afterMessageId, [...(byMessage.get(c.afterMessageId) ?? []), c]);
+    return byMessage;
+  }, [state.compactions]);
 
   // Working surface state — MUST live above the empty-state early
   // return (React #310, same reason as the other useMemos above).
@@ -198,7 +262,61 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
   // surfaced a session entry yet.
   const sessionEntryForPerm = sessionCtx.state.sessions[sessionId];
 
-  if (!state.initialized && !exitInfo && state.messages.length === 0) {
+  // Typed error panel (feature flag "agentViewErrors"). Flags are read once
+  // at startup, so this is stable for the life of the view.
+  const typedErrors = isFeatureFlagEnabled("agentViewErrors");
+  const t = useAgentErrorTranslate();
+  const agentName = agentDisplayName(sessionEntryForPerm?.ai_provider);
+  const agentError = useMemo(
+    () => (typedErrors
+      ? classifyAgentError({ state, stderr, exit: exitInfo, protocolError: snapshot.protocolError }, agentName, t)
+      : null),
+    // `t` changes with the interface language, so the panel follows it.
+    [typedErrors, state, stderr, exitInfo, snapshot.protocolError, agentName, t],
+  );
+  const [retrying, setRetrying] = useState(false);
+  const [, setCrashMarkVersion] = useState(0);
+  const lastMessageId = state.messages.length > 0 ? state.messages[state.messages.length - 1].id : null;
+  useEffect(() => {
+    if (!exitInfo) return;
+    if (forcedStops.delete(sessionId)) return;
+    if (!isUnexpectedExit(exitInfo) || lastMessageId === null) return;
+    const marks = crashMarks.get(sessionId) ?? new Set<string>();
+    if (marks.has(lastMessageId)) return;
+    marks.add(lastMessageId);
+    crashMarks.set(sessionId, marks);
+    setCrashMarkVersion((v) => v + 1);
+  }, [exitInfo, lastMessageId, sessionId]);
+  const marks = crashMarks.get(sessionId);
+  const { respawnAgent, createSession } = sessionCtx;
+  const handleRetry = () => {
+    setRetrying(true);
+    // A second click while this runs joins the same restart (per-session
+    // respawn lock), so it is safe to leave the button enabled.
+    void respawnAgent(sessionId)
+      .then((ok) => {
+        // Started: the old error no longer describes the session. A failed
+        // restart reports its own typed error through the exit channel.
+        if (ok) store.clearExitNotice();
+      })
+      .finally(() => setRetrying(false));
+  };
+  const handleSignIn = () => {
+    // Open the agent in a normal terminal session, where its own sign-in
+    // flow runs. The person signs in there; Hermes types nothing.
+    const s = sessionCtx.state.sessions[sessionId];
+    void createSession({
+      aiProvider: s?.ai_provider ?? "claude",
+      mode: "terminal",
+      workingDirectory: s?.working_directory,
+      label: t("agentError.signInSessionLabel", { agent: agentName }),
+    });
+  };
+  // Only the "busy" panel offers this: it has nothing to retry, and would
+  // otherwise stay until the agent's next start.
+  const handleDismiss = () => store.clearExitNotice();
+
+  if (!hasTimeline) {
     // Claude's `--print --input-format stream-json` mode doesn't emit anything
     // (not even the init event) until it receives the first user message on
     // stdin. So the "pre-init" state is just the user's empty inbox — invite
@@ -209,7 +327,7 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
     // message + the live thinking indicator give them feedback during
     // the bridge-spawn → init-arrives gap.
     return (
-      <div className="agent-session-view">
+      <div className="agent-session-view" data-session-id={sessionId}>
         <AgentHeader state={state} sessionId={sessionId} workspacePathCount={workspacePathCount} />
         <div className="agent-session-empty">
           <span className="agent-empty-led" aria-hidden="true" />
@@ -248,6 +366,7 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
       <AgentHeader state={state} sessionId={sessionId} workspacePathCount={workspacePathCount} />
       <div className="agent-session-scroll" ref={scrollRef}>
         <div className="agent-session-messages">
+          {(compactionsAfter.get(null) ?? []).map((c) => <CompactionDivider key={`compact-${c.at}`} mark={c} />)}
           {numbered.flatMap(({ message, turn, isFirstOfTurn }, idx, arr) => {
             const prev = idx > 0 ? arr[idx - 1].message : null;
             const next = idx + 1 < arr.length ? arr[idx + 1].message : null;
@@ -296,6 +415,20 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
               );
             }
 
+            for (const [i, c] of (compactionsAfter.get(message.id) ?? []).entries()) {
+              out.push(<CompactionDivider key={`${message.id}-compact-${i}`} mark={c} />);
+            }
+
+            // Where the agent stopped unexpectedly; while the live notice
+            // still says so (the last message, exit shown), it is not repeated.
+            if (marks?.has(message.id) && !(exitInfo && idx === arr.length - 1)) {
+              out.push(
+                <div key={`${message.id}-crash`} className="agent-crash-marker" role="note">
+                  {t("agentView.crashMarker", { agent: agentName })}
+                </div>,
+              );
+            }
+
             return out;
           })}
           {state.resultEvent ? <ResultFooter result={state.resultEvent} /> : null}
@@ -307,6 +440,8 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
           {(() => {
             const fatal = selectFatalError(state);
             if (!fatal) return null;
+            // The typed panel below already explains a sign-in failure.
+            if (agentError?.kind === "signed_out") return null;
             return (
               <div
                 className="agent-result-error"
@@ -327,7 +462,16 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
               </div>
             );
           })()}
-          {exitInfo && shouldShowExitNotice(exitInfo, state.messages.length) ? (
+          {agentError ? (
+            <AgentErrorBanner
+              error={agentError}
+              retrying={retrying}
+              onRetry={handleRetry}
+              onSignIn={handleSignIn}
+              onDismiss={handleDismiss}
+            />
+          ) : null}
+          {!typedErrors && exitInfo && shouldShowExitNotice(exitInfo, state.messages.length) ? (
             <div className="agent-exit-notice">
               {classifyExit(exitInfo, stderr).label}
               {exitInfo.code !== null ? ` (code ${exitInfo.code})` : ""}
@@ -369,6 +513,7 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
           <InteractivePermissionDispatcher
             sessionId={sessionId}
             permissionMode={permissionMode}
+            projectDir={sessionEntryForPerm?.working_directory || null}
             sendAgentEnvelope={sendAgentEnvelope}
           />
         </div>
@@ -414,10 +559,13 @@ export function AgentSessionView({ sessionId, workspacePathCount }: AgentSession
 function InteractivePermissionDispatcher({
   sessionId,
   permissionMode,
+  projectDir,
   sendAgentEnvelope,
 }: {
   sessionId: string;
   permissionMode: string;
+  /** The session's working directory: where "Always allow" rules go. */
+  projectDir: string | null;
   sendAgentEnvelope: (sessionId: string, envelope: unknown) => Promise<void>;
 }) {
   // Pending perm request lives in the long-lived store now (fix C1)
@@ -563,16 +711,28 @@ function InteractivePermissionDispatcher({
         }
       });
     if (decision.kind === "allow" && decision.persist) {
-      // Persist the rule to ~/.claude/settings.json (TUI parity per
-      // locked decision §0.5).  Best-effort; the in-session allow has
-      // already been wired via the response above.
-      import("@tauri-apps/api/core").then(({ invoke }) =>
-        invoke("write_permission_rule", {
-          pattern: decision.persist,
-          kind: "allow",
-          scope: "user",
-        }).catch((err) => console.warn("[perm] persist failed:", err)),
-      );
+      // Persist the rule to the project's .claude/settings.local.json
+      // (Claude Code's "local" scope), never to the global
+      // ~/.claude/settings.json: approving a command in one project must
+      // not approve it everywhere.  Best-effort; the in-session allow has
+      // already been wired via the response above.  Without a project
+      // folder there is nowhere safe to write: the prompt does not offer
+      // "Always allow" then, and nothing is persisted.
+      if (!projectDir) {
+        console.warn("[perm] no project folder for this session; rule not persisted");
+      } else {
+        const pattern = decision.persist;
+        import("@tauri-apps/api/core").then(({ invoke }) =>
+          invoke("write_permission_rule", {
+            pattern,
+            kind: "allow",
+            scope: "local",
+            projectDir,
+          })
+            .then(() => window.dispatchEvent(new Event(PERMISSION_RULES_CHANGED_EVENT)))
+            .catch((err) => console.warn("[perm] persist failed:", err)),
+        );
+      }
     }
   }
 
@@ -633,8 +793,19 @@ function InteractivePermissionDispatcher({
         request={request}
         permissionMode={permissionMode}
         onDecision={decide}
+        canPersist={!!projectDir}
       />
     </>
+  );
+}
+
+/** F14: where the agent compacted its context. */
+function CompactionDivider({ mark }: { mark: CompactionMark }) {
+  const t = useAgentErrorTranslate();
+  return (
+    <div className="agent-compaction-divider" role="separator" data-trigger={mark.trigger ?? undefined}>
+      <span className="agent-compaction-divider-label">{t("agent.contextCompacted")}</span>
+    </div>
   );
 }
 
@@ -686,6 +857,7 @@ interface AgentHeaderProps {
 // header — and its activity-derivation work — to re-run. Default shallow
 // equality is correct: AgentHeaderProps are all primitives or stable refs.
 const AgentHeader = memo(function AgentHeader({ state, sessionId, workspacePathCount }: AgentHeaderProps) {
+  const t = useAgentErrorTranslate();
   const model = state.initEvent?.model;
   const cwd = state.initEvent?.cwd;
   const rate = state.rateLimitInfo;
@@ -705,6 +877,40 @@ const AgentHeader = memo(function AgentHeader({ state, sessionId, workspacePathC
         : "thinking";
 
   const isWorking = state.initialized && activity.status !== "idle";
+  const since = turnTimerStart(activity.since, state.messages);
+
+  // CHAOS-10: ◼ Stop asks the agent to stop its turn. One that does not
+  // within a few seconds is hung: say so and offer Force stop (the agent's
+  // process is stopped; the conversation stays and the next message
+  // resumes it). Pressing Stop again does the same at once.
+  const [stopAskedAt, setStopAskedAt] = useState<number | null>(null);
+  const [unresponsive, setUnresponsive] = useState(false);
+  useEffect(() => {
+    if (!isWorking) {
+      setStopAskedAt(null);
+      setUnresponsive(false);
+    }
+  }, [isWorking]);
+  useEffect(() => {
+    if (stopAskedAt === null) return;
+    const timer = setTimeout(() => setUnresponsive(true), Math.max(0, FORCE_STOP_AFTER_MS - (Date.now() - stopAskedAt)));
+    return () => clearTimeout(timer);
+  }, [stopAskedAt]);
+  const forceStop = () => {
+    forcedStops.add(sessionId);
+    setUnresponsive(false);
+    forceStopAgent(sessionId).catch((err) => console.warn("[agent] force stop failed:", err));
+  };
+  const onStop = () => {
+    if (stopAskedAt !== null) {
+      forceStop();
+      return;
+    }
+    setStopAskedAt(Date.now());
+    softInterruptAgent(sessionId).catch((err) =>
+      console.warn("[agent] soft-interrupt failed:", err),
+    );
+  };
   const tickerLabel = !state.initialized
     ? "Ready"
     : activity.status === "running"
@@ -715,7 +921,7 @@ const AgentHeader = memo(function AgentHeader({ state, sessionId, workspacePathC
           ? "Awaiting Claude"
           : "Ready";
 
-  const cwdLabel = cwd ? cwd.split("/").pop() ?? cwd : null;
+  const cwdLabel = cwd ? cwd.split(/[\\/]/).filter(Boolean).pop() ?? cwd : null;
 
   // Three-zone grid: [status] [title] [meta].  Title is the only
   // flexible cell; it truncates with ellipsis on narrow panes so the
@@ -737,10 +943,10 @@ const AgentHeader = memo(function AgentHeader({ state, sessionId, workspacePathC
         {isWorking ? (
           <>
             <span className="agent-session-ticker">{tickerLabel}</span>
-            {activity.since !== null ? (
+            {since !== null ? (
               <>
                 <span className="agent-session-flag-sep" aria-hidden="true">·</span>
-                <ElapsedCounter since={activity.since} />
+                <ElapsedCounter since={since} />
               </>
             ) : null}
           </>
@@ -793,15 +999,19 @@ const AgentHeader = memo(function AgentHeader({ state, sessionId, workspacePathC
         {showRateNotice ? (
           <span className="agent-rate-notice">Rate limit · {rate!.status}</span>
         ) : null}
+        {isWorking && unresponsive ? (
+          <span className="agent-session-hung" role="status">
+            {t("agentView.notResponding")}
+            <Button size="sm" variant="danger" className="agent-session-force-stop" onClick={forceStop}>
+              {t("agentView.forceStop")}
+            </Button>
+          </span>
+        ) : null}
         {isWorking ? (
           <button
             type="button"
             className="agent-session-stop"
-            onClick={() => {
-              softInterruptAgent(sessionId).catch((err) =>
-                console.warn("[agent] soft-interrupt failed:", err),
-              );
-            }}
+            onClick={onStop}
             title="Stop this turn (Esc)"
             aria-label="Stop the current turn"
           >
@@ -960,7 +1170,9 @@ interface MessageRowProps {
   isFirstOfTurn?: boolean;
 }
 
-export function MessageRow({
+// Memoised: while one message streams, the rows before it keep their props
+// and are not re-rendered on every delta.
+export const MessageRow = memo(function MessageRow({
   message,
   toolResults,
   streamingMessageId = null,
@@ -1019,23 +1231,27 @@ export function MessageRow({
           <MessageRawView text={rawText} />
         ) : (
           message.blocks.map((block, i) => (
-            <BlockRenderer
-              key={i}
-              block={block}
-              blockIndex={i}
-              messageId={message.id}
-              toolResults={toolResults}
-              isStreamingTail={isStreamingMessage && i === lastTextIdx}
-              thinkingStartedAt={thinkingStartedAt}
-              thinkingElapsed={thinkingElapsed}
-              streamingThinkingText={streamingThinkingText}
-            />
+            // One malformed block shows an error card in its place; the
+            // rest of the message and the conversation keep rendering.
+            <ContainedErrorBoundary key={i} scope="block">
+              {import.meta.env.VITE_HERMES_E2E === "1" && <CrashProbe target={`block:${message.id}:${i}`} />}
+              <BlockRenderer
+                block={block}
+                blockIndex={i}
+                messageId={message.id}
+                toolResults={toolResults}
+                isStreamingTail={isStreamingMessage && i === lastTextIdx}
+                thinkingStartedAt={thinkingStartedAt}
+                thinkingElapsed={thinkingElapsed}
+                streamingThinkingText={streamingThinkingText}
+              />
+            </ContainedErrorBoundary>
           ))
         )}
       </div>
     </div>
   );
-}
+});
 
 /** Speaker-chip icons.  Drawn inline with `currentColor` so each
  *  theme's voice-color paints the glyph: --brass (warm operator

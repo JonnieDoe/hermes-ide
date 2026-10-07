@@ -38,9 +38,12 @@ pub fn reveal_in_file_manager(path: &str) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        // Call explorer.exe directly (never via cmd /C) to prevent command injection.
+        use std::os::windows::process::CommandExt;
+        // explorer.exe directly (never through a shell): `&` or `%` in the
+        // path are just characters (XP-14). The path is quoted as one
+        // argument after `/select,`, which explorer only parses unquoted.
         let mut child = std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path))
+            .raw_arg(explorer_arg(path, true))
             .spawn()
             .map_err(|e| format!("Failed to open Explorer: {}", e))?;
         std::thread::spawn(move || {
@@ -80,15 +83,11 @@ pub fn open_file(path: &str) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        // Validate path does not contain shell metacharacters that could be
-        // exploited if a cmd shell is ever involved upstream.
-        const SHELL_META: &[char] = &['&', '|', '>', '<', '^', '%'];
-        if path.chars().any(|c| SHELL_META.contains(&c)) {
-            return Err("Path contains invalid characters".to_string());
-        }
-        // Use explorer.exe directly (never via cmd /C) to prevent command injection.
+        use std::os::windows::process::CommandExt;
+        // explorer.exe runs without a shell, so `&` and `%` in a path are
+        // safe (XP-14: such paths used to be refused). Quoted, one argument.
         let mut child = std::process::Command::new("explorer")
-            .arg(path)
+            .raw_arg(explorer_arg(path, false))
             .spawn()
             .map_err(|e| format!("Failed to open file: {}", e))?;
         std::thread::spawn(move || {
@@ -97,6 +96,36 @@ pub fn open_file(path: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// The argument explorer.exe gets for `path`: the path quoted (a Windows
+/// path cannot contain `"`), after `/select,` to reveal it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn explorer_arg(path: &str, select: bool) -> String {
+    let quoted = format!("\"{}\"", path.replace('"', ""));
+    if select {
+        format!("/select,{quoted}")
+    } else {
+        quoted
+    }
+}
+
+/// The clipboard's text, for a terminal paste (XP-11): the web views'
+/// own paste either hangs (macOS) or does nothing (WebView2, WebKitGTK).
+/// Empty when the clipboard holds no text. Test builds can be handed the
+/// clipboard in `HERMES_E2E_CLIPBOARD`, so a test never reads the real one.
+#[tauri::command]
+pub fn read_clipboard_text() -> Result<String, String> {
+    #[cfg(feature = "e2e")]
+    if let Ok(text) = std::env::var("HERMES_E2E_CLIPBOARD") {
+        return Ok(text);
+    }
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    match clipboard.get_text() {
+        Ok(text) => Ok(text),
+        Err(arboard::Error::ContentNotAvailable) => Ok(String::new()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Check if a command exists on the system PATH.
@@ -122,15 +151,12 @@ pub fn command_exists(name: &str) -> bool {
     }
 }
 
-/// Provider ID → binary name mapping for AI CLI tools.
-pub const AI_CLI_PROVIDERS: &[(&str, &str)] = &[
-    ("claude", "claude"),
-    ("aider", "aider"),
-    ("codex", "codex"),
-    ("gemini", "gemini"),
-    ("copilot", "gh"),
-    ("kiro", "kiro-cli"),
-];
+/// Agent id → binary name for every agent CLI Hermes looks for, from the
+/// agent catalog (`src/catalog/agents.json`, the `detect` command of each
+/// entry).
+pub fn ai_cli_providers() -> Vec<(&'static str, &'static str)> {
+    crate::agent_catalog::detect_binaries()
+}
 
 /// Check which AI CLI tools are available on the system.
 ///
@@ -152,7 +178,12 @@ pub const AI_CLI_PROVIDERS: &[(&str, &str)] = &[
 ///      `~/.nvm/versions/node/*/bin`, `~/.local/bin`, `~/.cargo/bin`) as a
 ///      last resort for users whose profile is misconfigured.
 ///   3. **Bare `which`** on Windows or as a last fallback on Unix.
-pub fn check_ai_cli_availability() -> std::collections::HashMap<String, bool> {
+///
+/// `include_beta` is whether the UI shows the beta-channel agents (the
+/// agentCatalog flag). The fallback spawns one `which`/`where` per agent, so
+/// without the flag the beta agents are reported missing without a spawn.
+/// The Unix login-shell check is one script for every agent either way.
+pub fn check_ai_cli_availability(include_beta: bool) -> std::collections::HashMap<String, bool> {
     #[cfg(unix)]
     {
         if let Some(mut results) = check_ai_cli_via_login_shell() {
@@ -160,7 +191,7 @@ pub fn check_ai_cli_availability() -> std::collections::HashMap<String, bool> {
             // sitting in a well-known install directory. Never downgrades a
             // true hit — an empty/misconfigured profile can't mask a real
             // install, but a correct profile can always find the binary.
-            for (id, cmd) in AI_CLI_PROVIDERS {
+            for (id, cmd) in ai_cli_providers().iter() {
                 if results.get(*id).copied() == Some(false) && find_binary_in_well_known_dirs(cmd) {
                     results.insert((*id).to_string(), true);
                 }
@@ -171,9 +202,23 @@ pub fn check_ai_cli_availability() -> std::collections::HashMap<String, bool> {
 
     // Fallback: direct which/where (works when launched from a terminal
     // or on Windows).
-    AI_CLI_PROVIDERS
+    let probed = fallback_probe_list(include_beta);
+    ai_cli_providers()
         .iter()
-        .map(|(id, cmd)| (id.to_string(), command_exists(cmd)))
+        .map(|(id, cmd)| {
+            (
+                id.to_string(),
+                probed.contains(&(*id, *cmd)) && command_exists(cmd),
+            )
+        })
+        .collect()
+}
+
+/// The agents the which/where fallback spawns a check for.
+fn fallback_probe_list(include_beta: bool) -> Vec<(&'static str, &'static str)> {
+    ai_cli_providers()
+        .into_iter()
+        .filter(|(id, _)| include_beta || !crate::agent_catalog::is_beta(id))
         .collect()
 }
 
@@ -185,7 +230,7 @@ fn build_detection_script() -> String {
     // prints `id=1` or `id=0` on its own line. The parser only scans stdout
     // for those markers, so prompt/banner noise from interactive init files
     // doesn't affect the result.
-    AI_CLI_PROVIDERS
+    ai_cli_providers()
         .iter()
         .map(|(id, cmd)| {
             format!(
@@ -200,7 +245,7 @@ fn build_detection_script() -> String {
 /// Parse the login-shell stdout into a provider-id → available map.
 #[cfg(unix)]
 fn parse_detection_output(stdout: &str) -> std::collections::HashMap<String, bool> {
-    AI_CLI_PROVIDERS
+    ai_cli_providers()
         .iter()
         .map(|(id, _)| {
             let found = stdout.contains(&format!("{}=1", id));
@@ -244,7 +289,7 @@ fn check_ai_cli_via_login_shell() -> Option<std::collections::HashMap<String, bo
 /// macOS/Linux install locations for CLIs managed by Homebrew, nvm, volta,
 /// pnpm, pip user installs, cargo, and npm global.
 #[cfg(unix)]
-fn well_known_path_dirs() -> Vec<std::path::PathBuf> {
+pub(crate) fn well_known_path_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs: Vec<std::path::PathBuf> = vec![
         std::path::PathBuf::from("/opt/homebrew/bin"),
         std::path::PathBuf::from("/usr/local/bin"),
@@ -293,6 +338,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explorer_gets_the_path_quoted_as_one_argument_whatever_it_contains() {
+        assert_eq!(
+            explorer_arg(r"C:\Work\R&D %TEMP%\notes.txt", false),
+            r#""C:\Work\R&D %TEMP%\notes.txt""#
+        );
+        assert_eq!(
+            explorer_arg(r"C:\Work\a,b & c", true),
+            r#"/select,"C:\Work\a,b & c""#
+        );
+        // A quote cannot be in a Windows path; one never ends the argument.
+        assert_eq!(explorer_arg(r#"C:\x" & calc"#, false), r#""C:\x & calc""#);
+    }
+
+    #[test]
     fn command_exists_finds_system_commands() {
         // `ls` is always present in /bin on Unix and Windows
         #[cfg(unix)]
@@ -307,9 +366,31 @@ mod tests {
     }
 
     #[test]
+    fn fallback_probes_beta_agents_only_with_the_flag() {
+        let ids = |v: Vec<(&'static str, &'static str)>| {
+            v.into_iter().map(|(id, _)| id).collect::<Vec<_>>()
+        };
+        let stable = ids(fallback_probe_list(false));
+        let all = ids(fallback_probe_list(true));
+        assert_eq!(
+            stable,
+            vec!["claude", "codex", "gemini", "copilot", "aider", "kiro"]
+        );
+        assert_eq!(all.len(), ai_cli_providers().len());
+        for beta in ["antigravity", "opencode", "goose", "hermes-agent"] {
+            assert!(all.contains(&beta) && !stable.contains(&beta), "{beta}");
+        }
+        // Keys are always complete, so the UI never sees a missing entry.
+        let result = check_ai_cli_availability(false);
+        for (id, _) in ai_cli_providers().iter() {
+            assert!(result.contains_key(*id), "Missing provider key: {}", id);
+        }
+    }
+
+    #[test]
     fn check_ai_cli_availability_returns_all_provider_keys() {
-        let result = check_ai_cli_availability();
-        for (id, _) in AI_CLI_PROVIDERS {
+        let result = check_ai_cli_availability(true);
+        for (id, _) in ai_cli_providers().iter() {
             assert!(result.contains_key(*id), "Missing provider key: {}", id);
         }
     }
@@ -393,7 +474,7 @@ mod tests {
         let map = results.unwrap();
         // We can't assert specific AI CLIs are installed, but all keys must
         // be present.
-        for (id, _) in AI_CLI_PROVIDERS {
+        for (id, _) in ai_cli_providers().iter() {
             assert!(
                 map.contains_key(*id),
                 "Missing key from login shell results: {}",
@@ -587,14 +668,14 @@ mod tests {
         // one entry to true for a guaranteed-missing binary name, and
         // verify that running the well-known-paths upgrade pass against an
         // inert HOME leaves the true value intact.
-        let mut results: std::collections::HashMap<String, bool> = AI_CLI_PROVIDERS
+        let mut results: std::collections::HashMap<String, bool> = ai_cli_providers()
             .iter()
             .map(|(id, _)| ((*id).to_string(), false))
             .collect();
         // Force one provider to pretend-true.
         results.insert("claude".to_string(), true);
 
-        for (id, cmd) in AI_CLI_PROVIDERS {
+        for (id, cmd) in ai_cli_providers().iter() {
             if results.get(*id).copied() == Some(false) && find_binary_in_well_known_dirs(cmd) {
                 results.insert((*id).to_string(), true);
             }
@@ -607,6 +688,44 @@ mod tests {
         );
     }
 
+    /// Copilot is detected by the standalone `copilot` binary (what the install
+    /// hint installs and what Hermes launches), not by `gh`, whose retired
+    /// `gh copilot` extension no longer works.
+    #[cfg(unix)]
+    #[test]
+    fn copilot_is_detected_by_the_copilot_binary_not_gh() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn run_with_bins(bins: &[&str]) -> std::collections::HashMap<String, bool> {
+            let dir = std::env::temp_dir().join(format!(
+                "hermes-detect-{}-{}",
+                std::process::id(),
+                bins.join("-")
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            for b in bins {
+                let p = dir.join(b);
+                std::fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", &build_detection_script()])
+                .env("PATH", &dir)
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            parse_detection_output(&String::from_utf8_lossy(&out.stdout))
+        }
+
+        let only_gh = run_with_bins(&["gh"]);
+        assert_eq!(only_gh.get("copilot").copied(), Some(false));
+
+        let with_copilot = run_with_bins(&["copilot"]);
+        assert_eq!(with_copilot.get("copilot").copied(), Some(true));
+        assert_eq!(with_copilot.get("gemini").copied(), Some(false));
+    }
+
     // ── Script generation & parsing ────────────────────────────────────
 
     /// The login-shell script must not be injectable.  Provider IDs and
@@ -615,7 +734,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn login_shell_script_is_well_formed() {
-        let script = AI_CLI_PROVIDERS
+        let script = ai_cli_providers()
             .iter()
             .map(|(id, cmd)| {
                 format!(
@@ -627,7 +746,7 @@ mod tests {
             .join("; ");
 
         // No shell metacharacters from provider data
-        for (id, cmd) in AI_CLI_PROVIDERS {
+        for (id, cmd) in ai_cli_providers().iter() {
             assert!(
                 !id.contains('\'') && !id.contains(';') && !id.contains('|'),
                 "Provider ID contains unsafe chars: {}",
@@ -641,7 +760,7 @@ mod tests {
         }
 
         // Script should contain one check per provider
-        for (id, _) in AI_CLI_PROVIDERS {
+        for (id, _) in ai_cli_providers().iter() {
             assert!(script.contains(&format!("{}=1", id)));
             assert!(script.contains(&format!("{}=0", id)));
         }

@@ -11,7 +11,7 @@
 //!   profile/rc files and then applies overrides.
 //! - **fish**: `-C` (init-command) runs after config.fish loads.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ─── Integration Result ──────────────────────────────────────────────
 
@@ -70,6 +70,40 @@ ZDOTDIR="$_HERMES_ZDOTDIR"
 
 # ── Hermes overrides (run after all user plugins have loaded) ──
 
+# Prevent space-prefixed commands from entering history.
+# Hermes uses this to keep auto-injected commands out of the user's history.
+setopt HIST_IGNORE_SPACE 2>/dev/null
+
+export HERMES_TERMINAL=1
+
+# Keep Hermes's helper (hi) reachable even when a profile rewrote PATH.
+if [ -n "$HERMES_BIN_DIR" ]; then
+  case ":$PATH:" in *":$HERMES_BIN_DIR:"*) ;; *) export PATH="$HERMES_BIN_DIR:$PATH" ;; esac
+fi
+
+# Tell Hermes the working folder after every cd and at every prompt
+# (OSC 7, percent-encoded), so the status bar, worktree attach and
+# restore follow a cd.
+_hermes_report_cwd() {
+  emulate -L zsh
+  local LC_ALL=C p="$PWD" out="" c hex i
+  for (( i = 1; i <= ${#p}; i++ )); do
+    c="${p[i]}"
+    case "$c" in
+      [-/._~A-Za-z0-9]) out+="$c" ;;
+      *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+    esac
+  done
+  printf '\e]7;file://%s%s\a' "${HOST}" "$out"
+}
+autoload -Uz add-zsh-hook
+add-zsh-hook chpwd _hermes_report_cwd
+add-zsh-hook precmd _hermes_report_cwd
+"#;
+
+/// Appended to the zsh .zshrc when Hermes shows its own inline suggestions:
+/// disables conflicting autosuggestion plugins so the two don't overlap.
+const ZSH_DISABLE_NATIVE_SUGGESTIONS: &str = r#"
 # Disable zsh-autosuggestions — nuclear approach.
 # The plugin may be loaded now or deferred (zinit, zsh-defer, etc.),
 # so we use multiple layers:
@@ -97,12 +131,6 @@ add-zsh-hook precmd _hermes_autosuggest_precmd
 
 # Disable zsh-autocomplete real-time completion menu
 zstyle ':autocomplete:*' min-input 9999 2>/dev/null
-
-# Prevent space-prefixed commands from entering history.
-# Hermes uses this to keep auto-injected commands out of the user's history.
-setopt HIST_IGNORE_SPACE 2>/dev/null
-
-export HERMES_TERMINAL=1
 "#;
 
 /// Zsh .zlogin — last startup file.  Sources user's .zlogin then
@@ -142,21 +170,57 @@ fi
 
 # ── Hermes overrides ──
 
-# Disable ble.sh auto-complete if loaded
-if type ble-bind &>/dev/null 2>&1; then
-  ble-bind -m auto_complete -f '' auto_complete/cancel 2>/dev/null
+export HERMES_TERMINAL=1
+
+# Keep Hermes's helper (hi) reachable even when a profile rewrote PATH.
+if [ -n "$HERMES_BIN_DIR" ]; then
+  case ":$PATH:" in *":$HERMES_BIN_DIR:"*) ;; *) export PATH="$HERMES_BIN_DIR:$PATH" ;; esac
 fi
 
-export HERMES_TERMINAL=1
+# Tell Hermes the working folder at every prompt (OSC 7, percent-encoded),
+# so the status bar, worktree attach and restore follow a cd.
+_hermes_report_cwd() {
+  local LC_ALL=C p="$PWD" out="" c i n
+  for (( i = 0; i < ${#p}; i++ )); do
+    c="${p:i:1}"
+    case "$c" in
+      [-/._~A-Za-z0-9]) out+="$c" ;;
+      # Bytes over 127 read as negative in bash 3: keep the low byte.
+      *) printf -v n '%d' "'$c"; printf -v c '%%%02X' $(( n & 255 )); out+="$c" ;;
+    esac
+  done
+  printf '\e]7;file://%s%s\a' "${HOSTNAME}" "$out"
+}
+if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
+  PROMPT_COMMAND+=(_hermes_report_cwd)
+else
+  case ";${PROMPT_COMMAND:-};" in
+    *";_hermes_report_cwd;"*) ;;
+    *) PROMPT_COMMAND="_hermes_report_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
+  esac
+fi
 
 # Force terminal size re-read (fixes SIGWINCH race during startup)
 kill -WINCH $$ 2>/dev/null
 "#;
 
+/// Appended to the bash init script when Hermes shows its own inline
+/// suggestions: disables ble.sh auto-complete so the two don't overlap.
+const BASH_DISABLE_NATIVE_SUGGESTIONS: &str = r#"
+# Disable ble.sh auto-complete if loaded
+if type ble-bind &>/dev/null 2>&1; then
+  ble-bind -m auto_complete -f '' auto_complete/cancel 2>/dev/null
+fi
+"#;
+
 /// Fish init-command — passed via `fish -C "..."`.
 /// Runs after config.fish, so built-in autosuggestions are already active.
 const FISH_INIT_CMD: &str =
-    "set -g fish_autosuggestion_enabled 0 2>/dev/null; set -gx HERMES_TERMINAL 1";
+    "set -g fish_autosuggestion_enabled 0 2>/dev/null; set -gx HERMES_TERMINAL 1; if set -q HERMES_BIN_DIR; and not contains -- $HERMES_BIN_DIR $PATH; set -gx PATH $HERMES_BIN_DIR $PATH; end";
+
+/// Fish init-command used when Hermes suggestions are off: leaves fish's
+/// built-in autosuggestions alone.
+const FISH_INIT_CMD_NATIVE: &str = "set -gx HERMES_TERMINAL 1; if set -q HERMES_BIN_DIR; and not contains -- $HERMES_BIN_DIR $PATH; set -gx PATH $HERMES_BIN_DIR $PATH; end";
 
 // ─── Setup Functions ─────────────────────────────────────────────────
 
@@ -167,16 +231,20 @@ const FISH_INIT_CMD: &str =
 /// - `Zsh`: set `HERMES_ORIGINAL_ZDOTDIR` and `ZDOTDIR` env vars
 /// - `Bash`: replace `-l` with `--rcfile <path>`
 /// - `Fish`: add `-C <command>` argument
-pub fn setup(shell: &str, session_id: &str) -> ShellIntegration {
+///
+/// When `disable_native_suggestions` is false (the user turned Hermes's own
+/// suggestions off), the user's shell autosuggestion plugins are left alone.
+pub fn setup(shell: &str, session_id: &str, disable_native_suggestions: bool) -> ShellIntegration {
     log::info!(
-        "[SHELL-INTEGRATION] setup called: shell={:?}, session={}",
+        "[SHELL-INTEGRATION] setup called: shell={:?}, session={}, disable_native_suggestions={}",
         shell,
-        session_id
+        session_id,
+        disable_native_suggestions
     );
     let result = if shell.contains("zsh") {
-        setup_zsh(session_id)
+        setup_zsh(session_id, disable_native_suggestions)
     } else if shell.contains("bash") {
-        setup_bash(session_id)
+        setup_bash(session_id, disable_native_suggestions)
     } else if shell.contains("fish") {
         ShellIntegration::Fish
     } else {
@@ -189,23 +257,55 @@ pub fn setup(shell: &str, session_id: &str) -> ShellIntegration {
     result
 }
 
-/// Get the fish init-command string.
-pub fn fish_init_command() -> &'static str {
-    FISH_INIT_CMD
+/// Whether Hermes shows its own inline suggestions, given the raw
+/// `shell_suggestions` setting. `"native"` turns them off; anything else
+/// (including unset) keeps the default of Hermes suggestions on.
+pub fn hermes_suggestions_enabled(setting: Option<&str>) -> bool {
+    setting != Some("native")
 }
 
-fn setup_zsh(session_id: &str) -> ShellIntegration {
-    let dir = std::env::temp_dir().join(format!("hermes-zsh-{}", session_id));
+/// Get the fish init-command string.
+pub fn fish_init_command(disable_native_suggestions: bool) -> &'static str {
+    if disable_native_suggestions {
+        FISH_INIT_CMD
+    } else {
+        FISH_INIT_CMD_NATIVE
+    }
+}
+
+fn zsh_zshrc(disable_native_suggestions: bool) -> String {
+    if disable_native_suggestions {
+        format!("{}{}", ZSH_ZSHRC, ZSH_DISABLE_NATIVE_SUGGESTIONS)
+    } else {
+        ZSH_ZSHRC.to_string()
+    }
+}
+
+fn bash_init(disable_native_suggestions: bool) -> String {
+    if disable_native_suggestions {
+        format!("{}{}", BASH_INIT, BASH_DISABLE_NATIVE_SUGGESTIONS)
+    } else {
+        BASH_INIT.to_string()
+    }
+}
+
+fn setup_zsh(session_id: &str, disable_native_suggestions: bool) -> ShellIntegration {
+    let dir = crate::instance::shell_temp_root().join(format!(
+        "zsh-{}-{}",
+        std::process::id(),
+        session_id
+    ));
     log::info!("[SHELL-INTEGRATION] Creating ZDOTDIR at {:?}", dir);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log::warn!("Failed to create ZDOTDIR for session {}: {}", session_id, e);
         return ShellIntegration::None;
     }
 
+    let zshrc = zsh_zshrc(disable_native_suggestions);
     let files: &[(&str, &str)] = &[
         (".zshenv", ZSH_ZSHENV),
         (".zprofile", ZSH_ZPROFILE),
-        (".zshrc", ZSH_ZSHRC),
+        (".zshrc", &zshrc),
         (".zlogin", ZSH_ZLOGIN),
     ];
 
@@ -221,9 +321,12 @@ fn setup_zsh(session_id: &str) -> ShellIntegration {
     ShellIntegration::Zsh { zdotdir: dir }
 }
 
-fn setup_bash(session_id: &str) -> ShellIntegration {
-    let path = std::env::temp_dir().join(format!("hermes-bash-{}.sh", session_id));
-    if let Err(e) = std::fs::write(&path, BASH_INIT) {
+fn setup_bash(session_id: &str, disable_native_suggestions: bool) -> ShellIntegration {
+    let root = crate::instance::shell_temp_root();
+    let path = root.join(format!("bash-{}-{}.sh", std::process::id(), session_id));
+    let written = std::fs::create_dir_all(&root)
+        .and_then(|_| std::fs::write(&path, bash_init(disable_native_suggestions)));
+    if let Err(e) = written {
         log::warn!(
             "Failed to write bash init for session {}: {}",
             session_id,
@@ -254,27 +357,147 @@ pub fn cleanup(integration: &ShellIntegration) {
     }
 }
 
-/// Clean up any stale shell integration temp files from previous sessions
-/// that weren't properly cleaned up (e.g., app crash).
-pub fn cleanup_stale() {
-    let tmp = std::env::temp_dir();
-
-    // Clean up hermes-zsh-* directories
-    if let Ok(entries) = std::fs::read_dir(&tmp) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if (name_str.starts_with("hermes-zsh-") && entry.path().is_dir())
-                || (name_str.starts_with("hermes-bash-") && name_str.ends_with(".sh"))
-            {
-                if entry.path().is_dir() {
-                    std::fs::remove_dir_all(entry.path()).ok();
-                } else {
-                    std::fs::remove_file(entry.path()).ok();
-                }
-            }
+/// Clean up shell integration temp files left behind by an earlier run of
+/// this same instance (e.g. after a crash).
+///
+/// Only this instance's temp folder is looked at, so another Hermes on the
+/// same machine (installed app, dev, beta or test build) keeps its files. An
+/// entry is removed only when the process that created it is gone — and
+/// its session is not one of `keep_sessions`, the sessions the session host
+/// kept running (their shells are still configured with these files).
+pub fn cleanup_stale(keep_sessions: &[String]) {
+    let root = crate::instance::shell_temp_root();
+    let mut sys = sysinfo::System::new();
+    let removed = cleanup_stale_in(&root, std::process::id(), keep_sessions, |pid| {
+        let pid = sysinfo::Pid::from_u32(pid);
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        sys.process(pid).is_some()
+    });
+    if removed > 0 {
+        log::info!(
+            "[SHELL-INTEGRATION] Removed {} stale temp entries from {:?}",
+            removed,
+            root
+        );
+    }
+    if crate::instance::owns_production_data() {
+        let tmp = std::env::temp_dir();
+        let swept = sweep_legacy_in(&tmp, std::time::SystemTime::now(), LEGACY_MAX_AGE);
+        if swept > 0 {
+            log::info!(
+                "[SHELL-INTEGRATION] Removed {} shell-setup entries left by an older Hermes in {:?}",
+                swept,
+                tmp
+            );
         }
     }
+}
+
+/// How old a legacy entry must be before the installed app removes it.
+const LEGACY_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Removes `hermes-zsh-*` folders and `hermes-bash-*.sh` files that older
+/// versions of the installed app left directly in the temp folder, once they
+/// have not been modified for `max_age`. Only the installed app runs this;
+/// dev, beta and test builds never touch these names. Returns how many
+/// entries were removed.
+fn sweep_legacy_in(
+    temp_dir: &Path,
+    now: std::time::SystemTime,
+    max_age: std::time::Duration,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(temp_dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let legacy = if file_type.is_dir() {
+            name.starts_with("hermes-zsh-")
+        } else {
+            file_type.is_file() && name.starts_with("hermes-bash-") && name.ends_with(".sh")
+        };
+        if !legacy {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= max_age);
+        if !old_enough {
+            continue;
+        }
+        let path = entry.path();
+        let result = if file_type.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if result.is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Process id and session id that a temp entry was created for, from its
+/// name: `zsh-<pid>-<session>` (folder) or `bash-<pid>-<session>.sh`
+/// (file). `None` for anything else.
+fn owner(name: &str, is_dir: bool) -> Option<(u32, &str)> {
+    let rest = if is_dir {
+        name.strip_prefix("zsh-")?
+    } else {
+        name.strip_prefix("bash-")?.strip_suffix(".sh")?
+    };
+    let (pid, session) = rest.split_once('-')?;
+    if session.is_empty() {
+        return None;
+    }
+    Some((pid.parse().ok()?, session))
+}
+
+/// Removes entries in `root` whose creating process is neither `own_pid` nor
+/// alive, except those of `keep_sessions`. Entries it does not recognise are
+/// left alone. Returns how many entries were removed.
+fn cleanup_stale_in(
+    root: &Path,
+    own_pid: u32,
+    keep_sessions: &[String],
+    mut is_alive: impl FnMut(u32) -> bool,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some((pid, session)) = owner(&name, file_type.is_dir()) else {
+            continue;
+        };
+        if pid == own_pid || keep_sessions.iter().any(|k| k == session) || is_alive(pid) {
+            continue;
+        }
+        let path = entry.path();
+        let result = if file_type.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if result.is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
@@ -284,8 +507,217 @@ mod tests {
     use super::*;
 
     #[test]
+    fn temp_files_live_in_this_instances_folder_and_name_their_owner() {
+        let root = crate::instance::shell_temp_root();
+        let pid = std::process::id();
+        let zsh = setup_zsh("owner-zsh", true);
+        let bash = setup_bash("owner-bash", true);
+        match (&zsh, &bash) {
+            (ShellIntegration::Zsh { zdotdir }, ShellIntegration::Bash { rcfile }) => {
+                assert_eq!(zdotdir.parent(), Some(root.as_path()));
+                assert_eq!(rcfile.parent(), Some(root.as_path()));
+                let zname = zdotdir.file_name().unwrap().to_string_lossy().to_string();
+                let bname = rcfile.file_name().unwrap().to_string_lossy().to_string();
+                assert_eq!(zname, format!("zsh-{}-owner-zsh", pid));
+                assert_eq!(bname, format!("bash-{}-owner-bash.sh", pid));
+                assert_eq!(owner(&zname, true), Some((pid, "owner-zsh")));
+                assert_eq!(owner(&bname, false), Some((pid, "owner-bash")));
+            }
+            _ => panic!("expected zsh and bash integrations"),
+        }
+        cleanup(&zsh);
+        cleanup(&bash);
+    }
+
+    #[test]
+    fn stale_cleanup_removes_only_dead_owners_in_its_own_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("hermes-shell-mine");
+        std::fs::create_dir_all(&root).unwrap();
+        let mk_dir = |p: &Path| {
+            std::fs::create_dir_all(p).unwrap();
+            std::fs::write(p.join(".zshrc"), "x").unwrap();
+        };
+        // Leftovers of this instance: pid 111 is dead, 222 is alive, 333 is us.
+        mk_dir(&root.join("zsh-111-dead"));
+        std::fs::write(root.join("bash-111-dead.sh"), "x").unwrap();
+        mk_dir(&root.join("zsh-222-live"));
+        std::fs::write(root.join("bash-222-live.sh"), "x").unwrap();
+        mk_dir(&root.join("zsh-333-own"));
+        // A dead owner whose shell the session host kept running: its files
+        // are still in use.
+        mk_dir(&root.join("zsh-111-hosted"));
+        std::fs::write(root.join("bash-111-hosted.sh"), "x").unwrap();
+        // Things it does not recognise stay.
+        mk_dir(&root.join("zsh-notapid-x"));
+        std::fs::write(root.join("notes.txt"), "x").unwrap();
+        std::fs::write(root.join("zsh-111-file-not-dir"), "x").unwrap();
+        // Another Hermes's files next to our folder: legacy names from an
+        // older installed app and another instance's folder.
+        mk_dir(&tmp.path().join("hermes-zsh-installed-app"));
+        std::fs::write(tmp.path().join("hermes-bash-installed-app.sh"), "x").unwrap();
+        mk_dir(&tmp.path().join("hermes-shell-other").join("zsh-111-other"));
+
+        let mut asked = Vec::new();
+        let removed = cleanup_stale_in(&root, 333, &["hosted".to_string()], |pid| {
+            asked.push(pid);
+            pid == 222
+        });
+
+        assert_eq!(removed, 2);
+        assert!(!root.join("zsh-111-dead").exists());
+        assert!(!root.join("bash-111-dead.sh").exists());
+        assert!(root.join("zsh-111-hosted/.zshrc").exists());
+        assert!(root.join("bash-111-hosted.sh").exists());
+        assert!(root.join("zsh-222-live").exists());
+        assert!(root.join("bash-222-live.sh").exists());
+        assert!(root.join("zsh-333-own").exists());
+        assert!(root.join("zsh-notapid-x").exists());
+        assert!(root.join("notes.txt").exists());
+        assert!(root.join("zsh-111-file-not-dir").exists());
+        assert!(tmp.path().join("hermes-zsh-installed-app/.zshrc").exists());
+        assert!(tmp.path().join("hermes-bash-installed-app.sh").exists());
+        assert!(tmp
+            .path()
+            .join("hermes-shell-other/zsh-111-other/.zshrc")
+            .exists());
+        assert!(!asked.contains(&333), "never asks about its own pid");
+    }
+
+    #[test]
+    fn legacy_sweep_removes_only_old_legacy_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        let mk_dir = |p: &Path| {
+            std::fs::create_dir_all(p).unwrap();
+            std::fs::write(p.join(".zshrc"), "x").unwrap();
+        };
+        mk_dir(&t.join("hermes-zsh-old"));
+        std::fs::write(t.join("hermes-bash-old.sh"), "x").unwrap();
+        // Not legacy shell-setup entries: kept whatever their age.
+        mk_dir(&t.join("hermes-shell-0123456789abcdef").join("zsh-1-x"));
+        std::fs::write(t.join("hermes-bash-old.txt"), "x").unwrap();
+        std::fs::write(t.join("hermes-zsh-file-not-dir"), "x").unwrap();
+        mk_dir(&t.join("hermes-bash-dir-not-file.sh"));
+        mk_dir(&t.join("other-zsh-old"));
+
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        // Everything was just written: nothing is old enough yet.
+        assert_eq!(sweep_legacy_in(t, std::time::SystemTime::now(), day), 0);
+        assert!(t.join("hermes-zsh-old/.zshrc").exists());
+        assert!(t.join("hermes-bash-old.sh").exists());
+
+        // Two days later only the legacy zsh folder and bash file go.
+        let later = std::time::SystemTime::now() + 2 * day;
+        assert_eq!(sweep_legacy_in(t, later, day), 2);
+        assert!(!t.join("hermes-zsh-old").exists());
+        assert!(!t.join("hermes-bash-old.sh").exists());
+        assert!(t
+            .join("hermes-shell-0123456789abcdef/zsh-1-x/.zshrc")
+            .exists());
+        assert!(t.join("hermes-bash-old.txt").exists());
+        assert!(t.join("hermes-zsh-file-not-dir").exists());
+        assert!(t.join("hermes-bash-dir-not-file.sh/.zshrc").exists());
+        assert!(t.join("other-zsh-old/.zshrc").exists());
+    }
+
+    #[test]
+    fn legacy_sweep_of_a_missing_folder_is_a_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        assert_eq!(
+            sweep_legacy_in(
+                &tmp.path().join("absent"),
+                std::time::SystemTime::now(),
+                day
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn only_the_installed_app_sweeps_legacy_entries() {
+        // Unit tests never call `instance::init`, so this process is not the
+        // installed app and `cleanup_stale` must leave legacy names alone.
+        assert!(!crate::instance::owns_production_data());
+    }
+
+    #[test]
+    fn stale_cleanup_of_a_missing_folder_is_a_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            cleanup_stale_in(&tmp.path().join("absent"), 1, &[], |_| false),
+            0
+        );
+    }
+
+    /// The `_hermes_report_cwd` function of an init script, and the line
+    /// that hooks it in.
+    fn report_cwd_function(script: &str) -> String {
+        let start = script
+            .find("_hermes_report_cwd() {")
+            .expect("the script reports its folder");
+        let end = start + script[start..].find("\n}\n").expect("the function ends") + 3;
+        script[start..end].to_string()
+    }
+
+    /// Runs the function in `shell` inside `dir`; None when that shell is
+    /// not installed here.
+    #[cfg(unix)]
+    fn run_report(shell: &str, args: &[&str], script: &str, dir: &Path) -> Option<String> {
+        let body = format!("{}\n_hermes_report_cwd\n", report_cwd_function(script));
+        let out = std::process::Command::new(shell)
+            .args(args)
+            .arg("-c")
+            .arg(body)
+            .current_dir(dir)
+            .env("HOST", "demo-host")
+            .env("HOSTNAME", "demo-host")
+            .output()
+            .ok()?;
+        assert!(
+            out.status.success(),
+            "{shell}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zsh_and_bash_report_the_folder_after_a_cd_percent_encoded() {
+        // CHAOS-06: a `cd` in a plain terminal used to go unnoticed.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("a dir").join("ü%x");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        for (shell, args, script) in [
+            ("zsh", vec!["-f"], ZSH_ZSHRC),
+            ("bash", vec!["--norc", "--noprofile"], BASH_INIT),
+        ] {
+            let Some(out) = run_report(shell, &args, script, &dir) else {
+                continue;
+            };
+            let uri = out
+                .strip_prefix("\u{1b}]7;")
+                .and_then(|s| s.strip_suffix('\u{7}'))
+                .unwrap_or_else(|| panic!("{shell} printed {out:?}"));
+            assert!(uri.starts_with("file://demo-host/"), "{shell}: {uri}");
+            assert!(uri.ends_with("/a%20dir/%C3%BC%25x"), "{shell}: {uri}");
+            assert_eq!(
+                crate::pty::analyzer::osc7_path(uri).as_deref(),
+                dir.to_str(),
+                "{shell}: Hermes reads back the folder"
+            );
+        }
+        assert!(ZSH_ZSHRC.contains("add-zsh-hook chpwd _hermes_report_cwd"));
+        assert!(ZSH_ZSHRC.contains("add-zsh-hook precmd _hermes_report_cwd"));
+        assert!(BASH_INIT.contains("PROMPT_COMMAND=\"_hermes_report_cwd"));
+    }
+
+    #[test]
     fn setup_zsh_creates_all_rc_files() {
-        let integration = setup_zsh("test-zsh-001");
+        let integration = setup_zsh("test-zsh-001", true);
         match &integration {
             ShellIntegration::Zsh { zdotdir } => {
                 assert!(zdotdir.join(".zshenv").exists());
@@ -310,7 +742,7 @@ mod tests {
 
     #[test]
     fn setup_bash_creates_rcfile() {
-        let integration = setup_bash("test-bash-001");
+        let integration = setup_bash("test-bash-001", true);
         match &integration {
             ShellIntegration::Bash { rcfile } => {
                 assert!(rcfile.exists());
@@ -327,21 +759,21 @@ mod tests {
 
     #[test]
     fn setup_fish_returns_fish_variant() {
-        let integration = setup("fish", "test-fish-001");
+        let integration = setup("fish", "test-fish-001", true);
         assert!(matches!(integration, ShellIntegration::Fish));
         assert!(integration.is_active());
     }
 
     #[test]
     fn setup_unknown_shell_returns_none() {
-        let integration = setup("powershell", "test-ps-001");
+        let integration = setup("powershell", "test-ps-001", true);
         assert!(matches!(integration, ShellIntegration::None));
         assert!(!integration.is_active());
     }
 
     #[test]
     fn cleanup_removes_zsh_directory() {
-        let integration = setup_zsh("test-cleanup-zsh");
+        let integration = setup_zsh("test-cleanup-zsh", true);
         let path = match &integration {
             ShellIntegration::Zsh { zdotdir } => zdotdir.clone(),
             _ => panic!("Expected Zsh"),
@@ -353,7 +785,7 @@ mod tests {
 
     #[test]
     fn cleanup_removes_bash_file() {
-        let integration = setup_bash("test-cleanup-bash");
+        let integration = setup_bash("test-cleanup-bash", true);
         let path = match &integration {
             ShellIntegration::Bash { rcfile } => rcfile.clone(),
             _ => panic!("Expected Bash"),
@@ -365,9 +797,53 @@ mod tests {
 
     #[test]
     fn fish_init_command_content() {
-        let cmd = fish_init_command();
+        let cmd = fish_init_command(true);
         assert!(cmd.contains("fish_autosuggestion_enabled"));
         assert!(cmd.contains("HERMES_TERMINAL"));
+    }
+
+    #[test]
+    fn hermes_suggestions_setting_defaults_on() {
+        assert!(hermes_suggestions_enabled(None));
+        assert!(hermes_suggestions_enabled(Some("hermes")));
+        assert!(!hermes_suggestions_enabled(Some("native")));
+    }
+
+    #[test]
+    fn native_suggestions_left_alone_when_hermes_suggestions_off() {
+        // zsh
+        let read_zshrc = |integration: &ShellIntegration| match integration {
+            ShellIntegration::Zsh { zdotdir } => {
+                std::fs::read_to_string(zdotdir.join(".zshrc")).unwrap()
+            }
+            _ => panic!("Expected Zsh"),
+        };
+        let on_integration = setup_zsh("test-native-zsh-on", true);
+        let off_integration = setup_zsh("test-native-zsh-off", false);
+        let on = read_zshrc(&on_integration);
+        let off = read_zshrc(&off_integration);
+        cleanup(&on_integration);
+        cleanup(&off_integration);
+        assert!(on.contains("ZSH_AUTOSUGGEST_STRATEGY"));
+        assert!(on.contains("min-input 9999"));
+        assert!(!off.contains("ZSH_AUTOSUGGEST_STRATEGY"));
+        assert!(!off.contains("min-input 9999"));
+        assert!(off.contains("HERMES_TERMINAL=1"));
+        assert!(off.contains("HIST_IGNORE_SPACE"));
+
+        // bash
+        let bash_off = setup_bash("test-native-bash-off", false);
+        let script = match &bash_off {
+            ShellIntegration::Bash { rcfile } => std::fs::read_to_string(rcfile).unwrap(),
+            _ => panic!("Expected Bash"),
+        };
+        assert!(!script.contains("ble-bind"));
+        assert!(script.contains("HERMES_TERMINAL=1"));
+        cleanup(&bash_off);
+
+        // fish
+        assert!(!fish_init_command(false).contains("fish_autosuggestion_enabled"));
+        assert!(fish_init_command(false).contains("HERMES_TERMINAL"));
     }
 
     #[test]
@@ -412,7 +888,8 @@ mod tests {
     fn zsh_zshrc_sources_user_before_overrides() {
         // User's .zshrc must load BEFORE our overrides, so plugins are
         // already loaded when we disable them.
-        let lines: Vec<&str> = ZSH_ZSHRC.lines().collect();
+        let zshrc = zsh_zshrc(true);
+        let lines: Vec<&str> = zshrc.lines().collect();
         let source_line = lines
             .iter()
             .position(|l| l.contains("source \"$_hermes_user/.zshrc\""));

@@ -5,7 +5,8 @@ import { getSetting, setSetting, getSettings } from "../api/settings";
 import { checkAiProviders } from "../api/sessions";
 import { applyTheme, applyUiScale, DARK_THEMES, LIGHT_THEMES, UI_SCALE_OPTIONS, normalizeThemeId, DEFAULT_THEME_ID } from "../utils/themeManager";
 import { setAnalyticsEnabled } from "../utils/analytics";
-import { AI_PROVIDERS } from "../utils/aiProviders";
+import { installCommand, listAgents } from "../catalog/agentCatalog";
+import { ONBOARDING_COMPLETED_SETTING as SETTING_KEY } from "./startupDialogSettings";
 
 type Step = "welcome" | "theme" | "ai_setup" | "privacy";
 
@@ -29,8 +30,6 @@ const THEME_PREVIEW: Record<string, { bg: string; text: string; accent: string; 
   atrium:          { bg: "#eef2f6", text: "#4a5566", accent: "#4a6a8c", green: "#4a8a6a" },
 };
 
-const SETTING_KEY = "onboarding_completed";
-
 export function OnboardingWizard() {
   const [visible, setVisible] = useState(false);
   const [step, setStep] = useState<Step>("welcome");
@@ -43,8 +42,10 @@ export function OnboardingWizard() {
   const [providerAvailability, setProviderAvailability] = useState<Record<string, boolean>>({});
   const [detectionDone, setDetectionDone] = useState(false);
 
-  // Privacy step
-  const [analyticsOptIn, setAnalyticsOptIn] = useState(true);
+  // Privacy step — private by default: the box starts unchecked, so
+  // closing the wizard without touching it (or without reaching this step)
+  // never turns analytics on.
+  const [analyticsOptIn, setAnalyticsOptIn] = useState(false);
   const [policyAccepted, setPolicyAccepted] = useState(false);
 
   useEffect(() => {
@@ -111,9 +112,7 @@ export function OnboardingWizard() {
 
   const handleFinish = useCallback(async () => {
     // Save analytics preference
-    const telemetryValue = analyticsOptIn ? "true" : "false";
-    await setSetting("telemetry_enabled", telemetryValue).catch(console.warn);
-    setAnalyticsEnabled(analyticsOptIn);
+    await setAnalyticsEnabled(analyticsOptIn);
 
     // Mark onboarding as completed
     await setSetting(SETTING_KEY, "true").catch(console.warn);
@@ -234,7 +233,7 @@ export function OnboardingWizard() {
             <>
               <div className="onboarding-section-label">Detected AI tools</div>
               <div className="onboarding-ai-grid">
-                {AI_PROVIDERS.map((p) => {
+                {listAgents().map((p) => {
                   const available = providerAvailability[p.id];
                   return (
                     <div
@@ -242,7 +241,7 @@ export function OnboardingWizard() {
                       className={`onboarding-ai-card ${detectionDone && !available ? "missing" : ""}`}
                     >
                       <div className="onboarding-ai-card-header">
-                        <span className="onboarding-ai-card-name">{p.label}</span>
+                        <span className="onboarding-ai-card-name">{p.name}</span>
                         {detectionDone ? (
                           <span className={`onboarding-ai-status ${available ? "installed" : "missing"}`}>
                             {available ? "Detected" : "Not found"}
@@ -253,7 +252,7 @@ export function OnboardingWizard() {
                       </div>
                       <div className="onboarding-ai-card-desc">{p.description}</div>
                       {detectionDone && !available && (
-                        <code className="onboarding-ai-install-cmd">{p.installCmd}</code>
+                        <code className="onboarding-ai-install-cmd">{installCommand(p)}</code>
                       )}
                     </div>
                   );

@@ -1,22 +1,31 @@
 import "../styles/components/Settings.css";
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, Suspense } from "react";
+import { createPortal } from "react-dom";
+import { Button, CloseButton, IconButton } from "./ui/Button";
+import { Chip } from "./ui/Chip";
+import { Toggle } from "./ui/Choice";
+import { Input } from "./ui/Input";
+import { NativeSelect } from "./ui/Select";
+import { TabPanel, Tabs } from "./ui/Tabs";
+import { lazyView } from "../utils/lazyView";
 import { useResizablePanel } from "../hooks/useResizablePanel";
 import { useTextContextMenu } from "../hooks/useTextContextMenu";
+import { useFocusTrap } from "../hooks/useFocusTrap";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { applyTheme, applyAgentTimelineStyle, DARK_THEMES, LIGHT_THEMES, UI_SCALE_OPTIONS } from "../utils/themeManager";
 import { fmt, PLATFORM } from "../utils/platform";
+import { shortcutLabel } from "../utils/keymap";
 import {
-  AI_PROVIDERS,
   AI_AGENT_PREFIXES_KEY,
   PREFIX_EXAMPLES,
   parseAgentPrefixes,
   serializeAgentPrefixes,
   getPrefixPlaceholder,
-  buildLaunchPreview,
   type AgentPrefixMap,
 } from "../utils/aiProviders";
+import { buildLaunchPreview, listAgents } from "../catalog/agentCatalog";
 import { useSession } from "../state/SessionContext";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -25,8 +34,35 @@ import {
 } from "../api/settings";
 import { listSshSavedHosts, upsertSshSavedHost, deleteSshSavedHost, type SshSavedHost } from "../api/ssh";
 import { setAnalyticsEnabled } from "../utils/analytics";
-import { SHORTCUT_GROUPS } from "./ShortcutsPanel";
-import { PluginManager } from "./PluginManager";
+import { normalizeUpdateChannel } from "../api/updater";
+import { GENERATED_SHORTCUT_GROUPS } from "../generated/shortcuts";
+import { visibleShortcutGroups } from "../utils/shortcuts";
+import { AgentDoctor } from "./AgentDoctor";
+import { ensureDoctor, useAgentDoctor } from "../launcher/doctorStore";
+import { useI18n } from "../i18n/I18nProvider";
+import { setStatusStripEnabled } from "../statusStrip/preference";
+import {
+  FEATURE_FLAGS,
+  FEATURE_FLAG_OVERRIDES_KEY,
+  parseFeatureFlagOverrides,
+  getReleaseChannel,
+  isFeatureFlagEnabled,
+  type FeatureFlagId,
+} from "../featureFlags";
+import { AwayNotifySetting } from "./AwayNotifySetting";
+import { FleetSettingsTab } from "../fleet/FleetSettingsTab";
+import { AgentsSettings } from "./AgentsSettings";
+
+/** Id prefix of the Settings tabs and their panel. */
+const SETTINGS_TABS_ID = "settings";
+
+// The plugin manager loads when its tab is first opened.
+const PluginManager = lazyView("PluginManager", () => import("./PluginManager").then((m) => m.PluginManager));
+// The hidden controls preview (Flags tab) loads only when opened.
+const UiKitScreen = lazyView("UiKitScreen", () => import("./ui/UiKitScreen").then((m) => m.UiKitScreen));
+const LibrarySettings = lazyView("LibrarySettings", () => import("./library/LibrarySettings").then((m) => m.LibrarySettings));
+// Settings > Storage (diskGuard flag) loads when its tab is first opened.
+const StorageSettings = lazyView("StorageSettings", () => import("./StorageSettings").then((m) => m.StorageSettings));
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║  SETTINGS PAGE — EXPORT / IMPORT CONTRACT                              ║
@@ -57,9 +93,16 @@ interface SettingsProps {
   onConfirmPluginUpdate?: (plugin: import("../plugins/types").RegistryPlugin) => void;
   onConfirmPluginUpdateAll?: (plugins: import("../plugins/types").RegistryPlugin[]) => void;
   pluginRefreshTrigger?: number;
+  /** Agents tab (flag taskLauncher): open a terminal running an agent's CLI to sign in. */
+  onSignInAgent?: (agentId: string) => void;
+  /** 2.0: sign an agent account in (its CLI's own sign-in, in that account's profile). */
+  onSignInAccount?: (agentId: string, accountId: string) => void;
+  /** Agents tab: open the full creator, where a Custom agent is set up. */
+  onOpenAdvancedCreator?: () => void;
 }
 
-export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUpdate, onConfirmPluginUpdateAll, pluginRefreshTrigger }: SettingsProps) {
+export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUpdate, onConfirmPluginUpdateAll, pluginRefreshTrigger, onSignInAgent, onSignInAccount, onOpenAdvancedCreator }: SettingsProps) {
+  const { t } = useI18n();
   const [settings, setSettings] = useState<SettingsMap>({});
   const [shells, setShells] = useState<{ name: string; path: string }[]>([]);
   const [activeTab, setActiveTab] = useState(initialTab || "general");
@@ -74,6 +117,26 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
   }, []);
   const { dispatch } = useSession();
   const { onContextMenu: textContextMenu } = useTextContextMenu();
+
+  // Hidden "Flags" tab: unlocked by clicking the panel title 7 times within
+  // 1.5s of each other, like Android's build-number developer-options
+  // gesture. Not persisted — resets every time Settings is reopened.
+  const [flagsUnlocked, setFlagsUnlocked] = useState(false);
+  const [uiKitOpen, setUiKitOpen] = useState(false);
+  const titleClicks = useRef(0);
+  const titleClickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleTitleClick = useCallback(() => {
+    titleClicks.current += 1;
+    if (titleClickTimer.current) clearTimeout(titleClickTimer.current);
+    titleClickTimer.current = setTimeout(() => { titleClicks.current = 0; }, 1500);
+    if (titleClicks.current >= 7) {
+      titleClicks.current = 0;
+      setFlagsUnlocked(true);
+    }
+  }, []);
+  useEffect(() => () => {
+    if (titleClickTimer.current) clearTimeout(titleClickTimer.current);
+  }, []);
 
   // Live window size state (separate from DB settings)
   const [winWidth, setWinWidth] = useState("");
@@ -92,16 +155,10 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
   const programmaticResize = useRef(false);
   const applyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopImmediatePropagation();
-        onClose();
-      }
-    };
-    document.addEventListener("keydown", handler);
-    return () => document.removeEventListener("keydown", handler);
-  }, [onClose]);
+  // The keyboard is Settings' while it is open (not the terminal behind
+  // it); Esc closes it unless a field inside handled that Esc first.
+  const panelRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(panelRef, { onEscape: onClose, initialFocus: '.settings-tab[aria-selected="true"]' });
 
   useEffect(() => {
     getSettings()
@@ -137,30 +194,28 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
     };
   }, []);
 
-  const AUTONOMOUS_KEYS: Record<string, string> = {
-    auto_command_min_frequency: "commandMinFrequency",
-    auto_cancel_delay_ms: "cancelDelayMs",
-  };
-
   const updateSetting = useCallback((key: string, value: string) => {
     const next = { ...settings, [key]: value };
     setSettings(next);
     if (key === "theme") {
       applyTheme(value, next);
-    } else if (["font_size", "font_family", "scrollback", "ui_scale"].includes(key)) {
+    } else if (["font_size", "font_family", "scrollback", "ui_scale", "shell_suggestions"].includes(key)) {
       applyTheme(next.theme || "frosted-dark", next);
     } else if (key === "agent_timeline_style") {
       applyAgentTimelineStyle(value);
     }
-    setSetting(key, value).catch(console.error);
-    // Sync autonomous settings to live state
-    if (key in AUTONOMOUS_KEYS) {
-      dispatch({
-        type: "SET_AUTONOMOUS_SETTINGS",
-        settings: { [AUTONOMOUS_KEYS[key]]: parseInt(value, 10) || 0 },
-      });
-    }
-  }, [settings, dispatch]);
+    return setSetting(key, value).catch(console.error);
+  }, [settings]);
+
+  // The backend validates the worktree base (must exist, be a writable
+  // directory), so surface its error inline instead of only logging it.
+  const [worktreeBaseError, setWorktreeBaseError] = useState<string | null>(null);
+  const updateWorktreeBasePath = useCallback((value: string) => {
+    setSettings((prev) => ({ ...prev, worktree_base_path: value }));
+    setSetting("worktree_base_path", value)
+      .then(() => setWorktreeBaseError(null))
+      .catch((e) => setWorktreeBaseError(String(e)));
+  }, []);
 
   const applyWindowSize = useCallback((widthStr: string, heightStr: string, immediate = false) => {
     if (applyTimer.current) clearTimeout(applyTimer.current);
@@ -215,15 +270,25 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
   }, []);
 
   const tabs = [
-    { id: "general", label: "General" },
-    { id: "appearance", label: "Appearance" },
-    { id: "ssh", label: "SSH" },
-    { id: "git", label: "Git" },
-    { id: "autonomous", label: "Autonomous" },
-    { id: "ai-agent", label: "AI Agent" },
-    { id: "shortcuts", label: "Shortcuts" },
-    { id: "plugins", label: "Plugins" },
-    { id: "privacy", label: "Privacy" },
+    { id: "general", label: t("settings.general") },
+    { id: "appearance", label: t("settings.appearance") },
+    { id: "ssh", label: t("settings.ssh") },
+    { id: "git", label: t("settings.git") },
+    { id: "ai-agent", label: t("settings.aiAgent") },
+    // 2.0 fleet controls: spend caps and the running-agents cap.
+    ...(isFeatureFlagEnabled("fleetControls") ? [{ id: "limits", label: t("settings.limits") }] : []),
+    // The agent doctor (F16), the same one the welcome screens show.
+    // 2.0 (agentCatalog): accounts, models and presets per agent.
+    ...(isFeatureFlagEnabled("taskLauncher") || isFeatureFlagEnabled("agentCatalog") ? [{ id: "agents", label: t("settings.agents") }] : []),
+    // The prompt library: updates, personalisation, installs into projects.
+    { id: "library", label: t("app.library") },
+    // Old worktrees and the disk they take (disk guard).
+    ...(isFeatureFlagEnabled("diskGuard") ? [{ id: "storage", label: t("storage.title") }] : []),
+    { id: "shortcuts", label: t("settings.shortcuts") },
+    { id: "plugins", label: t("app.plugins") },
+    { id: "privacy", label: t("settings.privacy") },
+    // Hidden developer section, unlocked by handleTitleClick.
+    ...(flagsUnlocked ? [{ id: "flags", label: t("settings.flags") }] : []),
   ];
 
   return (
@@ -232,65 +297,100 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
       onClick={() => handleOverlayClick(onClose)}
       role="dialog"
       aria-modal="true"
-      aria-label="Settings"
+      aria-label={t("settings.title")}
     >
-      <div className="settings-panel" onClick={(e) => e.stopPropagation()} style={{ width: panelWidth, height: panelHeight }}>
+      <div ref={panelRef} className="settings-panel" onClick={(e) => e.stopPropagation()} style={{ width: panelWidth, height: panelHeight }}>
         <div className="settings-resize-handle" onMouseDown={onResizeWidthStart} />
         <div className="settings-resize-handle-bottom" onMouseDown={onResizeHeightStart} />
         <div className="settings-header">
-          <span className="settings-title">Settings</span>
-          <button className="close-btn settings-close" onClick={onClose} aria-label="Close">&times;</button>
+          <span className="settings-title" onClick={handleTitleClick}>{t("settings.title")}</span>
+          <CloseButton className="settings-close" onClick={onClose} label={t("common.close")} />
         </div>
 
         <div className="settings-body">
-          <div className="settings-tabs">
-            {tabs.map((tab) => (
-              <button
-                key={tab.id}
-                className={`settings-tab ${activeTab === tab.id ? "settings-tab-active" : ""}`}
-                onClick={() => setActiveTab(tab.id)}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
+          <Tabs
+            idPrefix={SETTINGS_TABS_ID}
+            orientation="vertical"
+            className="settings-tabs"
+            tabClassName="settings-tab"
+            label={t("settings.title")}
+            value={activeTab}
+            onChange={setActiveTab}
+            tabs={tabs.map((tab) => ({ value: tab.id, label: tab.label }))}
+          />
 
-          <div className="settings-content">
+          <TabPanel idPrefix={SETTINGS_TABS_ID} value={activeTab} className="settings-content">
             {activeTab === "general" && (
               <div className="settings-section">
                 <div className="settings-group">
-                  <label className="settings-label">Default Shell</label>
-                  <select
-                    className="settings-select"
+                  <label className="settings-label" htmlFor="settings-default-shell">{t("settings.defaultShell")}</label>
+                  <NativeSelect
+                    id="settings-default-shell"
                     value={settings.default_shell || ""}
                     onChange={(e) => updateSetting("default_shell", e.target.value)}
                   >
-                    <option value="">System default</option>
+                    <option value="">{t("settings.systemDefault")}</option>
                     {shells.map((s) => (
                       <option key={s.path} value={s.path}>{s.name}</option>
                     ))}
-                  </select>
+                  </NativeSelect>
                 </div>
 
                 <div className="settings-group">
-                  <label className="settings-label">Terminal Scrollback</label>
-                  <select
-                    className="settings-select"
+                  <label className="settings-label" htmlFor="settings-scrollback">{t("settings.terminalScrollback")}</label>
+                  <NativeSelect
+                    id="settings-scrollback"
                     value={settings.scrollback || "10000"}
                     onChange={(e) => updateSetting("scrollback", e.target.value)}
                   >
-                    <option value="5000">5,000 lines</option>
-                    <option value="10000">10,000 lines</option>
-                    <option value="25000">25,000 lines</option>
-                    <option value="50000">50,000 lines</option>
-                  </select>
+                    <option value="5000">{t("settings.lines", { count: "5,000" })}</option>
+                    <option value="10000">{t("settings.lines", { count: "10,000" })}</option>
+                    <option value="25000">{t("settings.lines", { count: "25,000" })}</option>
+                    <option value="50000">{t("settings.lines", { count: "50,000" })}</option>
+                  </NativeSelect>
+                </div>
+
+                <div className="settings-group" data-setting="shell_suggestions">
+                  <Toggle
+                    checked={settings.shell_suggestions !== "native"}
+                    onChange={(on) => updateSetting("shell_suggestions", on ? "hermes" : "native")}
+                    label={t("settings.shellSuggestions")}
+                    description={t("settings.shellSuggestionsHint")}
+                  />
+                </div>
+
+                <div className="settings-group" data-setting="status_strip">
+                  <Toggle
+                    checked={settings.status_strip !== "off"}
+                    onChange={(on) => {
+                      updateSetting("status_strip", on ? "on" : "off");
+                      void setStatusStripEnabled(on);
+                    }}
+                    label={t("settings.statusStrip")}
+                    description={t("settings.statusStripHint")}
+                  />
                 </div>
 
                 <div className="settings-group">
-                  <label className="settings-label">Default Working Directory</label>
-                  <input
-                    className="settings-input"
-                    placeholder="~ (home directory)"
+                  <label className="settings-label" htmlFor="settings-update-channel">{t("settings.updateChannel")}</label>
+                  <NativeSelect
+                    id="settings-update-channel"
+                    data-setting="update_channel"
+                    value={normalizeUpdateChannel(settings.update_channel)}
+                    onChange={(e) => updateSetting("update_channel", normalizeUpdateChannel(e.target.value))}
+                  >
+                    <option value="stable">{t("settings.updateChannelStable")}</option>
+                    <option value="beta">{t("settings.updateChannelBeta")}</option>
+                  </NativeSelect>
+                  <span className="settings-hint-inline">{t("settings.updateChannelHint")}</span>
+                </div>
+
+                <div className="settings-group">
+                  <label className="settings-label" htmlFor="settings-default-cwd">{t("settings.defaultWorkingDirectory")}</label>
+                  <Input
+                    id="settings-default-cwd"
+                    code
+                    placeholder={t("settings.homeDirectoryPlaceholder")}
                     value={settings.default_cwd || ""}
                     onChange={(e) => updateSetting("default_cwd", e.target.value)}
                     onContextMenu={textContextMenu}
@@ -298,26 +398,26 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
                 </div>
 
                 <div className="settings-group">
-                  <label className="settings-label">Command Palette Shortcut</label>
-                  <select
-                    className="settings-select"
+                  <label className="settings-label" htmlFor="settings-palette-shortcut">{t("settings.commandPaletteShortcut")}</label>
+                  <NativeSelect
+                    id="settings-palette-shortcut"
                     value={settings.command_palette_shortcut || "cmd_k"}
                     onChange={(e) => updateSetting("command_palette_shortcut", e.target.value)}
                   >
-                    <option value="cmd_k">{fmt("{mod}K")} (default)</option>
-                    <option value="cmd_shift_p">{fmt("{mod}{shift}P")} (frees {fmt("{mod}K")} for Clear Terminal)</option>
-                  </select>
-                  <span className="settings-hint-inline">Requires restart to update the native menu</span>
+                    <option value="cmd_k">{shortcutLabel("view.command-palette")} ({t("settings.defaultOption")})</option>
+                    <option value="cmd_shift_p">{fmt("{mod}{shift}P")} ({t("settings.freesShortcut", { shortcut: shortcutLabel("view.command-palette") })})</option>
+                  </NativeSelect>
+                  <span className="settings-hint-inline">{t("settings.requiresRestartMenu")}</span>
                 </div>
 
                 <div className="settings-group">
-                  <label className="settings-label">Preferred External Editor</label>
-                  <select
-                    className="settings-select"
+                  <label className="settings-label" htmlFor="settings-preferred-editor">{t("settings.preferredEditor")}</label>
+                  <NativeSelect
+                    id="settings-preferred-editor"
                     value={settings.preferred_editor || ""}
                     onChange={(e) => updateSetting("preferred_editor", e.target.value)}
                   >
-                    <option value="">System Default</option>
+                    <option value="">{t("settings.systemDefault")}</option>
                     <option value="code">VS Code</option>
                     <option value="cursor">Cursor</option>
                     <option value="zed">Zed</option>
@@ -328,45 +428,46 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
                     <option value="vim">Vim</option>
                     <option value="nvim">Neovim</option>
                     <option value="emacs">Emacs</option>
-                  </select>
-                  <span className="settings-hint-inline">Editor used when opening files from the file browser</span>
+                  </NativeSelect>
+                  <span className="settings-hint-inline">{t("settings.editorHint")}</span>
                 </div>
 
                 <div className="settings-group">
-                  <label className="settings-label">Restore Sessions on Launch</label>
-                  <select
-                    className="settings-select"
+                  <label className="settings-label" htmlFor="settings-restore-sessions">{t("settings.restoreSessions")}</label>
+                  <NativeSelect
+                    id="settings-restore-sessions"
                     value={settings.restore_sessions || "always"}
                     onChange={(e) => updateSetting("restore_sessions", e.target.value)}
                   >
-                    <option value="always">Always</option>
-                    <option value="never">Never</option>
-                  </select>
-                  <span className="settings-hint-inline">Re-open previous sessions and layout when the app restarts</span>
+                    <option value="always">{t("settings.always")}</option>
+                    <option value="never">{t("settings.never")}</option>
+                  </NativeSelect>
+                  <span className="settings-hint-inline">{t("settings.restoreHint")}</span>
                 </div>
 
-                <div className="settings-group">
-                  <label className="settings-label">
-                    <input
-                      type="checkbox"
-                      checked={settings.skip_close_confirm !== "true"}
-                      onChange={(e) => {
-                        const skip = !e.target.checked;
-                        updateSetting("skip_close_confirm", skip ? "true" : "false");
-                        dispatch({ type: "SET_SKIP_CLOSE_CONFIRM", skip });
-                      }}
-                    />
-                    {" "}Confirm before closing sessions
-                  </label>
-                  <span className="settings-hint-inline">Show a confirmation dialog when closing a terminal session</span>
+                <div className="settings-group" data-setting="skip_close_confirm">
+                  <Toggle
+                    checked={settings.skip_close_confirm !== "true"}
+                    onChange={(on) => {
+                      const skip = !on;
+                      updateSetting("skip_close_confirm", skip ? "true" : "false");
+                      dispatch({ type: "SET_SKIP_CLOSE_CONFIRM", skip });
+                    }}
+                    label={t("settings.confirmBeforeClosing")}
+                    description={t("settings.confirmBeforeClosingHint")}
+                  />
                 </div>
+
+                {isFeatureFlagEnabled("attentionInbox") && (
+                  <AwayNotifySetting value={settings.away_notify_url || ""} onSave={updateSetting} />
+                )}
               </div>
             )}
 
             {activeTab === "appearance" && (
               <div className="settings-section">
                 <div className="settings-group">
-                  <label className="settings-label">Theme</label>
+                  <label className="settings-label">{t("settings.theme")}</label>
                   <div
                     className="settings-theme-grid"
                     onMouseLeave={() => {
@@ -374,104 +475,101 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
                       applyTheme(saved, settings);
                     }}
                   >
-                    <span className="settings-theme-group-label">Dark</span>
-                    {DARK_THEMES.map((t) => (
-                      <button
-                        key={t.id}
-                        className={`settings-theme-item${(settings.theme || "frosted-dark") === t.id ? " settings-theme-item-active" : ""}`}
-                        onClick={() => updateSetting("theme", t.id)}
-                        onMouseEnter={() => applyTheme(t.id, { ...settings, theme: t.id })}
-                      >
-                        {t.label}
-                      </button>
+                    <span className="settings-theme-group-label">{t("settings.dark")}</span>
+                    {DARK_THEMES.map((theme) => (
+                      <span key={theme.id} className="settings-theme-item" data-theme-id={theme.id} onMouseEnter={() => applyTheme(theme.id, { ...settings, theme: theme.id })}>
+                        <Chip size="sm" selected={(settings.theme || "frosted-dark") === theme.id} onToggle={() => updateSetting("theme", theme.id)}>
+                          {theme.label}
+                        </Chip>
+                      </span>
                     ))}
                     <div className="settings-theme-separator" />
-                    <span className="settings-theme-group-label">Light</span>
-                    {LIGHT_THEMES.map((t) => (
-                      <button
-                        key={t.id}
-                        className={`settings-theme-item${(settings.theme || "frosted-dark") === t.id ? " settings-theme-item-active" : ""}`}
-                        onClick={() => updateSetting("theme", t.id)}
-                        onMouseEnter={() => applyTheme(t.id, { ...settings, theme: t.id })}
-                      >
-                        {t.label}
-                      </button>
+                    <span className="settings-theme-group-label">{t("settings.light")}</span>
+                    {LIGHT_THEMES.map((theme) => (
+                      <span key={theme.id} className="settings-theme-item" data-theme-id={theme.id} onMouseEnter={() => applyTheme(theme.id, { ...settings, theme: theme.id })}>
+                        <Chip size="sm" selected={(settings.theme || "frosted-dark") === theme.id} onToggle={() => updateSetting("theme", theme.id)}>
+                          {theme.label}
+                        </Chip>
+                      </span>
                     ))}
                   </div>
                 </div>
 
                 <div className="settings-group">
-                  <label className="settings-label">Agent Timeline Style</label>
+                  <label className="settings-label" htmlFor="settings-timeline-style">{t("settings.agentTimelineStyle")}</label>
                   <span className="settings-hint-inline">
-                    Modern (default) uses the speaker-chip layout with sans-serif body.
-                    Classic restores the denser logbook style — mono body, brass left
-                    bar on user messages, hairline rules between turns.
+                    {t("settings.agentTimelineHint")}
                   </span>
-                  <select
-                    className="settings-select"
+                  <NativeSelect
+                    id="settings-timeline-style"
                     value={settings.agent_timeline_style || "modern"}
                     onChange={(e) => updateSetting("agent_timeline_style", e.target.value)}
                   >
-                    <option value="modern">Modern (default)</option>
-                    <option value="classic">Classic compact</option>
-                  </select>
+                    <option value="modern">{t("settings.modernDefault")}</option>
+                    <option value="classic">{t("settings.classicCompact")}</option>
+                  </NativeSelect>
                 </div>
 
                 <div className="settings-group">
-                  <label className="settings-label">UI Scale</label>
-                  <span className="settings-hint-inline">Scales icons, text and spacing (not terminal)</span>
-                  <select
-                    className="settings-select"
+                  <label className="settings-label" htmlFor="settings-ui-scale">{t("settings.uiScale")}</label>
+                  <span className="settings-hint-inline">{t("settings.uiScaleHint")}</span>
+                  <NativeSelect
+                    id="settings-ui-scale"
                     value={settings.ui_scale || "default"}
                     onChange={(e) => updateSetting("ui_scale", e.target.value)}
                   >
                     {UI_SCALE_OPTIONS.map((o) => (
                       <option key={o.id} value={o.id}>{o.label}</option>
                     ))}
-                  </select>
+                  </NativeSelect>
                 </div>
 
                 <div className="settings-group">
-                  <label className="settings-label">Terminal Font Size</label>
-                  <select
-                    className="settings-select"
+                  <label className="settings-label" htmlFor="settings-font-size">{t("settings.terminalFontSize")}</label>
+                  <NativeSelect
+                    id="settings-font-size"
                     value={settings.font_size || "14"}
                     onChange={(e) => updateSetting("font_size", e.target.value)}
                   >
                     {[12, 13, 14, 15, 16, 18].map((s) => (
                       <option key={s} value={String(s)}>{s}px</option>
                     ))}
-                  </select>
+                  </NativeSelect>
                 </div>
 
                 <div className="settings-group">
-                  <label className="settings-label">Font Family</label>
-                  <select
-                    className="settings-select"
+                  <label className="settings-label" htmlFor="settings-font-family">{t("settings.fontFamily")}</label>
+                  <NativeSelect
+                    id="settings-font-family"
                     value={settings.font_family || "default"}
                     onChange={(e) => updateSetting("font_family", e.target.value)}
                   >
-                    <option value="default">SF Mono (default)</option>
+                    <option value="default">SF Mono ({t("settings.defaultOption")})</option>
                     <option value="fira">Fira Code</option>
                     <option value="jetbrains">JetBrains Mono</option>
                     <option value="cascadia">Cascadia Code</option>
                     <option value="menlo">Menlo</option>
-                  </select>
+                  </NativeSelect>
                 </div>
 
                 <div className="settings-group">
-                  <label className="settings-label">Window Size</label>
+                  <label className="settings-label">{t("settings.windowSize")}</label>
                   <div className="settings-size-row">
                     <div className="settings-stepper">
-                      <button
+                      <IconButton
+                        size="sm"
                         className="settings-stepper-btn"
+                        icon={"\u2212"}
+                        label={t("settings.decreaseWidth")}
                         onPointerDown={() => startRepeat("w", -10)}
                         onPointerUp={stopRepeat}
                         onPointerLeave={stopRepeat}
-                        title="Decrease width"
-                      >&#9666;</button>
-                      <input
+                      />
+                      <Input
+                        size="sm"
+                        code
                         className="settings-stepper-input"
+                        aria-label={t("settings.windowWidth")}
                         type="text"
                         inputMode="numeric"
                         placeholder="1200"
@@ -479,25 +577,32 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
                         onChange={(e) => { setWinWidth(e.target.value); applyWindowSize(e.target.value, latestH.current); }}
                         onContextMenu={textContextMenu}
                       />
-                      <button
+                      <IconButton
+                        size="sm"
                         className="settings-stepper-btn"
+                        icon="+"
+                        label={t("settings.increaseWidth")}
                         onPointerDown={() => startRepeat("w", 10)}
                         onPointerUp={stopRepeat}
                         onPointerLeave={stopRepeat}
-                        title="Increase width"
-                      >&#9656;</button>
+                      />
                     </div>
                     <span className="settings-size-separator">&times;</span>
                     <div className="settings-stepper">
-                      <button
+                      <IconButton
+                        size="sm"
                         className="settings-stepper-btn"
+                        icon={"\u2212"}
+                        label={t("settings.decreaseHeight")}
                         onPointerDown={() => startRepeat("h", -10)}
                         onPointerUp={stopRepeat}
                         onPointerLeave={stopRepeat}
-                        title="Decrease height"
-                      >&#9666;</button>
-                      <input
+                      />
+                      <Input
+                        size="sm"
+                        code
                         className="settings-stepper-input"
+                        aria-label={t("settings.windowHeight")}
                         type="text"
                         inputMode="numeric"
                         placeholder="800"
@@ -505,13 +610,15 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
                         onChange={(e) => { setWinHeight(e.target.value); applyWindowSize(latestW.current, e.target.value); }}
                         onContextMenu={textContextMenu}
                       />
-                      <button
+                      <IconButton
+                        size="sm"
                         className="settings-stepper-btn"
+                        icon="+"
+                        label={t("settings.increaseHeight")}
                         onPointerDown={() => startRepeat("h", 10)}
                         onPointerUp={stopRepeat}
                         onPointerLeave={stopRepeat}
-                        title="Increase height"
-                      >&#9656;</button>
+                      />
                     </div>
                     <span className="settings-size-unit">px</span>
                   </div>
@@ -522,15 +629,15 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
             {activeTab === "shortcuts" && (
               <div className="settings-section">
                 <p className="settings-hint">
-                  All available keyboard shortcuts. Customization coming soon.
+                  {t("settings.shortcutsHint")}
                 </p>
-                {SHORTCUT_GROUPS.map((group) => (
-                  <div key={group.label} className="settings-shortcut-group">
-                    <div className="settings-shortcut-group-label">{group.label}</div>
+                {visibleShortcutGroups(GENERATED_SHORTCUT_GROUPS).map((group) => (
+                  <div key={group.group} className="settings-shortcut-group">
+                    <div className="settings-shortcut-group-label">{t(group.groupKey)}</div>
                     {group.shortcuts.map((s) => (
-                      <div key={s.keys} className="settings-shortcut-row">
-                        <span className="settings-shortcut-action">{s.action}</span>
-                        <kbd className="settings-shortcut-kbd">{s.keys}</kbd>
+                      <div key={s.id} className="settings-shortcut-row">
+                        <span className="settings-shortcut-action">{t(s.labelKey)}</span>
+                        <kbd className="settings-shortcut-kbd">{fmt(s.keys)}</kbd>
                       </div>
                     ))}
                   </div>
@@ -541,29 +648,29 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
             {activeTab === "ssh" && (
               <div className="settings-section">
                 <div className="settings-group">
-                  <label className="settings-label">SSH File Editor</label>
-                  <select
-                    className="settings-select"
+                  <label className="settings-label" htmlFor="settings-ssh-editor">{t("settings.sshFileEditor")}</label>
+                  <NativeSelect
+                    id="settings-ssh-editor"
                     value={settings.preferred_ssh_editor || "vim"}
                     onChange={(e) => updateSetting("preferred_ssh_editor", e.target.value)}
                   >
-                    <optgroup label="Terminal editors (run in PTY)">
+                    <optgroup label={t("settings.terminalEditors")}>
                       <option value="vim">Vim</option>
                       <option value="nvim">Neovim</option>
                       <option value="nano">Nano</option>
                       <option value="emacs">Emacs</option>
                       <option value="vi">Vi</option>
                     </optgroup>
-                    <optgroup label="GUI editors (open locally via SSH remote)">
+                    <optgroup label={t("settings.guiEditors")}>
                       <option value="code">VS Code (Remote SSH)</option>
                       <option value="cursor">Cursor (Remote SSH)</option>
                       <option value="zed">Zed (Remote SSH)</option>
                     </optgroup>
-                  </select>
-                  <span className="settings-hint-inline">Editor used when opening files on SSH sessions</span>
+                  </NativeSelect>
+                  <span className="settings-hint-inline">{t("settings.sshEditorHint")}</span>
                 </div>
 
-                <h3 className="settings-section-title" style={{ marginTop: 16 }}>Saved Hosts</h3>
+                <h3 className="settings-section-title" style={{ marginTop: 16 }}>{t("settings.savedHosts")}</h3>
 
                 {sshHosts.length > 0 && (
                   <div className="settings-ssh-hosts-list">
@@ -571,20 +678,22 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
                       <div key={h.id} className="settings-ssh-host-item">
                         <div className="settings-ssh-host-info">
                           <span className="settings-ssh-host-label">{h.label}</span>
-                          <span className="settings-ssh-host-detail">{h.user}@{h.host}{h.port !== 22 ? `:${h.port}` : ""}</span>
+                          <span className="settings-ssh-host-detail">{h.user ? `${h.user}@` : ""}{h.host}{h.port !== 22 ? `:${h.port}` : ""}</span>
                         </div>
                         <div className="settings-ssh-host-actions">
-                          <button
-                            className="settings-btn-sm"
-                            onClick={() => setEditingHost({ ...h })}
-                          >Edit</button>
-                          <button
-                            className="settings-btn-sm settings-btn-danger"
+                          <Button size="sm" onClick={() => setEditingHost({ ...h })}>
+                            {t("settings.edit")}
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="danger"
                             onClick={async () => {
                               await deleteSshSavedHost(h.id);
                               setSshHosts((prev) => prev.filter((x) => x.id !== h.id));
                             }}
-                          >Delete</button>
+                          >
+                            {t("common.delete")}
+                          </Button>
                         </div>
                       </div>
                     ))}
@@ -592,45 +701,48 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
                 )}
 
                 {sshHosts.length === 0 && !editingHost && (
-                  <p className="settings-hint">No saved SSH hosts yet.</p>
+                  <p className="settings-hint">{t("settings.noSshHosts")}</p>
                 )}
 
                 {editingHost ? (
                   <div className="settings-ssh-host-form">
                     <div className="settings-group">
-                      <label className="settings-label">Label</label>
-                      <input
-                        className="settings-input"
-                        placeholder="My Server"
+                      <label className="settings-label" htmlFor="settings-ssh-label">{t("settings.label")}</label>
+                      <Input
+                        id="settings-ssh-label"
+                        placeholder={t("settings.serverLabelPlaceholder")}
                         value={editingHost.label}
                         onChange={(e) => setEditingHost({ ...editingHost, label: e.target.value })}
                         onContextMenu={textContextMenu}
                       />
                     </div>
                     <div className="settings-group">
-                      <label className="settings-label">Host</label>
-                      <input
-                        className="settings-input"
-                        placeholder="example.com"
+                      <label className="settings-label" htmlFor="settings-ssh-host">{t("settings.host")}</label>
+                      <Input
+                        id="settings-ssh-host"
+                        code
+                        placeholder={t("settings.hostPlaceholder")}
                         value={editingHost.host}
                         onChange={(e) => setEditingHost({ ...editingHost, host: e.target.value })}
                         onContextMenu={textContextMenu}
                       />
                     </div>
                     <div className="settings-group">
-                      <label className="settings-label">User</label>
-                      <input
-                        className="settings-input"
-                        placeholder="root"
+                      <label className="settings-label" htmlFor="settings-ssh-user">{t("settings.user")}</label>
+                      <Input
+                        id="settings-ssh-user"
+                        code
+                        placeholder={t("settings.userPlaceholder")}
                         value={editingHost.user}
                         onChange={(e) => setEditingHost({ ...editingHost, user: e.target.value })}
                         onContextMenu={textContextMenu}
                       />
                     </div>
                     <div className="settings-group">
-                      <label className="settings-label">Port</label>
-                      <input
-                        className="settings-input"
+                      <label className="settings-label" htmlFor="settings-ssh-port">{t("settings.port")}</label>
+                      <Input
+                        id="settings-ssh-port"
+                        code
                         type="number"
                         placeholder="22"
                         value={editingHost.port}
@@ -638,28 +750,31 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
                       />
                     </div>
                     <div className="settings-group">
-                      <label className="settings-label">Identity File (optional)</label>
-                      <input
-                        className="settings-input"
-                        placeholder="~/.ssh/id_rsa"
+                      <label className="settings-label" htmlFor="settings-ssh-identity">{t("settings.identityFile")}</label>
+                      <Input
+                        id="settings-ssh-identity"
+                        code
+                        placeholder={t("settings.identityFilePlaceholder")}
                         value={editingHost.identity_file || ""}
                         onChange={(e) => setEditingHost({ ...editingHost, identity_file: e.target.value || null })}
                         onContextMenu={textContextMenu}
                       />
                     </div>
                     <div className="settings-group">
-                      <label className="settings-label">Jump Host (optional)</label>
-                      <input
-                        className="settings-input"
-                        placeholder="bastion.example.com"
+                      <label className="settings-label" htmlFor="settings-ssh-jump">{t("settings.jumpHost")}</label>
+                      <Input
+                        id="settings-ssh-jump"
+                        code
+                        placeholder={t("settings.jumpHostPlaceholder")}
                         value={editingHost.jump_host || ""}
                         onChange={(e) => setEditingHost({ ...editingHost, jump_host: e.target.value || null })}
                         onContextMenu={textContextMenu}
                       />
                     </div>
                     <div className="settings-ssh-host-form-actions">
-                      <button
-                        className="settings-btn"
+                      <Button onClick={() => setEditingHost(null)}>{t("common.cancel")}</Button>
+                      <Button
+                        variant="primary"
                         onClick={async () => {
                           if (!editingHost.label.trim() || !editingHost.host.trim() || !editingHost.user.trim()) return;
                           await upsertSshSavedHost(editingHost);
@@ -667,14 +782,14 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
                           setSshHosts(hosts);
                           setEditingHost(null);
                         }}
-                      >Save</button>
-                      <button className="settings-btn" onClick={() => setEditingHost(null)}>Cancel</button>
+                      >
+                        {t("settings.save")}
+                      </Button>
                     </div>
                   </div>
                 ) : (
-                  <button
-                    className="settings-btn"
-                    style={{ marginTop: 8 }}
+                  <Button
+                    className="settings-add-host"
                     onClick={() => setEditingHost({
                       id: crypto.randomUUID(),
                       label: "",
@@ -687,7 +802,9 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
                       created_at: new Date().toISOString(),
                       updated_at: new Date().toISOString(),
                     })}
-                  >Add Host</button>
+                  >
+                    {t("settings.addHost")}
+                  </Button>
                 )}
               </div>
             )}
@@ -695,25 +812,25 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
             {activeTab === "git" && (
               <div className="settings-section">
                 <div className="settings-group">
-                  <label className="settings-label">Auto-refresh Interval</label>
-                  <select
-                    className="settings-select"
+                  <label className="settings-label" htmlFor="settings-git-poll">{t("settings.autoRefreshInterval")}</label>
+                  <NativeSelect
+                    id="settings-git-poll"
                     value={settings.git_poll_interval || "3000"}
                     onChange={(e) => updateSetting("git_poll_interval", e.target.value)}
                   >
-                    <option value="1000">1 second</option>
-                    <option value="3000">3 seconds</option>
-                    <option value="5000">5 seconds</option>
-                    <option value="10000">10 seconds</option>
-                    <option value="0">Off</option>
-                  </select>
+                    <option value="1000">{t("settings.oneSecond")}</option>
+                    <option value="3000">{t("settings.seconds", { count: "3" })}</option>
+                    <option value="5000">{t("settings.seconds", { count: "5" })}</option>
+                    <option value="10000">{t("settings.seconds", { count: "10" })}</option>
+                    <option value="0">{t("settings.off")}</option>
+                  </NativeSelect>
                 </div>
 
                 <div className="settings-group">
-                  <label className="settings-label">Author Name Override</label>
-                  <input
-                    className="settings-input"
-                    placeholder="Use git config (default)"
+                  <label className="settings-label" htmlFor="settings-git-author-name">{t("settings.authorNameOverride")}</label>
+                  <Input
+                    id="settings-git-author-name"
+                    placeholder={t("settings.useGitConfig")}
                     value={settings.git_author_name || ""}
                     onChange={(e) => updateSetting("git_author_name", e.target.value)}
                     onContextMenu={textContextMenu}
@@ -721,102 +838,77 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
                 </div>
 
                 <div className="settings-group">
-                  <label className="settings-label">Author Email Override</label>
-                  <input
-                    className="settings-input"
-                    placeholder="Use git config (default)"
+                  <label className="settings-label" htmlFor="settings-git-author-email">{t("settings.authorEmailOverride")}</label>
+                  <Input
+                    id="settings-git-author-email"
+                    placeholder={t("settings.useGitConfig")}
                     value={settings.git_author_email || ""}
                     onChange={(e) => updateSetting("git_author_email", e.target.value)}
                     onContextMenu={textContextMenu}
                   />
                 </div>
 
-                <div className="settings-group">
-                  <label className="settings-label">Worktree Base Path</label>
+                <div className="settings-group" data-setting="worktree_base_path">
+                  <label className="settings-label" htmlFor="settings-worktree-base-path">{t("settings.worktreeBasePath")}</label>
                   <div className="settings-input-with-btn">
-                    <input
-                      className="settings-input"
-                      placeholder="Default: App Data / hermes-worktrees"
+                    <Input
+                      id="settings-worktree-base-path"
+                      placeholder={t("settings.worktreeBasePathPlaceholder")}
                       value={settings.worktree_base_path || ""}
-                      onChange={(e) => updateSetting("worktree_base_path", e.target.value)}
+                      onChange={(e) => updateWorktreeBasePath(e.target.value)}
                       onContextMenu={textContextMenu}
+                      error={worktreeBaseError ?? undefined}
                     />
-                    <button
-                      className="settings-btn-sm"
+                    <Button
                       onClick={async () => {
                         const selected = await open({
                           directory: true,
                           multiple: false,
-                          title: "Select Worktree Base Directory",
+                          title: t("settings.worktreeBasePathDialogTitle"),
                         });
                         if (selected && typeof selected === "string") {
-                          updateSetting("worktree_base_path", selected);
+                          updateWorktreeBasePath(selected);
                         }
                       }}
                     >
-                      Browse
-                    </button>
+                      {t("common.browse")}
+                    </Button>
                   </div>
-                  <span className="settings-hint-inline">Redirect git worktrees to another directory. Requires a restart to update existing watchers.</span>
+                  <span className="settings-hint-inline">{t("settings.worktreeBasePathHint")}</span>
                 </div>
 
-                <div className="settings-group">
-                  <label className="settings-label settings-label-row">
-                    <input
-                      type="checkbox"
-                      checked={settings.git_auto_stage === "true"}
-                      onChange={(e) => updateSetting("git_auto_stage", e.target.checked ? "true" : "false")}
-                    />
-                    Auto-stage all changes on commit
-                  </label>
+                <div className="settings-group" data-setting="git_auto_stage">
+                  <Toggle
+                    checked={settings.git_auto_stage === "true"}
+                    onChange={(on) => updateSetting("git_auto_stage", on ? "true" : "false")}
+                    label={t("settings.autoStageCommit")}
+                  />
                 </div>
 
-                <div className="settings-group">
-                  <label className="settings-label settings-label-row">
-                    <input
-                      type="checkbox"
-                      checked={settings.git_show_untracked !== "false"}
-                      onChange={(e) => updateSetting("git_show_untracked", e.target.checked ? "true" : "false")}
-                    />
-                    Show untracked files
-                  </label>
+                <div className="settings-group" data-setting="git_show_untracked">
+                  <Toggle
+                    checked={settings.git_show_untracked !== "false"}
+                    onChange={(on) => updateSetting("git_show_untracked", on ? "true" : "false")}
+                    label={t("settings.showUntracked")}
+                  />
                 </div>
+
+                {/* F20 turn ledger kill switch: only shown while the flag is on. */}
+                {isFeatureFlagEnabled("turnLedger") && (
+                  <div className="settings-group" data-setting="turn_ledger">
+                    <Toggle
+                      checked={settings.turn_ledger !== "off"}
+                      onChange={(on) => updateSetting("turn_ledger", on ? "on" : "off")}
+                      label={t("settings.turnLedger")}
+                      description={<span data-setting-hint="turn_ledger">{t("settings.turnLedgerHint")}</span>}
+                    />
+                  </div>
+                )}
               </div>
             )}
 
 
-            {activeTab === "autonomous" && (
-              <div className="settings-section">
-                <p className="settings-hint">
-                  Autonomous mode auto-executes frequent commands and repeated error fixes
-                  after a countdown. Adjust thresholds below.
-                </p>
-                <div className="settings-group">
-                  <label className="settings-label">
-                    Min command frequency for auto-predict: {settings.auto_command_min_frequency || "5"}
-                  </label>
-                  <input
-                    type="range"
-                    className="settings-range"
-                    min="2" max="20" step="1"
-                    value={settings.auto_command_min_frequency || "5"}
-                    onChange={(e) => updateSetting("auto_command_min_frequency", e.target.value)}
-                  />
-                </div>
-                <div className="settings-group">
-                  <label className="settings-label">
-                    Cancel delay: {settings.auto_cancel_delay_ms ? `${parseInt(settings.auto_cancel_delay_ms) / 1000}s` : "3s"}
-                  </label>
-                  <input
-                    type="range"
-                    className="settings-range"
-                    min="1000" max="10000" step="1000"
-                    value={settings.auto_cancel_delay_ms || "3000"}
-                    onChange={(e) => updateSetting("auto_cancel_delay_ms", e.target.value)}
-                  />
-                </div>
-              </div>
-            )}
+            {activeTab === "limits" && isFeatureFlagEnabled("fleetControls") && <FleetSettingsTab />}
 
             {activeTab === "ai-agent" && (
               <AiAgentSettingsTab
@@ -828,67 +920,136 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
             {activeTab === "plugins" && (
               <>
                 <div className="settings-section">
-                  <h3 className="settings-section-title">Plugin Updates</h3>
+                  <h3 className="settings-section-title">{t("settings.pluginUpdates")}</h3>
                   <div className="settings-group">
-                    <label className="settings-label">Check for plugin updates</label>
-                    <select
-                      className="settings-select"
+                    <label className="settings-label" htmlFor="settings-plugin-update-check">{t("settings.checkPluginUpdates")}</label>
+                    <NativeSelect
+                      id="settings-plugin-update-check"
                       value={settings.plugin_update_check || "startup"}
                       onChange={(e) => updateSetting("plugin_update_check", e.target.value)}
                     >
-                      <option value="startup">On startup</option>
-                      <option value="daily">Daily</option>
-                      <option value="weekly">Weekly</option>
-                      <option value="never">Never</option>
-                    </select>
+                      <option value="startup">{t("settings.onStartup")}</option>
+                      <option value="daily">{t("settings.daily")}</option>
+                      <option value="weekly">{t("settings.weekly")}</option>
+                      <option value="never">{t("settings.never")}</option>
+                    </NativeSelect>
                   </div>
-                  <div className="settings-group">
-                    <label className="settings-label-row">
-                      <input
-                        type="checkbox"
-                        checked={settings.plugin_auto_update === "true"}
-                        onChange={(e) =>
-                          updateSetting("plugin_auto_update", e.target.checked ? "true" : "false")
-                        }
-                      />
-                      Auto-update plugins
-                    </label>
-                    <p className="settings-hint">
-                      Automatically install plugin updates when they become available.
-                    </p>
+                  <div className="settings-group" data-setting="plugin_auto_update">
+                    <Toggle
+                      checked={settings.plugin_auto_update === "true"}
+                      onChange={(on) => updateSetting("plugin_auto_update", on ? "true" : "false")}
+                      label={t("settings.autoUpdatePlugins")}
+                      description={t("settings.autoUpdatePluginsHint")}
+                    />
                   </div>
                 </div>
-                <PluginManager runtime={pluginRuntime} onConfirmUpdate={onConfirmPluginUpdate} onConfirmUpdateAll={onConfirmPluginUpdateAll} refreshTrigger={pluginRefreshTrigger} />
+                <Suspense fallback={null}><PluginManager runtime={pluginRuntime} onConfirmUpdate={onConfirmPluginUpdate} onConfirmUpdateAll={onConfirmPluginUpdateAll} refreshTrigger={pluginRefreshTrigger} /></Suspense>
               </>
+            )}
+
+            {activeTab === "library" && (
+              <Suspense fallback={null}>
+                <LibrarySettings />
+              </Suspense>
+            )}
+
+            {activeTab === "agents" && isFeatureFlagEnabled("agentCatalog") && (
+              <div className="settings-section settings-agents-capabilities">
+                <AgentsSettings
+                  onSignInAccount={(agentId, accountId) => {
+                    onSignInAccount?.(agentId, accountId);
+                    onClose();
+                  }}
+                />
+              </div>
+            )}
+            {activeTab === "agents" && isFeatureFlagEnabled("taskLauncher") && (
+              <div className="settings-section settings-agents-doctor">
+                <p className="settings-hint">{t("settings.agentsDoctorHint")}</p>
+                <AgentDoctor
+                  // Settings > Agents has one "Check again" (above the cards), which checks this too.
+                  showRecheck={!isFeatureFlagEnabled("agentCatalog")}
+                  onSignIn={(agentId) => {
+                    onSignInAgent?.(agentId);
+                    onClose();
+                  }}
+                  onOpenAdvanced={
+                    onOpenAdvancedCreator
+                      ? () => {
+                          // The creator first: Settings closing must not bring
+                          // back a launcher it was opened from.
+                          onOpenAdvancedCreator();
+                          onClose();
+                        }
+                      : undefined
+                  }
+                />
+              </div>
+            )}
+
+            {activeTab === "storage" && (
+              <Suspense fallback={null}><StorageSettings settings={settings} onChange={updateSetting} /></Suspense>
             )}
 
             {activeTab === "privacy" && (
               <div className="settings-section">
-                <div className="settings-group">
-                  <label className="settings-label-row">
-                    <input
-                      type="checkbox"
-                      checked={settings.telemetry_enabled === "true"}
-                      onChange={(e) => {
-                        const val = e.target.checked;
-                        updateSetting("telemetry_enabled", val ? "true" : "false");
-                        setAnalyticsEnabled(val);
-                      }}
-                    />
-                    Send anonymous usage analytics
-                  </label>
-                  <p className="settings-hint">
-                    Help improve Hermes IDE by sending anonymous usage data. No personal information, terminal content, or file paths are collected.
-                  </p>
+                <div className="settings-group" data-setting="telemetry_enabled">
+                  <Toggle
+                    checked={settings.telemetry_enabled === "true"}
+                    onChange={(on) => {
+                      updateSetting("telemetry_enabled", on ? "true" : "false");
+                      void setAnalyticsEnabled(on);
+                    }}
+                    label={t("settings.analytics")}
+                    description={t("settings.analyticsHint")}
+                  />
                 </div>
               </div>
             )}
-          </div>
+
+            {activeTab === "flags" && flagsUnlocked && (
+              <div className="settings-section">
+                <p className="settings-hint">{t("settings.flags.hint", { channel: getReleaseChannel() })}</p>
+                <div className="settings-group">
+                  <Button data-testid="ui-kit-open" onClick={() => setUiKitOpen(true)}>
+                    {t("settings.flags.uiKit")}
+                  </Button>
+                  <span className="settings-hint-inline">{t("settings.flags.uiKitHint")}</span>
+                </div>
+                {FEATURE_FLAGS.map((flag) => {
+                  const overrides = parseFeatureFlagOverrides(settings[FEATURE_FLAG_OVERRIDES_KEY]);
+                  const current = overrides[flag.id];
+                  const selectValue = current === undefined ? "default" : current ? "on" : "off";
+                  return (
+                    <div className="settings-group" key={flag.id}>
+                      <label className="settings-label" htmlFor={`settings-flag-${flag.id}`}>{flag.label}</label>
+                      <span className="settings-hint-inline">{flag.description}</span>
+                      <NativeSelect
+                        id={`settings-flag-${flag.id}`}
+                        data-flag-id={flag.id}
+                        value={selectValue}
+                        onChange={(e) => {
+                          const next: Partial<Record<FeatureFlagId, boolean>> = { ...overrides };
+                          if (e.target.value === "default") delete next[flag.id];
+                          else next[flag.id] = e.target.value === "on";
+                          updateSetting(FEATURE_FLAG_OVERRIDES_KEY, JSON.stringify(next));
+                        }}
+                      >
+                        <option value="default">{t("settings.flags.default")}</option>
+                        <option value="on">{t("settings.flags.forceOn")}</option>
+                        <option value="off">{t("settings.flags.forceOff")}</option>
+                      </NativeSelect>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </TabPanel>
         </div>
 
         <div className="settings-footer">
-          <button
-            className="settings-btn"
+          <Button
+            className="settings-export"
             onClick={async () => {
               const path = await save({
                 defaultPath: "settings.json",
@@ -897,17 +1058,17 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
               if (path) {
                 try {
                   await exportSettings(path);
-                  setFooterStatus("Settings exported");
+                  setFooterStatus(t("settings.exported"));
                 } catch (e) {
-                  setFooterStatus(`Export failed: ${e}`);
+                  setFooterStatus(t("settings.exportFailed", { error: String(e) }));
                 }
               }
             }}
           >
-            Export Settings
-          </button>
-          <button
-            className="settings-btn"
+            {t("settings.export")}
+          </Button>
+          <Button
+            className="settings-import"
             onClick={async () => {
               const path = await open({
                 filters: [{ name: "JSON", extensions: ["json"] }],
@@ -920,27 +1081,26 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
                   // Apply theme + UI scale
                   applyTheme(newSettings.theme || "frosted-dark", newSettings);
                   // Sync analytics state
-                  setAnalyticsEnabled(newSettings.telemetry_enabled === "true");
-                  // Sync autonomous settings to live state
-                  for (const [settingKey, stateKey] of Object.entries(AUTONOMOUS_KEYS)) {
-                    if (newSettings[settingKey]) {
-                      dispatch({
-                        type: "SET_AUTONOMOUS_SETTINGS",
-                        settings: { [stateKey]: parseInt(newSettings[settingKey], 10) || 0 },
-                      });
-                    }
-                  }
-                  setFooterStatus("Settings imported");
+                  void setAnalyticsEnabled(newSettings.telemetry_enabled === "true");
+                  setFooterStatus(t("settings.imported"));
                 } catch (e) {
-                  setFooterStatus(`Import failed: ${e}`);
+                  setFooterStatus(t("settings.importFailed", { error: String(e) }));
                 }
               }
             }}
           >
-            Import Settings
-          </button>
+            {t("settings.import")}
+          </Button>
           {footerStatus && <span className="settings-footer-status">{footerStatus}</span>}
         </div>
+        {/* Inside the panel, whose click handler keeps clicks from closing Settings. */}
+        {uiKitOpen &&
+          createPortal(
+            <Suspense fallback={null}>
+              <UiKitScreen onClose={() => setUiKitOpen(false)} uiScale={settings.ui_scale} />
+            </Suspense>,
+            document.body,
+          )}
       </div>
     </div>
   );
@@ -950,7 +1110,7 @@ export function Settings({ onClose, initialTab, pluginRuntime, onConfirmPluginUp
 //
 // Displays per-agent prefix + suffix configuration. The prefix is stored as a
 // single JSON blob under `ai_agent_prefixes`, so adding a new provider to
-// AI_PROVIDERS never requires a DB schema or settings-whitelist change.
+// the agent catalog (src/catalog/agents.json) never requires a DB schema or settings-whitelist change.
 
 interface AiAgentSettingsTabProps {
   settings: SettingsMap;
@@ -958,6 +1118,7 @@ interface AiAgentSettingsTabProps {
 }
 
 function AiAgentSettingsTab({ settings, updateSetting }: AiAgentSettingsTabProps) {
+  const { t } = useI18n();
   const prefixes = parseAgentPrefixes(settings[AI_AGENT_PREFIXES_KEY]);
   const examples = PREFIX_EXAMPLES[PLATFORM];
   const placeholder = getPrefixPlaceholder(PLATFORM);
@@ -971,52 +1132,63 @@ function AiAgentSettingsTab({ settings, updateSetting }: AiAgentSettingsTabProps
     updateSetting(AI_AGENT_PREFIXES_KEY, serializeAgentPrefixes(next));
   };
 
+  // A row per installed agent (and per agent that has a prefix already);
+  // the rest of the catalog behind "Show all agents". Until the doctor has
+  // answered, every agent is listed.
+  const { rows: doctorRows } = useAgentDoctor();
+  useEffect(() => {
+    ensureDoctor();
+  }, []);
+  const [showAll, setShowAll] = useState(false);
+  const allAgents = listAgents();
+  const installedIds = doctorRows ? new Set(doctorRows.filter((r) => r.installed).map((r) => r.id)) : null;
+  const shownAgents =
+    showAll || !installedIds ? allAgents : allAgents.filter((p) => installedIds.has(p.id) || (prefixes[p.id] ?? "").trim() !== "");
+  const hiddenCount = allAgents.length - shownAgents.length;
+
   return (
     <div className="settings-section">
       <p className="settings-hint">
-        Default permission mode and launch-command customization for new AI agent sessions.
-        All values can be overridden per session in the session creator.
+        {t("settings.aiAgentHint")}
       </p>
 
       <div className="settings-group">
-        <label className="settings-label">Default permission mode</label>
-        <select
-          className="settings-select"
+        <label className="settings-label" htmlFor="settings-default-permission-mode">{t("settings.defaultPermissionMode")}</label>
+        <NativeSelect
+          id="settings-default-permission-mode"
           value={settings.default_permission_mode || "default"}
           onChange={(e) => updateSetting("default_permission_mode", e.target.value)}
         >
-          <option value="default">Ask Permissions</option>
-          <option value="acceptEdits">Accept Edits</option>
-          <option value="plan">Plan Mode</option>
-          <option value="auto">Auto Mode</option>
-          <option value="bypassPermissions">Bypass Permissions</option>
-        </select>
+          <option value="default">{t("settings.askPermissions")}</option>
+          <option value="acceptEdits">{t("settings.acceptEdits")}</option>
+          <option value="plan">{t("settings.planMode")}</option>
+          <option value="auto">{t("settings.autoMode")}</option>
+          <option value="bypassPermissions">{t("settings.bypassPermissions")}</option>
+        </NativeSelect>
       </div>
 
       <div className="settings-group">
-        <label className="settings-label">Custom command suffix (applies to every agent)</label>
-        <input
-          type="text"
-          className="settings-input"
+        <label className="settings-label" htmlFor="settings-command-suffix">{t("settings.customCommandSuffix")}</label>
+        <Input
+          id="settings-command-suffix"
+          code
           value={settings.custom_command_suffix || ""}
           onChange={(e) => updateSetting("custom_command_suffix", e.target.value)}
-          placeholder="e.g. --model opus --max-tokens 4096"
+          placeholder={t("settings.customCommandSuffixPlaceholder")}
         />
         <p className="settings-hint">
-          Text appended to AI agent launch commands in every new session.
+          {t("settings.customCommandSuffixHint")}
         </p>
       </div>
 
-      <h3 className="settings-section-title" style={{ marginTop: 16 }}>Per-agent launch prefix</h3>
+      <h3 className="settings-section-title" style={{ marginTop: 16 }}>{t("settings.perAgentPrefix")}</h3>
       <p className="settings-hint">
-        Prepended to the launch command for the matching agent — e.g. {" "}
-        <code>caffeinate -i claude</code> on macOS or <code>wsl claude</code> on Windows.
-        Runs on your local machine. Ignored for SSH sessions.
+        {t("settings.perAgentPrefixHint", { example1: "caffeinate -i claude", example2: "wsl claude" })}
       </p>
 
       <fieldset className="settings-agent-prefix-grid">
-        <legend className="settings-agent-prefix-legend">Agents</legend>
-        {AI_PROVIDERS.map((p) => {
+        <legend className="settings-agent-prefix-legend">{t("settings.agents")}</legend>
+        {shownAgents.map((p) => {
           const value = prefixes[p.id] ?? "";
           const inputId = `agent-prefix-${p.id}`;
           const hintId = `agent-prefix-hint-${p.id}`;
@@ -1024,12 +1196,11 @@ function AiAgentSettingsTab({ settings, updateSetting }: AiAgentSettingsTabProps
           return (
             <div key={p.id} className="settings-agent-prefix-row">
               <label htmlFor={inputId} className="settings-agent-prefix-label">
-                {p.label}
+                {p.name}
               </label>
-              <input
+              <Input
                 id={inputId}
-                type="text"
-                className="settings-input"
+                code
                 value={value}
                 onChange={(e) => setPrefix(p.id, e.target.value)}
                 placeholder={placeholder}
@@ -1039,17 +1210,17 @@ function AiAgentSettingsTab({ settings, updateSetting }: AiAgentSettingsTabProps
                 autoCorrect="off"
               />
               {examples.length > 0 && (
-                <div className="settings-agent-prefix-chips" role="group" aria-label={`${p.label} prefix examples`}>
+                <div className="settings-agent-prefix-chips" role="group" aria-label={t("settings.prefixExamples", { agent: p.name })}>
                   {examples.map((ex) => (
-                    <button
+                    <Button
                       key={ex.value}
-                      type="button"
+                      size="sm"
                       className="settings-agent-prefix-chip"
                       title={ex.hint}
                       onClick={() => setPrefix(p.id, ex.value)}
                     >
                       {ex.label}
-                    </button>
+                    </Button>
                   ))}
                 </div>
               )}
@@ -1058,12 +1229,18 @@ function AiAgentSettingsTab({ settings, updateSetting }: AiAgentSettingsTabProps
                 className="settings-agent-prefix-preview"
                 aria-live="polite"
               >
-                <span className="settings-agent-prefix-preview-label">Preview</span>
-                <code className="settings-agent-prefix-preview-cmd">{preview || p.label}</code>
+                <span className="settings-agent-prefix-preview-label">{t("settings.preview")}</span>
+                <code className="settings-agent-prefix-preview-cmd">{preview || p.name}</code>
               </div>
             </div>
           );
         })}
+        {shownAgents.length === 0 && <p className="settings-hint">{t("settings.noAgentsInstalled")}</p>}
+        {hiddenCount > 0 && (
+          <Button size="sm" variant="link" className="settings-agent-prefix-show-all" onClick={() => setShowAll(true)}>
+            {t("settings.showAllAgents", { count: hiddenCount })}
+          </Button>
+        )}
       </fieldset>
     </div>
   );

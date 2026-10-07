@@ -2,7 +2,12 @@ import "../styles/components/SessionBranchSelector.css";
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { gitListBranchesForProject, listWorktrees, checkBranchAvailable, fetchRemoteBranches } from "../api/git";
 import { validateBranchName } from "./GitBranchSelector";
+import { defaultTaskBranch } from "../state/isolation";
+import { findBranchClash } from "../utils/branchClash";
 import type { GitBranch, WorktreeInfo } from "../types/git";
+import { useI18n } from "../i18n/I18nProvider";
+import { Badge, Button, Input, Segmented, Select } from "./ui";
+import { cx } from "./ui/Button";
 
 interface SessionBranchSelectorProps {
   projectId: string;
@@ -24,8 +29,28 @@ interface SessionBranchSelectorProps {
    *      what's currently chosen and can change it.
    */
   existingBranchName?: string;
+  /**
+   * Honest isolation (flag `honestIsolation`): when set, the default is a
+   * NEW branch `hermes/<slug>` cut from HEAD (made unique against the
+   * repo's branches) instead of the current branch, and the "New branch"
+   * tab starts filled in with it so it can be edited.
+   */
+  defaultTaskSlug?: string;
   onBranchSelected: (branchName: string, createNew: boolean, fromRemote?: string) => void;
   onSkip: () => void;
+  /**
+   * What the open "New branch" form holds, so the step's own Continue can
+   * commit a name the user typed but did not confirm with "Create & use"
+   * (it used to go on with the proposed branch instead). `ok` is false while
+   * the name is one that cannot be created. null: nothing typed, the other
+   * tab, or the picker closed.
+   */
+  onDraftChange?: (draft: BranchDraft | null) => void;
+}
+
+export interface BranchDraft {
+  name: string;
+  ok: boolean;
 }
 
 type Tab = "existing" | "new";
@@ -101,7 +126,8 @@ export function sortBranchesMainFirst<T extends { name: string; is_remote: boole
   });
 }
 
-export function SessionBranchSelector({ projectId, existingBranchName, onBranchSelected, onSkip }: SessionBranchSelectorProps) {
+export function SessionBranchSelector({ projectId, existingBranchName, defaultTaskSlug, onBranchSelected, onSkip, onDraftChange }: SessionBranchSelectorProps) {
+  const { t } = useI18n();
   // Keep the latest onBranchSelected behind a ref so loadData can read
   // it without including it in the useCallback dependency array.  The
   // parent re-creates the inline callback on every render; if we put it
@@ -117,6 +143,8 @@ export function SessionBranchSelector({ projectId, existingBranchName, onBranchS
   // at mount time inside loadData.
   const existingBranchNameRef = useRef(existingBranchName);
   existingBranchNameRef.current = existingBranchName;
+  const defaultTaskSlugRef = useRef(defaultTaskSlug);
+  defaultTaskSlugRef.current = defaultTaskSlug;
 
   const [tab, setTab] = useState<Tab>("existing");
   const [branches, setBranches] = useState<GitBranch[]>([]);
@@ -183,7 +211,20 @@ export function SessionBranchSelector({ projectId, existingBranchName, onBranchS
       // "Use Branch", or skip isolation entirely via "Use current
       // branch" (which calls onSkip and clears the selection upstream).
       const priorSelection = existingBranchNameRef.current;
-      if (priorSelection) {
+      const taskSlug = defaultTaskSlugRef.current;
+      if (taskSlug) {
+        // Honest isolation: every task gets its own new branch by default,
+        // so two tasks never land in the same checkout. Editable in the
+        // "New branch" tab, which starts filled in with it.
+        const localNames = branchList.filter((b) => !b.is_remote).map((b) => b.name);
+        const proposed = defaultTaskBranch(taskSlug, localNames);
+        const shown = priorSelection ?? proposed;
+        const priorIsExisting = !!priorSelection && localNames.includes(priorSelection);
+        setNewBranchName(priorIsExisting ? proposed : shown);
+        setTab(priorIsExisting ? "existing" : "new");
+        if (priorSelection) setSelectedBranch(priorSelection);
+        else if (localNames.length > 0 || current) onBranchSelectedRef.current(proposed, true);
+      } else if (priorSelection) {
         // Pre-highlight the user's existing choice so they can see it
         // and either click another row or click "Use Branch" to keep
         // it.  We deliberately do NOT call onBranchSelected here — the
@@ -344,6 +385,16 @@ export function SessionBranchSelector({ projectId, existingBranchName, onBranchS
     }
   }, [highlightedIndex]);
 
+  // A typed name that is an existing branch, also when only the letter case
+  // differs (on macOS and Windows `Develop` IS `develop`): never "new".
+  const nameClash = useMemo(
+    () => (newBranchName.trim() ? findBranchClash(newBranchName.trim(), localBranchNames) : null),
+    [newBranchName, localBranchNames],
+  );
+  const clashedBranch = nameClash && nameClash.kind !== "folder"
+    ? augmentedBranches.find((b) => !b.is_remote && b.name === nameClash.existing)
+    : undefined;
+
   // Validate new branch name
   useEffect(() => {
     if (!newBranchName.trim()) {
@@ -355,15 +406,24 @@ export function SessionBranchSelector({ projectId, existingBranchName, onBranchS
       setValidationError(nameError);
       return;
     }
-    if (localBranchNames.has(newBranchName)) {
-      setValidationError("A branch with this name already exists");
+    if (nameClash) {
+      setValidationError(
+        nameClash.kind === "same"
+          ? t("branch.exists", { branch: nameClash.existing })
+          : nameClash.kind === "case"
+            ? t("branch.caseClash", { branch: nameClash.existing })
+            : t("branch.folderClash", { branch: nameClash.existing }),
+      );
       return;
     }
-    // Check availability via backend
+    // Check availability via backend. An answer that comes back after the
+    // name changed belongs to the old name and must not touch the error.
+    let stale = false;
     setCheckingAvailability(true);
     const timer = setTimeout(() => {
       checkBranchAvailable(projectId, newBranchName)
         .then((result) => {
+          if (stale) return;
           if (!result.available) {
             setValidationError(
               result.usedBySession
@@ -376,12 +436,33 @@ export function SessionBranchSelector({ projectId, existingBranchName, onBranchS
         })
         .catch(() => {
           // Non-blocking — allow creation attempt
-          setValidationError(null);
+          if (!stale) setValidationError(null);
         })
-        .finally(() => setCheckingAvailability(false));
+        .finally(() => {
+          if (!stale) setCheckingAvailability(false);
+        });
     }, 300);
-    return () => clearTimeout(timer);
-  }, [newBranchName, projectId, localBranchNames]);
+    return () => {
+      stale = true;
+      clearTimeout(timer);
+      setCheckingAvailability(false);
+    };
+  }, [newBranchName, projectId, nameClash, t]);
+
+  // Tell the parent what the New branch form holds (see onDraftChange). While
+  // the availability check runs, the last answer belongs to the previous name.
+  const onDraftChangeRef = useRef(onDraftChange);
+  onDraftChangeRef.current = onDraftChange;
+  const draftName = tab === "new" ? newBranchName.trim() : "";
+  const draftOk =
+    !!draftName &&
+    !validateBranchName(draftName) &&
+    !nameClash &&
+    (checkingAvailability || !validationError);
+  useEffect(() => {
+    onDraftChangeRef.current?.(draftName ? { name: draftName, ok: draftOk } : null);
+  }, [draftName, draftOk]);
+  useEffect(() => () => onDraftChangeRef.current?.(null), []);
 
   /**
    * Single-click commits.  Clicking a row on the Existing Branch tab fires
@@ -419,6 +500,8 @@ export function SessionBranchSelector({ projectId, existingBranchName, onBranchS
   }, [newBranchName, validationError, checkingAvailability, onBranchSelected]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    // A control that took the key (the tabs' arrows, the base branch list) keeps it.
+    if (e.defaultPrevented) return;
     if (tab === "existing") {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -447,8 +530,8 @@ export function SessionBranchSelector({ projectId, existingBranchName, onBranchS
   if (loading) {
     return (
       <div className="branch-selector-body">
-        <div className="session-creator-section-title">Select Branch</div>
-        <div className="branch-selector-loading">Loading branches...</div>
+        <div className="session-creator-section-title">{t("branch.selectBranch")}</div>
+        <div className="branch-selector-loading">{t("branch.loading")}</div>
       </div>
     );
   }
@@ -457,17 +540,17 @@ export function SessionBranchSelector({ projectId, existingBranchName, onBranchS
   if (error) {
     return (
       <div className="branch-selector-body">
-        <div className="session-creator-section-title">Select Branch</div>
+        <div className="session-creator-section-title">{t("branch.selectBranch")}</div>
         <div className="branch-selector-error">
-          <span>Failed to load branches: {error}</span>
-          <button className="branch-selector-error-retry" onClick={loadData} title="Retry loading branches">
-            Retry
-          </button>
+          <span>{t("branch.loadFailed", { error })}</span>
+          <Button size="sm" className="branch-selector-error-retry" onClick={loadData} title={t("branch.retryLoading")}>
+            {t("common.retry")}
+          </Button>
         </div>
         <div className="session-creator-actions">
-          <button className="session-creator-btn-secondary" onClick={onSkip}>
-            Use current branch
-          </button>
+          <Button className="session-creator-btn-secondary" onClick={onSkip}>
+            {t("branch.useCurrent")}
+          </Button>
         </div>
       </div>
     );
@@ -477,15 +560,14 @@ export function SessionBranchSelector({ projectId, existingBranchName, onBranchS
   if (unifiedBranches.length === 0) {
     return (
       <div className="branch-selector-body">
-        <div className="session-creator-section-title">Select Branch</div>
+        <div className="session-creator-section-title">{t("branch.selectBranch")}</div>
         <div className="branch-selector-empty">
-          No local branches found. This project may not be a git repository,
-          or the repository has no commits yet.
+          {t("branch.noneFound")}
         </div>
         <div className="session-creator-actions">
-          <button className="session-creator-btn-secondary" onClick={onSkip}>
-            Use current branch
-          </button>
+          <Button className="session-creator-btn-secondary" onClick={onSkip}>
+            {t("branch.useCurrent")}
+          </Button>
         </div>
       </div>
     );
@@ -493,45 +575,43 @@ export function SessionBranchSelector({ projectId, existingBranchName, onBranchS
 
   return (
     <div className="branch-selector-body" onKeyDown={handleKeyDown}>
-      <div className="session-creator-section-title">Select Branch</div>
+      <div className="session-creator-section-title">{t("branch.selectBranch")}</div>
 
       {/* Tab switcher */}
-      <div className="branch-selector-tabs">
-        <button
-          className={`branch-selector-tab ${tab === "existing" ? "active" : ""}`}
-          onClick={() => setTab("existing")}
-        >
-          Existing Branch
-        </button>
-        <button
-          className={`branch-selector-tab ${tab === "new" ? "active" : ""}`}
-          onClick={() => setTab("new")}
-        >
-          New Branch
-        </button>
+      <div className="branch-selector-bar">
+        <Segmented<Tab>
+          className="branch-selector-tabs"
+          label={t("branch.selectBranch")}
+          value={tab}
+          onChange={setTab}
+          options={[
+            { value: "existing", label: t("branch.existingBranch"), attrs: { className: cx("branch-selector-tab", tab === "existing" && "active") } },
+            { value: "new", label: t("branch.newBranch"), attrs: { className: cx("branch-selector-tab", tab === "new" && "active") } },
+          ]}
+        />
         {tab === "existing" && (
-          <button
+          <Button
+            variant="quiet"
+            size="sm"
             className="branch-selector-fetch-link"
             onClick={handleRefreshRemotes}
             disabled={fetchingRemotes}
-            title="Fetch latest branches from remote"
+            loading={fetchingRemotes}
+            title={t("branch.fetchLatest")}
           >
-            {fetchingRemotes ? (
-              <><span className="branch-selector-fetch-spinner" /> Fetching...</>
-            ) : (
-              "↻ Fetch"
-            )}
-          </button>
+            {fetchingRemotes ? t("branch.fetching") : `↻ ${t("branch.fetch")}`}
+          </Button>
         )}
       </div>
 
       {/* Existing branch tab */}
       {tab === "existing" && (
         <>
-          <input
+          <Input
             ref={searchRef}
-            className="command-palette-input"
-            placeholder="Filter branches..."
+            className="branch-selector-filter"
+            aria-label={t("branch.filterBranches")}
+            placeholder={t("branch.filterBranches")}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             autoComplete="off"
@@ -542,7 +622,7 @@ export function SessionBranchSelector({ projectId, existingBranchName, onBranchS
           <div className="branch-selector-list" ref={listRef}>
             {flatFiltered.length === 0 && (
               <div className="branch-selector-empty">
-                No branches matching &ldquo;{search}&rdquo;
+                {t("branch.noMatches", { query: search })}
               </div>
             )}
 
@@ -565,13 +645,13 @@ export function SessionBranchSelector({ projectId, existingBranchName, onBranchS
                 >
                   <span className="branch-selector-item-name">{displayName}</span>
                   {branch.is_current && (
-                    <span className="branch-selector-item-current">current</span>
+                    <Badge tone="success" className="branch-selector-item-current">{t("branch.current")}</Badge>
                   )}
                   {branch.is_remote && !branch.taken && (
-                    <span className="branch-selector-item-remote-badge">remote</span>
+                    <Badge tone="info" className="branch-selector-item-remote-badge">{t("branch.remote")}</Badge>
                   )}
                   {branch.taken && (
-                    <span className="branch-selector-item-taken-label">in use</span>
+                    <Badge className="branch-selector-item-taken-label">{t("branch.inUse")}</Badge>
                   )}
                   {/* Hover-only affordance telegraphing single-click commits.
                       Hidden on .branch-selector-item-taken via CSS. */}
@@ -592,35 +672,56 @@ export function SessionBranchSelector({ projectId, existingBranchName, onBranchS
       {tab === "new" && (
         <div className="branch-selector-new-form">
           <div className="branch-selector-field">
-            <label className="branch-selector-field-label">Branch Name</label>
-            <input
+            <label className="branch-selector-field-label" htmlFor={`branch-selector-name-${projectId}`}>{t("branch.branchName")}</label>
+            <Input
+              id={`branch-selector-name-${projectId}`}
               ref={newBranchRef}
-              className={`branch-selector-field-input ${validationError ? "invalid" : ""}`}
+              code
+              className="branch-selector-field-input"
               placeholder="feature/my-branch"
               value={newBranchName}
               onChange={(e) => setNewBranchName(e.target.value)}
+              // Not the field's `error`: that draws the input anew when the
+              // message comes and goes, and the typing would lose the focus.
+              invalid={!!validationError}
+              aria-describedby={validationError ? `branch-selector-name-error-${projectId}` : undefined}
               autoComplete="off"
               autoCorrect="off"
               autoCapitalize="off"
               spellCheck={false}
             />
             {validationError && (
-              <span className="branch-selector-validation-error">{validationError}</span>
+              <span id={`branch-selector-name-error-${projectId}`} className="h-field-error branch-selector-validation-error">
+                {validationError}
+              </span>
+            )}
+            {/* The name is an existing branch: use that one on purpose, or type another name. */}
+            {clashedBranch && !clashedBranch.taken && (
+              <Button
+                variant="link"
+                size="sm"
+                className="branch-selector-use-existing"
+                data-branch={clashedBranch.name}
+                onClick={() => handleCommitBranch(clashedBranch.name)}
+              >
+                {t("branch.useExisting", { branch: clashedBranch.name })}
+              </Button>
             )}
           </div>
           <div className="branch-selector-field">
-            <label className="branch-selector-field-label">Based On</label>
-            <select
+            <span className="branch-selector-field-label" id={`branch-selector-base-${projectId}`}>{t("branch.basedOn")}</span>
+            <Select
+              code
               className="branch-selector-field-select"
+              aria-labelledby={`branch-selector-base-${projectId}`}
               value={baseBranch}
-              onChange={(e) => setBaseBranch(e.target.value)}
-            >
-              {localAugmentedBranches.map((b) => (
-                <option key={b.name} value={b.name}>
-                  {b.name}{b.is_current ? " (current)" : ""}
-                </option>
-              ))}
-            </select>
+              onChange={setBaseBranch}
+              options={localAugmentedBranches.map((b) => ({
+                value: b.name,
+                label: b.name,
+                detail: b.is_current ? t("branch.current") : undefined,
+              }))}
+            />
           </div>
         </div>
       )}
@@ -637,21 +738,22 @@ export function SessionBranchSelector({ projectId, existingBranchName, onBranchS
        * New tab: the submit button stays — the user is typing into a form and
        * there is nothing to single-click on. */}
       <div className="session-creator-actions">
-        <button
+        <Button
           className="session-creator-btn-secondary"
           onClick={onSkip}
-          title="Uses the same branch as other sessions — changes will be shared"
+          title={t("branch.useCurrentHint")}
         >
-          Use current branch
-        </button>
+          {t("branch.useCurrent")}
+        </Button>
+        {/* Secondary: the branch step's one primary is its own Continue. */}
         {tab === "new" && (
-          <button
-            className="session-creator-btn-primary"
+          <Button
+            className="branch-selector-create"
             onClick={handleConfirmNew}
             disabled={!newBranchName.trim() || !!validationError || checkingAvailability}
           >
-            {checkingAvailability ? "Checking..." : "Create & Use Branch"}
-          </button>
+            {checkingAvailability ? t("common.checking") : t("branch.createAndUse")}
+          </Button>
         )}
       </div>
     </div>

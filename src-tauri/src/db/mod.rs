@@ -7,29 +7,8 @@ use tauri::{AppHandle, Emitter, State};
 use crate::pty::SessionUpdate;
 use crate::AppState;
 
-// ─── Execution Nodes ─────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionNode {
-    pub id: i64,
-    pub session_id: String,
-    pub timestamp: i64,
-    pub kind: String,
-    pub input: Option<String>,
-    pub output_summary: Option<String>,
-    pub exit_code: Option<i32>,
-    pub working_dir: String,
-    pub duration_ms: i64,
-    pub metadata: Option<String>,
-}
-
-// ─── Command Patterns ────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommandPrediction {
-    pub next_command: String,
-    pub frequency: i64,
-}
+pub mod migrations;
+pub mod startup;
 
 // ─── Context Pins ────────────────────────────────────────────────────
 
@@ -133,7 +112,9 @@ pub struct CostDailyEntry {
 
 // ─── Session Worktrees ──────────────────────────────────────────────
 
+/// Sent to the frontend in camelCase, which is what `src/types/git.ts` reads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionWorktreeRow {
     pub id: String,
     pub session_id: String,
@@ -162,7 +143,26 @@ pub struct SshSavedHost {
 
 impl Database {
     pub fn new(path: &Path) -> Result<Self, String> {
-        let conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
+        Self::open(path).map_err(|e| e.to_string())
+    }
+
+    /// Open (creating if needed) and migrate the database at `path`.
+    ///
+    /// A database written by a newer Hermes is refused before anything is
+    /// written to it. Before pending migrations run on an existing database,
+    /// a backup is saved next to it (see `migrations`).
+    pub fn open(path: &Path) -> Result<Self, migrations::OpenError> {
+        // Nothing below may touch a newer database, not even a WAL a crash
+        // left next to it (that one is checked through a read-only connection).
+        migrations::check_file_not_newer(path, migrations::MIGRATIONS)?;
+        let conn = Connection::open(path)
+            .map_err(|e| migrations::OpenError::Sqlite(format!("{}: {}", path.display(), e)))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| migrations::OpenError::Sqlite(e.to_string()))?;
+        // Only reads; closing this connection on a cleanly closed database
+        // changes nothing and removes any -wal/-shm it created.
+        migrations::check_not_newer(&conn, migrations::MIGRATIONS)?;
+
         // Performance PRAGMAs (DB-01).
         // - journal_mode=WAL: concurrent readers + single writer, fewer fsyncs
         // - synchronous=NORMAL: safe under WAL, ~3-5x faster writes than FULL
@@ -180,400 +180,10 @@ impl Database {
              PRAGMA foreign_keys=ON;
              PRAGMA busy_timeout=5000;",
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| migrations::OpenError::Sqlite(e.to_string()))?;
 
-        let db = Self { conn };
-        db.run_migrations()?;
-        Ok(db)
-    }
-
-    fn run_migrations(&self) -> Result<(), String> {
-        self.conn.execute_batch("
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                label TEXT NOT NULL,
-                color TEXT NOT NULL DEFAULT '#58a6ff',
-                group_name TEXT,
-                phase TEXT NOT NULL DEFAULT 'destroyed',
-                working_directory TEXT NOT NULL,
-                shell TEXT NOT NULL,
-                workspace_paths TEXT NOT NULL DEFAULT '[]',
-                worktree_base_path TEXT,
-                created_at TEXT NOT NULL,
-                closed_at TEXT,
-                scrollback_snapshot TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS token_usage (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                model TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL DEFAULT 0,
-                output_tokens INTEGER NOT NULL DEFAULT 0,
-                estimated_cost_usd REAL DEFAULT 0.0,
-                recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_token_session ON token_usage(session_id, provider);
-
-            CREATE TABLE IF NOT EXISTS token_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                model TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL,
-                cost_usd REAL NOT NULL,
-                recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_token_snap_session ON token_snapshots(session_id);
-            CREATE INDEX IF NOT EXISTS idx_token_snap_date ON token_snapshots(recorded_at);
-
-            CREATE TABLE IF NOT EXISTS cost_daily (
-                date TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                model TEXT NOT NULL,
-                total_input_tokens INTEGER NOT NULL DEFAULT 0,
-                total_output_tokens INTEGER NOT NULL DEFAULT 0,
-                total_cost_usd REAL NOT NULL DEFAULT 0.0,
-                session_count INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (date, provider, model)
-            );
-
-            CREATE TABLE IF NOT EXISTS memory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                scope TEXT NOT NULL CHECK(scope IN ('session', 'project', 'global')),
-                scope_id TEXT NOT NULL,
-                category TEXT NOT NULL DEFAULT 'general',
-                key TEXT NOT NULL,
-                value TEXT NOT NULL,
-                source TEXT NOT NULL DEFAULT 'auto',
-                confidence REAL NOT NULL DEFAULT 1.0,
-                access_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-                expires_at TEXT,
-                UNIQUE(scope, scope_id, key)
-            );
-            CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory(scope, scope_id);
-
-            CREATE TABLE IF NOT EXISTS execution_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                content TEXT NOT NULL,
-                exit_code INTEGER,
-                working_directory TEXT,
-                timestamp TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_exec_session ON execution_log(session_id, timestamp);
-
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS projects (
-                id TEXT PRIMARY KEY,
-                path TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                detected_languages TEXT,
-                detected_frameworks TEXT,
-                file_tree_hash TEXT,
-                worktree_base_path TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_projects_path ON projects(path);
-
-            CREATE TABLE IF NOT EXISTS execution_nodes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                kind TEXT NOT NULL DEFAULT 'command',
-                input TEXT,
-                output_summary TEXT,
-                exit_code INTEGER,
-                working_dir TEXT NOT NULL,
-                duration_ms INTEGER DEFAULT 0,
-                metadata TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_exec_nodes_session ON execution_nodes(session_id, timestamp);
-
-            CREATE TABLE IF NOT EXISTS error_patterns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id TEXT,
-                fingerprint TEXT NOT NULL,
-                raw_sample TEXT,
-                occurrence_count INTEGER DEFAULT 1,
-                last_seen INTEGER,
-                resolution TEXT,
-                resolution_verified INTEGER DEFAULT 0,
-                created_at INTEGER DEFAULT (strftime('%s','now'))
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_error_fp ON error_patterns(project_id, fingerprint);
-
-            CREATE TABLE IF NOT EXISTS command_patterns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id TEXT,
-                sequence TEXT NOT NULL,
-                next_command TEXT NOT NULL,
-                frequency INTEGER DEFAULT 1,
-                last_seen INTEGER DEFAULT (strftime('%s','now')),
-                UNIQUE(project_id, sequence, next_command)
-            );
-            CREATE INDEX IF NOT EXISTS idx_cmd_patterns ON command_patterns(project_id, sequence);
-
-            CREATE TABLE IF NOT EXISTS context_pins (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT,
-                project_id TEXT,
-                kind TEXT NOT NULL CHECK(kind IN ('file','memory','text','directory')),
-                target TEXT NOT NULL,
-                label TEXT,
-                priority INTEGER DEFAULT 128,
-                created_at INTEGER DEFAULT (strftime('%s','now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_pins_session ON context_pins(session_id);
-            CREATE INDEX IF NOT EXISTS idx_pins_project ON context_pins(project_id);
-
-            CREATE TABLE IF NOT EXISTS error_sessions (
-                error_pattern_id INTEGER NOT NULL,
-                session_id TEXT NOT NULL,
-                last_seen INTEGER NOT NULL,
-                occurrence_count INTEGER DEFAULT 1,
-                PRIMARY KEY (error_pattern_id, session_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS realms (
-                id TEXT PRIMARY KEY,
-                path TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                languages TEXT NOT NULL DEFAULT '[]',
-                frameworks TEXT NOT NULL DEFAULT '[]',
-                architecture TEXT,
-                conventions TEXT NOT NULL DEFAULT '[]',
-                scan_status TEXT NOT NULL DEFAULT 'pending',
-                last_scanned_at TEXT,
-                worktree_base_path TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_realms_path ON realms(path);
-
-            CREATE TABLE IF NOT EXISTS session_realms (
-                session_id TEXT NOT NULL,
-                realm_id TEXT NOT NULL,
-                attached_at TEXT NOT NULL DEFAULT (datetime('now')),
-                role TEXT NOT NULL DEFAULT 'primary',
-                PRIMARY KEY (session_id, realm_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_session_realms_session ON session_realms(session_id);
-
-            CREATE TABLE IF NOT EXISTS realm_conventions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                realm_id TEXT NOT NULL,
-                rule TEXT NOT NULL,
-                source TEXT NOT NULL DEFAULT 'detected',
-                confidence REAL NOT NULL DEFAULT 0.8,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(realm_id, rule)
-            );
-            CREATE INDEX IF NOT EXISTS idx_conventions_realm ON realm_conventions(realm_id);
-
-            CREATE TABLE IF NOT EXISTS context_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                version INTEGER NOT NULL,
-                context_json TEXT NOT NULL,
-                created_at INTEGER DEFAULT (strftime('%s','now')),
-                UNIQUE(session_id, version)
-            );
-            CREATE INDEX IF NOT EXISTS idx_ctx_snap_session ON context_snapshots(session_id);
-
-            CREATE TABLE IF NOT EXISTS hermes_project_config (
-                realm_id TEXT PRIMARY KEY,
-                config_json TEXT NOT NULL,
-                config_hash TEXT,
-                loaded_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS session_worktrees (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                realm_id TEXT NOT NULL,
-                worktree_path TEXT NOT NULL,
-                branch_name TEXT,
-                is_main_worktree INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(session_id, realm_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_sw_session ON session_worktrees(session_id);
-            CREATE INDEX IF NOT EXISTS idx_sw_realm ON session_worktrees(realm_id);
-            CREATE INDEX IF NOT EXISTS idx_sw_path ON session_worktrees(worktree_path);
-
-            CREATE TABLE IF NOT EXISTS plugins (
-                id TEXT PRIMARY KEY,
-                version TEXT NOT NULL,
-                name TEXT NOT NULL,
-                description TEXT,
-                author TEXT,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                permissions_granted TEXT NOT NULL DEFAULT '[]',
-                installed_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS plugin_storage (
-                plugin_id TEXT NOT NULL,
-                key TEXT NOT NULL,
-                value TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-                PRIMARY KEY (plugin_id, key)
-            );
-            CREATE INDEX IF NOT EXISTS idx_plugin_storage_plugin ON plugin_storage(plugin_id);
-        ").map_err(|e| format!("Migration failed: {}", e))?;
-
-        // Migrate existing workspace projects table → realms table (one-time, idempotent)
-        self.conn.execute_batch("
-            INSERT OR IGNORE INTO realms (id, path, name, languages, frameworks, scan_status, created_at, updated_at)
-            SELECT id, path, name,
-                   COALESCE(detected_languages, '[]'),
-                   COALESCE(detected_frameworks, '[]'),
-                   'surface',
-                   created_at,
-                   updated_at
-            FROM projects;
-        ").map_err(|e| format!("Workspace projects migration failed: {}", e))?;
-
-        // Add description column to sessions (idempotent)
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE sessions ADD COLUMN description TEXT NOT NULL DEFAULT '';");
-
-        // Add ssh_info column to sessions (idempotent)
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE sessions ADD COLUMN ssh_info TEXT;");
-
-        // SSH saved hosts table (idempotent)
-        let _ = self.conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS ssh_saved_hosts (
-                id TEXT PRIMARY KEY,
-                label TEXT NOT NULL,
-                host TEXT NOT NULL,
-                port INTEGER NOT NULL DEFAULT 22,
-                user TEXT NOT NULL,
-                identity_file TEXT,
-                jump_host TEXT,
-                port_forwards TEXT NOT NULL DEFAULT '[]',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-        ",
-        );
-
-        // Add last_activity_at column to session_worktrees (idempotent)
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE session_worktrees ADD COLUMN last_activity_at TEXT;");
-
-        // Add worktree_base_path column to projects (idempotent)
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE projects ADD COLUMN worktree_base_path TEXT;");
-
-        // Add worktree_base_path column to realms (idempotent)
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE realms ADD COLUMN worktree_base_path TEXT;");
-
-        // Add worktree_base_path column to sessions (idempotent)
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE sessions ADD COLUMN worktree_base_path TEXT;");
-
-        // Migration: drop UNIQUE(worktree_path) constraint from session_worktrees
-        // so that shared worktrees (multiple sessions on the same branch) can coexist.
-        // SQLite doesn't support ALTER TABLE DROP CONSTRAINT, so we recreate the table.
-        // We check if the old UNIQUE index exists before attempting the migration.
-        let has_unique_wt_path: bool = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_index_list('session_worktrees') WHERE name = 'sqlite_autoindex_session_worktrees_2'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-            > 0;
-
-        if has_unique_wt_path {
-            self.conn
-                .execute_batch(
-                    "
-                    CREATE TABLE session_worktrees_new (
-                        id TEXT PRIMARY KEY,
-                        session_id TEXT NOT NULL,
-                        realm_id TEXT NOT NULL,
-                        worktree_path TEXT NOT NULL,
-                        branch_name TEXT,
-                        is_main_worktree INTEGER NOT NULL DEFAULT 0,
-                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                        last_activity_at TEXT,
-                        UNIQUE(session_id, realm_id)
-                    );
-                    INSERT INTO session_worktrees_new (id, session_id, realm_id, worktree_path, branch_name, is_main_worktree, created_at, last_activity_at)
-                        SELECT id, session_id, realm_id, worktree_path, branch_name, is_main_worktree, created_at, last_activity_at
-                        FROM session_worktrees;
-                    DROP TABLE session_worktrees;
-                    ALTER TABLE session_worktrees_new RENAME TO session_worktrees;
-                    CREATE INDEX IF NOT EXISTS idx_sw_session ON session_worktrees(session_id);
-                    CREATE INDEX IF NOT EXISTS idx_sw_realm ON session_worktrees(realm_id);
-                    CREATE INDEX IF NOT EXISTS idx_sw_path ON session_worktrees(worktree_path);
-                    ",
-                )
-                .map_err(|e| {
-                    format!(
-                        "Migration (drop UNIQUE worktree_path) failed: {}",
-                        e
-                    )
-                })?;
-        }
-
-        // Project usage tracking table (idempotent)
-        let _ = self.conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS project_usage (
-                project_id TEXT PRIMARY KEY,
-                session_count INTEGER NOT NULL DEFAULT 0,
-                last_opened_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-        ",
-        );
-
-        // Performance indexes (DB-08 / DB-09 / DB-10 / DB-11). All idempotent.
-        // - idx_sessions_closed_phase: speeds get_recent_sessions (filter on phase + sort by closed_at).
-        // - idx_token_usage_recorded_at: speeds get_token_usage_today and update_cost_daily_rollup
-        //   (both filter on recorded_at; previously only an index on session_id existed).
-        // - idx_session_realms_realm: speeds get_sessions_for_project and delete_project (WHERE realm_id = ?).
-        // - idx_cmd_patterns_freq: covering index for predict_next_command's
-        //   ORDER BY frequency DESC LIMIT N on the keystroke hot path.
-        let _ = self.conn.execute_batch(
-            "
-            CREATE INDEX IF NOT EXISTS idx_sessions_closed_phase
-                ON sessions(closed_at DESC, phase) WHERE closed_at IS NOT NULL;
-            CREATE INDEX IF NOT EXISTS idx_token_usage_recorded_at
-                ON token_usage(recorded_at);
-            CREATE INDEX IF NOT EXISTS idx_session_realms_realm
-                ON session_realms(realm_id);
-            CREATE INDEX IF NOT EXISTS idx_cmd_patterns_freq
-                ON command_patterns(project_id, sequence, frequency DESC);
-            ",
-        );
-
-        Ok(())
+        migrations::migrate(&conn, Some(path), migrations::MIGRATIONS)?;
+        Ok(Self { conn })
     }
 
     // ─── Project Usage ──────────────────────────────────────────
@@ -595,7 +205,7 @@ impl Database {
     pub fn get_all_projects_ordered(&self) -> Result<Vec<crate::project::ProjectOrdered>, String> {
         let mut stmt = self.conn.prepare(
             "SELECT r.id, r.path, r.name, r.languages, r.frameworks, r.architecture, r.conventions,
-                    r.scan_status, r.last_scanned_at, r.created_at, r.updated_at, r.worktree_base_path,
+                    r.scan_status, r.last_scanned_at, r.created_at, r.updated_at,
                     COALESCE(pu.session_count, 0) AS session_count,
                     pu.last_opened_at
              FROM realms r
@@ -624,9 +234,8 @@ impl Database {
                     last_scanned_at: row.get(8)?,
                     created_at: row.get(9)?,
                     updated_at: row.get(10)?,
-                    worktree_base_path: row.get(11)?,
-                    session_count: row.get(12)?,
-                    last_opened_at: row.get(13)?,
+                    session_count: row.get(11)?,
+                    last_opened_at: row.get(12)?,
                     path_exists: false, // filled in by the command handler
                 })
             })
@@ -643,10 +252,10 @@ impl Database {
 
     pub fn create_session_v2(&self, s: &SessionUpdate) -> Result<(), String> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO sessions (id, label, description, color, group_name, phase, working_directory, shell, workspace_paths, worktree_base_path, created_at, ssh_info)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT OR REPLACE INTO sessions (id, label, description, color, group_name, phase, working_directory, shell, workspace_paths, created_at, ssh_info)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![s.id, s.label, s.description, s.color, s.group, s.phase, s.working_directory, s.shell,
-                    serde_json::to_string(&s.workspace_paths).unwrap_or_default(), s.worktree_base_path, s.created_at,
+                    serde_json::to_string(&s.workspace_paths).unwrap_or_default(), s.created_at,
                     s.ssh_info.as_ref().map(|info| serde_json::to_string(info).unwrap_or_default())],
         ).map_err(|e| e.to_string())?;
         Ok(())
@@ -681,19 +290,6 @@ impl Database {
             .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
             .unwrap_or_default();
         Ok(parsed)
-    }
-
-    /// Read the persisted `worktree_base_path` for a session (if configured).
-    pub fn get_session_worktree_base_path(&self, session_id: &str) -> Result<Option<String>, String> {
-        self.conn
-            .query_row(
-                "SELECT worktree_base_path FROM sessions WHERE id = ?1",
-                params![session_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map(|opt| opt.flatten())
-            .map_err(|e| format!("Failed to query session worktree_base_path: {}", e))
     }
 
     /// Persist `workspace_paths` for a session.  Used by `add_workspace_path`
@@ -1128,140 +724,6 @@ impl Database {
         Ok(projects)
     }
 
-    // ─── Execution Nodes ─────────────────────────────────────────
-
-    // DB insert with many columns — keeping flat signature
-    #[allow(clippy::too_many_arguments)]
-    pub fn insert_execution_node(
-        &self,
-        session_id: &str,
-        timestamp: i64,
-        kind: &str,
-        input: Option<&str>,
-        output_summary: Option<&str>,
-        exit_code: Option<i32>,
-        working_dir: &str,
-        duration_ms: i64,
-        metadata: Option<&str>,
-    ) -> Result<i64, String> {
-        self.conn.execute(
-            "INSERT INTO execution_nodes (session_id, timestamp, kind, input, output_summary, exit_code, working_dir, duration_ms, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![session_id, timestamp, kind, input, output_summary, exit_code, working_dir, duration_ms, metadata],
-        ).map_err(|e| e.to_string())?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    pub fn get_execution_nodes(
-        &self,
-        session_id: &str,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<ExecutionNode>, String> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, timestamp, kind, input, output_summary, exit_code, working_dir, duration_ms, metadata
-             FROM execution_nodes WHERE session_id = ?1 ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3"
-        ).map_err(|e| e.to_string())?;
-
-        let rows = stmt
-            .query_map(params![session_id, limit, offset], |row| {
-                Ok(ExecutionNode {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    timestamp: row.get(2)?,
-                    kind: row.get(3)?,
-                    input: row.get(4)?,
-                    output_summary: row.get(5)?,
-                    exit_code: row.get(6)?,
-                    working_dir: row.get(7)?,
-                    duration_ms: row.get(8)?,
-                    metadata: row.get(9)?,
-                })
-            })
-            .map_err(|e| e.to_string())?;
-
-        let mut entries = Vec::new();
-        for row in rows {
-            entries.push(row.map_err(|e| e.to_string())?);
-        }
-        Ok(entries)
-    }
-
-    pub fn get_execution_node(&self, id: i64) -> Result<Option<ExecutionNode>, String> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, timestamp, kind, input, output_summary, exit_code, working_dir, duration_ms, metadata
-             FROM execution_nodes WHERE id = ?1"
-        ).map_err(|e| e.to_string())?;
-
-        let result = stmt
-            .query_row(params![id], |row| {
-                Ok(ExecutionNode {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    timestamp: row.get(2)?,
-                    kind: row.get(3)?,
-                    input: row.get(4)?,
-                    output_summary: row.get(5)?,
-                    exit_code: row.get(6)?,
-                    working_dir: row.get(7)?,
-                    duration_ms: row.get(8)?,
-                    metadata: row.get(9)?,
-                })
-            })
-            .ok();
-        Ok(result)
-    }
-
-    // ─── Command Patterns ────────────────────────────────────────
-
-    pub fn record_command_sequence(
-        &self,
-        project_id: Option<&str>,
-        sequence_json: &str,
-        next_command: &str,
-    ) -> Result<(), String> {
-        let now_ts = chrono::Utc::now().timestamp();
-        self.conn.execute(
-            "INSERT INTO command_patterns (project_id, sequence, next_command, frequency, last_seen)
-             VALUES (?1, ?2, ?3, 1, ?4)
-             ON CONFLICT(project_id, sequence, next_command) DO UPDATE SET
-                frequency = frequency + 1, last_seen = ?4",
-            params![project_id, sequence_json, next_command, now_ts],
-        ).map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    pub fn predict_next_command(
-        &self,
-        project_id: Option<&str>,
-        sequence_json: &str,
-        limit: i64,
-    ) -> Result<Vec<CommandPrediction>, String> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT next_command, frequency FROM command_patterns
-             WHERE (project_id = ?1 OR (project_id IS NULL AND ?1 IS NULL)) AND sequence = ?2
-             ORDER BY frequency DESC LIMIT ?3",
-            )
-            .map_err(|e| e.to_string())?;
-
-        let rows = stmt
-            .query_map(params![project_id, sequence_json, limit], |row| {
-                Ok(CommandPrediction {
-                    next_command: row.get(0)?,
-                    frequency: row.get(1)?,
-                })
-            })
-            .map_err(|e| e.to_string())?;
-
-        let mut entries = Vec::new();
-        for row in rows {
-            entries.push(row.map_err(|e| e.to_string())?);
-        }
-        Ok(entries)
-    }
-
     // ─── Context Pins ────────────────────────────────────────────
 
     pub fn add_context_pin(
@@ -1297,13 +759,44 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_pin_session_id(&self, id: i64) -> Result<Option<String>, String> {
+    /// A pin's scope: its session (session pin) or project (project pin).
+    /// None when there is no such pin.
+    pub fn get_pin_scope(&self, id: i64) -> Result<Option<PinScope>, String> {
         let mut stmt = self
             .conn
-            .prepare("SELECT session_id FROM context_pins WHERE id = ?1")
+            .prepare("SELECT session_id, project_id FROM context_pins WHERE id = ?1")
             .map_err(|e| e.to_string())?;
-        let result = stmt.query_row(params![id], |row| row.get(0)).ok();
+        let result = stmt
+            .query_row(params![id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .ok();
         Ok(result)
+    }
+
+    /// The pins a session's context uses: its own, those saved for its
+    /// primary project (the first one attached, as the context file the
+    /// agent reads uses), and global ones.
+    pub fn get_session_pins(&self, session_id: &str) -> Result<Vec<ContextPin>, String> {
+        let primary = self
+            .get_session_projects(session_id)?
+            .into_iter()
+            .next()
+            .map(|p| p.id);
+        self.get_context_pins(Some(session_id), primary.as_deref())
+    }
+
+    /// The sessions whose pin list changes when a pin with this scope is
+    /// added or removed: the session of a session pin, every session the
+    /// project is attached to for a project pin.
+    pub fn sessions_seeing_pin(
+        &self,
+        session_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        match (session_id, project_id) {
+            (Some(sid), _) => Ok(vec![sid.to_string()]),
+            (None, Some(pid)) => self.get_sessions_for_project(pid),
+            (None, None) => Ok(Vec::new()),
+        }
     }
 
     pub fn get_context_pins(
@@ -1620,17 +1113,6 @@ impl Database {
         Ok(())
     }
 
-    // ─── Execution Nodes Count ───────────────────────────────────
-
-    pub fn get_execution_nodes_count(&self, session_id: &str) -> Result<i64, String> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT COUNT(*) FROM execution_nodes WHERE session_id = ?1")
-            .map_err(|e| e.to_string())?;
-        stmt.query_row(params![session_id], |row| row.get(0))
-            .map_err(|e| e.to_string())
-    }
-
     // ─── Project Operations ────────────────────────────────────────
 
     pub fn insert_project(
@@ -1656,7 +1138,7 @@ impl Database {
 
     pub fn get_all_projects(&self) -> Result<Vec<crate::project::Project>, String> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, name, languages, frameworks, architecture, conventions, scan_status, last_scanned_at, created_at, updated_at, worktree_base_path
+            "SELECT id, path, name, languages, frameworks, architecture, conventions, scan_status, last_scanned_at, created_at, updated_at
              FROM realms ORDER BY updated_at DESC"
         ).map_err(|e| e.to_string())?;
 
@@ -1678,7 +1160,6 @@ impl Database {
                     last_scanned_at: row.get(8)?,
                     created_at: row.get(9)?,
                     updated_at: row.get(10)?,
-                    worktree_base_path: row.get(11)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -1692,7 +1173,7 @@ impl Database {
 
     pub fn get_project(&self, id: &str) -> Result<Option<crate::project::Project>, String> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, name, languages, frameworks, architecture, conventions, scan_status, last_scanned_at, created_at, updated_at, worktree_base_path
+            "SELECT id, path, name, languages, frameworks, architecture, conventions, scan_status, last_scanned_at, created_at, updated_at
              FROM realms WHERE id = ?1"
         ).map_err(|e| e.to_string())?;
 
@@ -1714,11 +1195,9 @@ impl Database {
                     last_scanned_at: row.get(8)?,
                     created_at: row.get(9)?,
                     updated_at: row.get(10)?,
-                    worktree_base_path: row.get(11)?,
                 })
             })
-            .optional()
-            .map_err(|e| e.to_string())?;
+            .ok();
         Ok(result)
     }
 
@@ -1727,7 +1206,7 @@ impl Database {
         path: &str,
     ) -> Result<Option<crate::project::Project>, String> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, name, languages, frameworks, architecture, conventions, scan_status, last_scanned_at, created_at, updated_at, worktree_base_path
+            "SELECT id, path, name, languages, frameworks, architecture, conventions, scan_status, last_scanned_at, created_at, updated_at
              FROM realms WHERE path = ?1"
         ).map_err(|e| e.to_string())?;
 
@@ -1749,11 +1228,9 @@ impl Database {
                     last_scanned_at: row.get(8)?,
                     created_at: row.get(9)?,
                     updated_at: row.get(10)?,
-                    worktree_base_path: row.get(11)?,
                 })
             })
-            .optional()
-            .map_err(|e| e.to_string())?;
+            .ok();
         Ok(result)
     }
 
@@ -1803,16 +1280,6 @@ impl Database {
                 )
                 .map_err(|e| e.to_string())?;
         }
-        Ok(())
-    }
-
-    pub fn set_project_worktree_path(&self, id: &str, path: Option<&str>) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE realms SET worktree_base_path = ?1, updated_at = datetime('now') WHERE id = ?2",
-                params![path, id],
-            )
-            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -2153,6 +1620,35 @@ impl Database {
         Ok(entries)
     }
 
+    /// The branch a task's worktree was cut from (the launcher's base), which
+    /// Land lands into unless told otherwise.
+    pub fn set_worktree_base_branch(&self, id: &str, base_branch: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE session_worktrees SET base_branch = ?1 WHERE id = ?2",
+                params![base_branch, id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_worktree_base_branch(
+        &self,
+        session_id: &str,
+        project_id: &str,
+    ) -> Result<Option<String>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT base_branch FROM session_worktrees WHERE session_id = ?1 AND realm_id = ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let value: Option<Option<String>> = stmt
+            .query_row(params![session_id, project_id], |row| row.get(0))
+            .ok();
+        Ok(value.flatten().filter(|b| !b.is_empty()))
+    }
+
     pub fn update_worktree_branch(&self, id: &str, branch_name: &str) -> Result<(), String> {
         self.conn
             .execute(
@@ -2204,6 +1700,36 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Deletes Hermes-side cached data for one session: the saved terminal
+    /// scrollback, execution history, token usage, context pins/snapshots,
+    /// session-scoped memory, realm attachments and recorded error
+    /// occurrences.
+    ///
+    /// Deliberately leaves the `sessions` row and `session_worktrees` (the
+    /// git worktree Hermes checked the session's repo into) untouched — this
+    /// clears Hermes's own caches about the session, never the repo it
+    /// points at.
+    pub fn delete_session_cache_data(&self, session_id: &str) -> Result<(), String> {
+        for sql in [
+            "DELETE FROM execution_log WHERE session_id = ?1",
+            "DELETE FROM token_usage WHERE session_id = ?1",
+            "DELETE FROM token_snapshots WHERE session_id = ?1",
+            "DELETE FROM context_pins WHERE session_id = ?1",
+            "DELETE FROM context_snapshots WHERE session_id = ?1",
+            "DELETE FROM session_realms WHERE session_id = ?1",
+            "DELETE FROM error_sessions WHERE session_id = ?1",
+            "DELETE FROM memory WHERE scope = 'session' AND scope_id = ?1",
+            // Keep the row itself (the session stays listed); drop only the
+            // raw terminal output saved for it.
+            "UPDATE sessions SET scrollback_snapshot = NULL WHERE id = ?1",
+        ] {
+            self.conn
+                .execute(sql, params![session_id])
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     pub fn delete_session_worktree(&self, id: &str) -> Result<(), String> {
         self.conn
             .execute("DELETE FROM session_worktrees WHERE id = ?1", params![id])
@@ -2221,16 +1747,95 @@ impl Database {
         Ok(())
     }
 
-    /// Count how many session_worktrees records reference the same worktree path.
-    /// Used to protect shared worktrees from premature disk deletion.
-    pub fn count_sessions_for_worktree_path(&self, path: &str) -> Result<i64, String> {
-        self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM session_worktrees WHERE worktree_path = ?1",
-                params![path],
-                |row| row.get(0),
+    // ─── Fast worktrees (N17): ports and setup report ────────────
+
+    /// Port blocks recorded for any session's worktree. A block is free
+    /// again once its worktree link is deleted.
+    pub fn taken_port_bases(&self) -> Result<std::collections::HashSet<u16>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT port_base FROM session_worktrees WHERE port_base IS NOT NULL")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            if let Ok(base) = u16::try_from(row.map_err(|e| e.to_string())?) {
+                out.insert(base);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Record the port block and setup report of a session's worktree.
+    /// Fails when the link does not exist or the block is already recorded
+    /// for another worktree.
+    pub fn set_worktree_setup(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        port_base: Option<u16>,
+        setup_report: &str,
+    ) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE session_worktrees SET port_base = ?1, setup_report = ?2
+                 WHERE session_id = ?3 AND realm_id = ?4",
+                params![
+                    port_base.map(i64::from),
+                    setup_report,
+                    session_id,
+                    project_id
+                ],
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err(format!(
+                "No worktree recorded for session '{}' in project '{}'",
+                session_id, project_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// The port block and setup report of a session's worktree, if recorded.
+    pub fn get_worktree_setup(
+        &self,
+        session_id: &str,
+        project_id: &str,
+    ) -> Result<(Option<u16>, Option<String>), String> {
+        let found = self.conn.query_row(
+            "SELECT port_base, setup_report FROM session_worktrees
+             WHERE session_id = ?1 AND realm_id = ?2",
+            params![session_id, project_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        );
+        match found {
+            Ok((base, report)) => Ok((base.and_then(|b| u16::try_from(b).ok()), report)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok((None, None)),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Count how many session_worktrees records point at the same checkout as
+    /// `path`. Used to protect shared worktrees from premature disk deletion.
+    ///
+    /// Compares directories, not strings: a checkout linked on purpose may be
+    /// recorded as git prints it (`/private/var/...`, `C:/...`) while its
+    /// creator recorded the path Hermes built (`/var/...`, `C:\...`).
+    pub fn count_sessions_for_worktree_path(&self, path: &str) -> Result<i64, String> {
+        let rows = self.get_all_session_worktrees()?;
+        Ok(rows
+            .iter()
+            .filter(|row| crate::git::worktree::same_dir(&row.worktree_path, path))
+            .count() as i64)
     }
 
     // ─── SSH Saved Hosts ──────────────────────────────────────────
@@ -2276,6 +1881,55 @@ impl Database {
             .execute("DELETE FROM ssh_saved_hosts WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Every link to a linked worktree (not the project folder), with the
+    /// project's path, for the worktree hygiene scan.
+    pub fn get_worktree_links(&self) -> Result<Vec<crate::git::hygiene::LinkRow>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT sw.session_id, sw.worktree_path, r.path, sw.created_at, sw.last_activity_at
+                 FROM session_worktrees sw LEFT JOIN realms r ON r.id = sw.realm_id
+                 WHERE sw.is_main_worktree = 0",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::git::hygiene::LinkRow {
+                    session_id: row.get(0)?,
+                    worktree_path: row.get(1)?,
+                    project_path: row.get(2)?,
+                    created_at: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    last_activity_at: row.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Stamp "last used" on every worktree of these (open) sessions.
+    pub fn touch_worktrees_of_sessions(&self, session_ids: &[String]) -> Result<(), String> {
+        for id in session_ids {
+            self.conn
+                .execute(
+                    "UPDATE session_worktrees SET last_activity_at = datetime('now') WHERE session_id = ?1",
+                    params![id],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Drop every session's link to the worktree at `path` (it was removed).
+    pub fn delete_worktree_links_at(&self, path: &str) -> Result<usize, String> {
+        self.conn
+            .execute(
+                "DELETE FROM session_worktrees WHERE worktree_path = ?1 AND is_main_worktree = 0",
+                params![path],
+            )
+            .map_err(|e| e.to_string())
     }
 
     pub fn update_worktree_last_activity(
@@ -2377,8 +2031,25 @@ pub fn get_all_memory(
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.get_all_settings()
+    #[allow(unused_mut)]
+    let mut settings = db.get_all_settings()?;
+    // e2e builds only: flag defaults for this run (a JSON map), below any
+    // override the app stores. The real-app scenarios keep the flags their
+    // steps were written for this way (see e2e/app/harness.mjs). The key
+    // cannot come from the settings table: set_setting refuses it.
+    #[cfg(feature = "e2e")]
+    if let Ok(defaults) = std::env::var(E2E_FLAG_DEFAULTS_ENV) {
+        settings.insert(E2E_FLAG_DEFAULTS_KEY.to_string(), defaults);
+    }
+    Ok(settings)
 }
+
+/// e2e builds: the environment variable with this run's flag defaults.
+#[cfg(feature = "e2e")]
+const E2E_FLAG_DEFAULTS_ENV: &str = "HERMES_E2E_FLAG_DEFAULTS";
+/// e2e builds: the key get_settings reports them under.
+#[cfg(feature = "e2e")]
+const E2E_FLAG_DEFAULTS_KEY: &str = "e2e_flag_defaults";
 
 /// Allowlist of valid setting keys that the frontend may write.
 ///
@@ -2395,6 +2066,10 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
 /// ║  adding a migration note in the import path.                       ║
 /// ╚══════════════════════════════════════════════════════════════════════╝
 const VALID_SETTING_KEYS: &[&str] = &[
+    // Worktree hygiene (Settings > Storage)
+    "worktree_auto_cleanup",
+    "worktree_idle_days",
+    "worktree_low_disk_gb",
     // Window geometry (excluded from export — machine-specific)
     "window_width",
     "window_height",
@@ -2411,23 +2086,29 @@ const VALID_SETTING_KEYS: &[&str] = &[
     "ui_scale",
     "font_size",
     "font_family",
+    "editor_font_size",
     "agent_timeline_style",
     // Terminal
     "default_shell",
     "default_cwd",
     "scrollback",
     "restore_sessions",
+    "shell_suggestions",
     // Workspace (excluded from export — machine-specific)
     "saved_workspace",
     // Behaviour
     "skip_close_confirm",
-    "execution_mode",
     "telemetry_enabled",
+    // Updates: "stable" (default) or "beta"
+    "update_channel",
     // Onboarding / What's New (excluded from export — per-install state)
     "onboarding_completed",
     "last_seen_version",
     "suppress_whats_new",
-    // Prompt composer
+    // Prompts: Mine (the person's own prompts) and which 2.0 ids it took in
+    "my_prompts",
+    "my_prompts_migrated",
+    // The 2.0 prompt composer (read by the migration into Mine, never written)
     "prompt_templates",
     "pinned_templates",
     "template_groups",
@@ -2439,15 +2120,20 @@ const VALID_SETTING_KEYS: &[&str] = &[
     "git_author_email",
     "git_auto_stage",
     "git_show_untracked",
-    "worktree_base_path",
-    // Autonomous mode
-    "auto_command_min_frequency",
-    "auto_cancel_delay_ms",
+    // Turn ledger kill switch (F20): "off" stops every snapshot.
+    "turn_ledger",
     // AI agent defaults
     "default_permission_mode",
     "custom_command_suffix",
+    "last_ai_provider",
     // Per-agent launch command prefix (JSON map of providerId -> prefix string)
     "ai_agent_prefixes",
+    // Per-agent Terminal / Agent view choice (JSON map of providerId -> "terminal" | "agent")
+    "session_mode_by_provider",
+    // Task launcher (F15): what each launched task was (task, track, done-when), per session
+    "task_launches",
+    // Task queue (N22): the tasks waiting for a free slot, kept while Hermes is closed
+    "task_queue",
     // Keyboard shortcuts
     "command_palette_shortcut",
     // Plugin updates
@@ -2464,6 +2150,37 @@ const VALID_SETTING_KEYS: &[&str] = &[
     "ssh_connection_history",
     // UI layout
     "activity_bar_order",
+    // Localization
+    "ui_language",
+    // The status line above terminal agent sessions (F11): "on" | "off"
+    "status_strip",
+    // Feature flags (per-install debug overrides — see src/featureFlags/)
+    "feature_flag_overrides",
+    // Away notifications (N16): webhook / ntfy / Telegram address
+    "away_notify_url",
+    // ...how long a blocked agent waits while Hermes is in front of you
+    // ("0" | "120" | "600" seconds), and whether messages name sessions
+    "away_notify_delay",
+    "away_notify_names",
+    // Fleet controls (2.0: spend caps and the task queue — see src/fleet/)
+    "fleet_spend_cap_session_usd",
+    "fleet_spend_cap_feature_usd",
+    "fleet_max_running_agents",
+    "fleet_max_agent_memory_mb",
+    // Prompt library (src-tauri/src/library): updates "auto" | "notify" | "off",
+    // when it last checked and succeeded, versions the person skipped, the
+    // packs they turned on or off, "stable" | "all" on the shelves, their
+    // profile (roles and interests, JSON) and whether the interests step was offered.
+    "library_updates",
+    "library_last_check",
+    "library_last_success",
+    "library_last_error",
+    "library_ignored_versions",
+    "library_enabled_packs",
+    "library_disabled_packs",
+    "library_channel",
+    "library_profile",
+    "library_onboarded",
 ];
 
 #[tauri::command]
@@ -2471,9 +2188,12 @@ pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Re
     if !VALID_SETTING_KEYS.contains(&key.as_str()) {
         return Err(format!("Unknown setting key: {}", key));
     }
-    if key == "worktree_base_path" && !value.trim().is_empty() {
-        crate::git::worktree::validate_custom_worktree_base(&value, None)?;
-    }
+    // A save that started before a session was closed must not bring it back.
+    let value = if key == crate::saved_workspace::SETTING_KEY {
+        crate::saved_workspace::filter_incoming(value, &state.closed_sessions.snapshot())
+    } else {
+        value
+    };
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.set_setting(&key, &value)
 }
@@ -2507,6 +2227,9 @@ pub fn get_execution_log(
     db.get_execution_log_entries(&session_id, limit)
 }
 
+/// A pin's (session id, project id); one of them is set.
+pub type PinScope = (Option<String>, Option<String>);
+
 // ─── Context Pin Commands ────────────────────────────────────────────
 
 // Tauri command handler — params map to DB columns
@@ -2531,7 +2254,7 @@ pub fn add_context_pin(
         label.as_deref(),
         priority,
     )?;
-    if let Some(ref sid) = session_id {
+    for sid in db.sessions_seeing_pin(session_id.as_deref(), project_id.as_deref())? {
         let _ = app.emit(&format!("context-pins-changed-{}", sid), ());
     }
     Ok(id)
@@ -2544,14 +2267,18 @@ pub fn remove_context_pin(
     id: i64,
 ) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let session_id = db.get_pin_session_id(id)?;
+    let scope = db.get_pin_scope(id)?;
     db.remove_context_pin(id)?;
-    if let Some(ref sid) = session_id {
-        let _ = app.emit(&format!("context-pins-changed-{}", sid), ());
+    if let Some((session_id, project_id)) = scope {
+        for sid in db.sessions_seeing_pin(session_id.as_deref(), project_id.as_deref())? {
+            let _ = app.emit(&format!("context-pins-changed-{}", sid), ());
+        }
     }
     Ok(())
 }
 
+/// With a session and no project: the pins that session's context uses,
+/// its primary project's included (`Database::get_session_pins`).
 #[tauri::command]
 pub fn get_context_pins(
     state: State<'_, AppState>,
@@ -2559,7 +2286,10 @@ pub fn get_context_pins(
     project_id: Option<String>,
 ) -> Result<Vec<ContextPin>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.get_context_pins(session_id.as_deref(), project_id.as_deref())
+    match (session_id.as_deref(), project_id.as_deref()) {
+        (Some(sid), None) => db.get_session_pins(sid),
+        (sid, pid) => db.get_context_pins(sid, pid),
+    }
 }
 
 // ─── Context Snapshot Commands ────────────────────────────────────────
@@ -2615,6 +2345,98 @@ mod tests {
     fn test_db() -> Database {
         let tmp = NamedTempFile::new().unwrap();
         Database::new(tmp.path()).expect("Failed to create test database")
+    }
+
+    // ── context pins: what a session's panel lists ─────────────────────
+
+    #[test]
+    fn a_session_lists_its_primary_projects_pins_with_its_own() {
+        let db = test_db();
+        db.insert_project("p1", "/work/one", "one", "[]", "[]")
+            .unwrap();
+        db.insert_project("p2", "/work/two", "two", "[]", "[]")
+            .unwrap();
+        db.attach_session_project("s1", "p1", "primary").unwrap();
+        db.attach_session_project("s1", "p2", "primary").unwrap();
+        let own = db
+            .add_context_pin(Some("s1"), None, "memory", "a=1", None, None)
+            .unwrap();
+        let shared = db
+            .add_context_pin(None, Some("p1"), "file", "/work/one/notes.md", None, None)
+            .unwrap();
+        let other_project = db
+            .add_context_pin(None, Some("p2"), "file", "/work/two/x.md", None, None)
+            .unwrap();
+        let other_session = db
+            .add_context_pin(Some("s2"), None, "memory", "b=2", None, None)
+            .unwrap();
+
+        let ids: Vec<i64> = db
+            .get_session_pins("s1")
+            .unwrap()
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        assert!(ids.contains(&own), "the session's own pin");
+        assert!(
+            ids.contains(&shared),
+            "the primary project's pin (the default scope in the panel)"
+        );
+        assert!(
+            !ids.contains(&other_project),
+            "only the primary project's, as in the context file"
+        );
+        assert!(!ids.contains(&other_session), "never another session's");
+        // The context file uses the same rule.
+        let assembled: Vec<i64> = db
+            .get_context_pins(Some("s1"), Some("p1"))
+            .unwrap()
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(ids, assembled);
+        // A session with no project sees only its own pins.
+        let lone: Vec<i64> = db
+            .get_session_pins("s2")
+            .unwrap()
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(lone, vec![other_session]);
+    }
+
+    #[test]
+    fn a_project_pin_changes_every_session_on_that_project() {
+        let db = test_db();
+        db.insert_project("p1", "/work/one", "one", "[]", "[]")
+            .unwrap();
+        db.attach_session_project("s1", "p1", "primary").unwrap();
+        db.attach_session_project("s2", "p1", "primary").unwrap();
+        let mut seeing = db.sessions_seeing_pin(None, Some("p1")).unwrap();
+        seeing.sort();
+        assert_eq!(seeing, vec!["s1".to_string(), "s2".to_string()]);
+        assert_eq!(
+            db.sessions_seeing_pin(Some("s3"), None).unwrap(),
+            vec!["s3".to_string()]
+        );
+        assert!(db.sessions_seeing_pin(None, None).unwrap().is_empty());
+
+        let pin = db
+            .add_context_pin(None, Some("p1"), "file", "/work/one/a.md", None, None)
+            .unwrap();
+        assert_eq!(
+            db.get_pin_scope(pin).unwrap(),
+            Some((None, Some("p1".to_string())))
+        );
+        let own = db
+            .add_context_pin(Some("s1"), None, "memory", "k=v", None, None)
+            .unwrap();
+        assert_eq!(
+            db.get_pin_scope(own).unwrap(),
+            Some((Some("s1".to_string()), None))
+        );
+        db.remove_context_pin(pin).unwrap();
+        assert_eq!(db.get_pin_scope(pin).unwrap(), None);
     }
 
     // ── insert + get_session_worktrees ─────────────────────────────────
@@ -2896,6 +2718,56 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    // ── worktree base branch ───────────────────────────────────────────
+
+    #[test]
+    fn test_worktree_base_branch_round_trip() {
+        let db = test_db();
+        db.insert_session_worktree("wt1", "sess1", "project1", "/path/wt1", Some("task"), false)
+            .unwrap();
+        db.insert_session_worktree(
+            "wt2",
+            "sess2",
+            "project1",
+            "/path/wt2",
+            Some("other"),
+            false,
+        )
+        .unwrap();
+
+        // Nothing recorded yet, and no worktree at all, both read as None.
+        assert_eq!(
+            db.get_worktree_base_branch("sess1", "project1").unwrap(),
+            None
+        );
+        assert_eq!(
+            db.get_worktree_base_branch("nobody", "project1").unwrap(),
+            None
+        );
+
+        db.set_worktree_base_branch("wt1", "develop").unwrap();
+        assert_eq!(
+            db.get_worktree_base_branch("sess1", "project1").unwrap(),
+            Some("develop".to_string())
+        );
+        // Only that worktree, and only in its project.
+        assert_eq!(
+            db.get_worktree_base_branch("sess2", "project1").unwrap(),
+            None
+        );
+        assert_eq!(
+            db.get_worktree_base_branch("sess1", "project2").unwrap(),
+            None
+        );
+
+        // An empty base is no base.
+        db.set_worktree_base_branch("wt1", "").unwrap();
+        assert_eq!(
+            db.get_worktree_base_branch("sess1", "project1").unwrap(),
+            None
+        );
+    }
+
     // ── update_worktree_branch ─────────────────────────────────────────
 
     #[test]
@@ -2998,6 +2870,83 @@ mod tests {
         let db = test_db();
         let result = db.delete_worktrees_for_session("no-such-session");
         assert!(result.is_ok());
+    }
+
+    // ── delete_session_cache_data ────────────────────────────────────────
+
+    #[test]
+    fn test_delete_session_cache_data_clears_only_target_session() {
+        let db = test_db();
+
+        // Populate every cache table for the target session ("sess1") and a
+        // sibling session ("sess2") that must survive untouched.
+        for sid in ["sess1", "sess2"] {
+            insert_test_session(&db, sid);
+            db.save_session_snapshot(sid, "$ echo secret\nsecret\n")
+                .unwrap();
+            db.log_execution_entry(sid, "command", "echo hi", Some(0), Some("/tmp"))
+                .unwrap();
+            db.record_token_usage(sid, "anthropic", "claude", 10, 20, 0.01)
+                .unwrap();
+            db.add_context_pin(Some(sid), None, "file", "src/main.rs", None, None)
+                .unwrap();
+            db.save_context_snapshot(sid, 1, "{}").unwrap();
+            db.save_memory_entry("session", sid, "fact", "value", "user", "general", 1.0)
+                .unwrap();
+        }
+
+        db.insert_session_worktree("wt1", "sess1", "project1", "/path/wt1", Some("a"), false)
+            .unwrap();
+
+        db.delete_session_cache_data("sess1").unwrap();
+
+        // sess1's caches are gone.
+        assert!(db
+            .get_execution_log_entries("sess1", None)
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .get_all_memory_entries("session", "sess1")
+            .unwrap()
+            .is_empty());
+        assert!(db.get_context_pins(Some("sess1"), None).unwrap().is_empty());
+        assert_eq!(
+            db.get_session_snapshot("sess1").unwrap(),
+            None,
+            "the saved terminal scrollback must be cleared"
+        );
+        assert!(
+            db.session_exists("sess1").unwrap(),
+            "the session row itself must survive a data delete"
+        );
+
+        // sess2's caches (a different session) are untouched.
+        assert_eq!(
+            db.get_session_snapshot("sess2").unwrap().as_deref(),
+            Some("$ echo secret\nsecret\n")
+        );
+        assert!(!db
+            .get_execution_log_entries("sess2", None)
+            .unwrap()
+            .is_empty());
+        assert!(!db
+            .get_all_memory_entries("session", "sess2")
+            .unwrap()
+            .is_empty());
+
+        // The repo Hermes checked the session's worktree into is left intact.
+        let worktrees = db.get_session_worktrees("sess1").unwrap();
+        assert_eq!(
+            worktrees.len(),
+            1,
+            "session_worktrees must survive a data delete"
+        );
+    }
+
+    #[test]
+    fn test_delete_session_cache_data_nonexistent_session_is_ok() {
+        let db = test_db();
+        assert!(db.delete_session_cache_data("no-such-session").is_ok());
     }
 
     // ── Unique constraints ─────────────────────────────────────────────
@@ -3330,8 +3279,6 @@ const EXPORT_EXCLUDED_KEYS: &[&str] = &[
     "saved_workspace",
     // Default CWD — absolute path, won't exist on another machine
     "default_cwd",
-    // Worktree base path — absolute path, machine-specific
-    "worktree_base_path",
     // Onboarding / What's New — per-install lifecycle
     "onboarding_completed",
     "last_seen_version",
@@ -3341,6 +3288,20 @@ const EXPORT_EXCLUDED_KEYS: &[&str] = &[
     "plugin_ignored_updates",
     // SSH history — may contain sensitive hostnames
     "ssh_connection_history",
+    // Feature flag overrides — per-install debug state, not a real preference
+    "feature_flag_overrides",
+    // Away notification address — a Telegram URL carries the bot's token
+    "away_notify_url",
+    // Worktree recipes the user allowed to run (project id -> file hash)
+    "worktree_recipe_trust",
+    // Task launcher records — per session, with task text and branch names
+    "task_launches",
+    // Tasks waiting in the queue (N22) — task text and paths, per install
+    "task_queue",
+    // Prompt library update times and the last error — per install
+    "library_last_check",
+    "library_last_success",
+    "library_last_error",
 ];
 
 /// Validate a settings file path for export or import.
@@ -3510,14 +3471,19 @@ fn has_plugin_permission(db: &Database, plugin_id: &str, permission: &str) -> Re
     Ok(perms.iter().any(|p| p == permission))
 }
 
+/// Record a plugin and the permissions granted to it. Host only: a plugin
+/// must never be able to grant itself anything.
 #[tauri::command]
 pub fn save_plugin_metadata(
     plugin_id: String,
     version: String,
     name: String,
     permissions: Vec<String>,
+    host_key: String,
     state: State<'_, AppState>,
+    identity: State<'_, crate::plugin_identity::PluginIdentityState>,
 ) -> Result<(), String> {
+    identity.require_host(&host_key)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let perms_json = serde_json::to_string(&permissions)
         .map_err(|e| format!("Failed to serialize permissions: {}", e))?;
@@ -3531,21 +3497,29 @@ pub fn save_plugin_metadata(
     Ok(())
 }
 
+/// Host only: what a plugin was granted is the app's business, not another
+/// plugin's.
 #[tauri::command]
 pub fn get_plugin_permissions(
     plugin_id: String,
+    host_key: String,
     state: State<'_, AppState>,
+    identity: State<'_, crate::plugin_identity::PluginIdentityState>,
 ) -> Result<Vec<String>, String> {
+    identity.require_host(&host_key)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.get_plugin_permissions(&plugin_id)
 }
 
+/// Token-bound: the plugin is whoever holds the token, not whoever it names.
 #[tauri::command]
 pub fn get_plugin_setting(
     key: String,
-    plugin_id: String,
+    plugin_token: String,
     state: State<'_, AppState>,
+    identity: State<'_, crate::plugin_identity::PluginIdentityState>,
 ) -> Result<Option<String>, String> {
+    let plugin_id = identity.plugin_for(&plugin_token)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
     if !has_plugin_permission(&db, &plugin_id, "storage")? {
         return Err(format!(
@@ -3563,13 +3537,16 @@ pub fn get_plugin_setting(
         .map_err(|e| e.to_string())
 }
 
+/// Token-bound: the plugin is whoever holds the token, not whoever it names.
 #[tauri::command]
 pub fn set_plugin_setting(
     key: String,
     value: String,
-    plugin_id: String,
+    plugin_token: String,
     state: State<'_, AppState>,
+    identity: State<'_, crate::plugin_identity::PluginIdentityState>,
 ) -> Result<(), String> {
+    let plugin_id = identity.plugin_for(&plugin_token)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
     if !has_plugin_permission(&db, &plugin_id, "storage")? {
         return Err(format!(
@@ -3587,12 +3564,15 @@ pub fn set_plugin_setting(
     Ok(())
 }
 
+/// Token-bound: the plugin is whoever holds the token, not whoever it names.
 #[tauri::command]
 pub fn delete_plugin_setting(
     key: String,
-    plugin_id: String,
+    plugin_token: String,
     state: State<'_, AppState>,
+    identity: State<'_, crate::plugin_identity::PluginIdentityState>,
 ) -> Result<(), String> {
+    let plugin_id = identity.plugin_for(&plugin_token)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
     if !has_plugin_permission(&db, &plugin_id, "storage")? {
         return Err(format!(
@@ -3609,12 +3589,16 @@ pub fn delete_plugin_setting(
     Ok(())
 }
 
+/// Host only.
 #[tauri::command]
 pub fn set_plugin_enabled(
     plugin_id: String,
     enabled: bool,
+    host_key: String,
     state: State<'_, AppState>,
+    identity: State<'_, crate::plugin_identity::PluginIdentityState>,
 ) -> Result<(), String> {
+    identity.require_host(&host_key)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let enabled_int: i32 = if enabled { 1 } else { 0 };
     // Upsert into plugins table — insert if not exists, update enabled if exists
@@ -3629,9 +3613,15 @@ pub fn set_plugin_enabled(
 }
 
 /// Remove all database records for a plugin (plugins table + plugin_storage).
-/// Called during uninstall to prevent orphaned data.
+/// Called during uninstall to prevent orphaned data. Host only.
 #[tauri::command]
-pub fn cleanup_plugin_data(plugin_id: String, state: State<'_, AppState>) -> Result<(), String> {
+pub fn cleanup_plugin_data(
+    plugin_id: String,
+    host_key: String,
+    state: State<'_, AppState>,
+    identity: State<'_, crate::plugin_identity::PluginIdentityState>,
+) -> Result<(), String> {
+    identity.require_host(&host_key)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.conn
         .execute(
@@ -3645,11 +3635,14 @@ pub fn cleanup_plugin_data(plugin_id: String, state: State<'_, AppState>) -> Res
     Ok(())
 }
 
+/// Token-bound: a plugin's settings are readable by that plugin alone.
 #[tauri::command]
 pub fn get_plugin_settings_batch(
-    plugin_id: String,
+    plugin_token: String,
     state: State<'_, AppState>,
+    identity: State<'_, crate::plugin_identity::PluginIdentityState>,
 ) -> Result<std::collections::HashMap<String, String>, String> {
+    let plugin_id = identity.plugin_for(&plugin_token)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
     if !has_plugin_permission(&db, &plugin_id, "storage")? {
         return Err(format!(
@@ -3675,8 +3668,14 @@ pub fn get_plugin_settings_batch(
     Ok(map)
 }
 
+/// Host only.
 #[tauri::command]
-pub fn get_disabled_plugin_ids(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+pub fn get_disabled_plugin_ids(
+    host_key: String,
+    state: State<'_, AppState>,
+    identity: State<'_, crate::plugin_identity::PluginIdentityState>,
+) -> Result<Vec<String>, String> {
+    identity.require_host(&host_key)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let mut stmt = db
         .conn

@@ -14,9 +14,14 @@ import {
 import { foldGutter, foldKeymap, indentOnInput, bracketMatching, syntaxHighlighting, defaultHighlightStyle, indentUnit } from "@codemirror/language";
 import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
 import { search, searchKeymap, openSearchPanel, gotoLine, selectNextOccurrence } from "@codemirror/search";
-import { getLanguageSupport } from "./languageRegistry";
+import { loadLanguageSupport, peekLanguageSupport } from "./languageRegistry";
 import { createSyntaxHighlighting } from "./editorTheme";
 import { Minimap } from "./Minimap";
+import {
+  nextEditorFontSize,
+  parseEditorFontSize,
+} from "./editorFontSize";
+import { getSetting, setSetting } from "../api/settings";
 
 export interface CursorInfo {
   line: number;
@@ -50,6 +55,8 @@ const baseTheme = EditorView.theme({
   ".cm-scroller": {
     overflow: "auto",
     fontFamily: "var(--font-mono)",
+    // Follows the UI scale by default; a user override from Mod+= / Mod+-
+    // is layered on top via fontSizeCompartment (earlier extension wins).
     fontSize: "var(--text-sm)",
     scrollbarWidth: "thin",
     scrollbarColor: "var(--bg-active) transparent",
@@ -172,6 +179,14 @@ const baseTheme = EditorView.theme({
   },
 });
 
+function buildFontSizeExtension(px: number | null) {
+  // No override: contribute nothing so baseTheme's var(--text-sm) applies.
+  if (px == null) return [];
+  return EditorView.theme({
+    ".cm-scroller": { fontSize: `${px}px` },
+  });
+}
+
 function buildIndentExtensions(config: IndentConfig) {
   const unit = config.useTabs ? "\t" : " ".repeat(config.size);
   const insertStr = unit;
@@ -212,6 +227,12 @@ export function EditorPane({ content, language, onContentChange, onSave, onCurso
   const themeCompartment = useRef(new Compartment());
   const wrapCompartment = useRef(new Compartment());
   const indentCompartment = useRef(new Compartment());
+  const fontSizeCompartment = useRef(new Compartment());
+  // Live font size, mutated by Mod+= / Mod+- / Mod+0 inside the keymap.
+  // Held in a ref (not React state) so shortcut handlers can update it
+  // without triggering a re-creation of the EditorView in the useEffect
+  // below that depends on `language`. `null` = no override, follow the UI.
+  const fontSizePxRef = useRef<number | null>(null);
 
   // Keep callback refs up to date
   onContentChangeRef.current = onContentChange;
@@ -220,11 +241,31 @@ export function EditorPane({ content, language, onContentChange, onSave, onCurso
 
   const effectiveIndent: IndentConfig = indentConfig ?? { useTabs: false, size: 2 };
 
+  /** Apply a font-size change to the live EditorView and persist it. */
+  const applyFontSizeAction = (action: "increase" | "decrease" | "reset"): boolean => {
+    const view = viewRef.current;
+    if (!view) return false;
+    const renderedPx = Number.parseFloat(getComputedStyle(view.scrollDOM).fontSize);
+    const next = nextEditorFontSize(fontSizePxRef.current, action, renderedPx);
+    if (next === fontSizePxRef.current) return true; // clamped at bound, or reset with no override
+    fontSizePxRef.current = next;
+    view.dispatch({
+      effects: fontSizeCompartment.current.reconfigure(buildFontSizeExtension(next)),
+    });
+    // Reset stores "" so the editor follows the UI scale again.
+    setSetting("editor_font_size", next == null ? "" : String(next)).catch((err) =>
+      console.warn("[EditorPane] Failed to persist editor_font_size:", err),
+    );
+    return true;
+  };
+
   // Create and destroy EditorView
   useEffect(() => {
     if (!containerRef.current) return;
 
-    const langSupport = getLanguageSupport(language);
+    // Grammar already loaded → highlight from the first paint; otherwise the
+    // language effect below loads it and reconfigures the view.
+    const langSupport = peekLanguageSupport(language);
 
     const state = EditorState.create({
       doc: content,
@@ -243,6 +284,7 @@ export function EditorPane({ content, language, onContentChange, onSave, onCurso
         search({ top: true }),
         wrapCompartment.current.of(wordWrap ? EditorView.lineWrapping : []),
         indentCompartment.current.of(buildIndentExtensions(effectiveIndent)),
+        fontSizeCompartment.current.of(buildFontSizeExtension(fontSizePxRef.current)),
         keymap.of([
           ...closeBracketsKeymap,
           ...defaultKeymap,
@@ -251,6 +293,12 @@ export function EditorPane({ content, language, onContentChange, onSave, onCurso
           ...foldKeymap,
           // ── Save ──
           { key: "Mod-s", run: () => { onSaveRef.current(); return true; } },
+          // ── Font size (issue #193). Bind both `=` and `+` so users with
+          //    a US layout don't have to press Shift to grow the font. ──
+          { key: "Mod-=", run: () => applyFontSizeAction("increase") },
+          { key: "Mod-+", run: () => applyFontSizeAction("increase") },
+          { key: "Mod--", run: () => applyFontSizeAction("decrease") },
+          { key: "Mod-0", run: () => applyFontSizeAction("reset") },
           // ── Search / Replace / Go-to-line ──
           {
             key: "Mod-r",
@@ -374,10 +422,19 @@ export function EditorPane({ content, language, onContentChange, onSave, onCurso
     const view = viewRef.current;
     if (!view) return;
 
-    const langSupport = getLanguageSupport(language);
-    view.dispatch({
-      effects: languageCompartment.current.reconfigure(langSupport ? [langSupport] : []),
-    });
+    let cancelled = false;
+    loadLanguageSupport(language)
+      .then((langSupport) => {
+        // The view may have been destroyed, or the language changed again.
+        if (cancelled || viewRef.current !== view) return;
+        view.dispatch({
+          effects: languageCompartment.current.reconfigure(langSupport ? [langSupport] : []),
+        });
+      })
+      .catch((err) => console.warn(`[EditorPane] Failed to load ${language} highlighting:`, err));
+    return () => {
+      cancelled = true;
+    };
   }, [language]);
 
   // Toggle word wrap
@@ -398,6 +455,30 @@ export function EditorPane({ content, language, onContentChange, onSave, onCurso
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [effectiveIndent.useTabs, effectiveIndent.size]);
+
+  // Load the persisted editor_font_size on mount and apply it to the
+  // live view. With no stored value the compartment stays empty and the
+  // editor keeps following the UI scale.
+  useEffect(() => {
+    let cancelled = false;
+    getSetting("editor_font_size")
+      .then((raw) => {
+        if (cancelled) return;
+        const px = parseEditorFontSize(raw);
+        if (px === fontSizePxRef.current) return;
+        fontSizePxRef.current = px;
+        const view = viewRef.current;
+        if (view) {
+          view.dispatch({
+            effects: fontSizeCompartment.current.reconfigure(buildFontSizeExtension(px)),
+          });
+        }
+      })
+      .catch((err) => console.warn("[EditorPane] Failed to load editor_font_size:", err));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Hot-swap syntax colours when the app theme changes
   useEffect(() => {

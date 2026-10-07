@@ -1,7 +1,16 @@
 import type { Disposable, PluginSettingsSchema, HermesEvent, SessionInfo, TranscriptEvent, AgentsAPI, FileHandlerProps } from "./types";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { bindPluginInvoke } from "./identity";
+import { createPluginApiV2, type AgentsAPIv2, type FeaturesAPI, type InboxAPI, type ReviewAPI } from "./apiV2";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
+import {
+	getCurrentLanguage,
+	registerLanguagePack,
+	setLanguage,
+	type LanguagePack,
+	type LazyLanguagePack,
+} from "../i18n/registry";
 
 // Props passed to plugin panel components via React context
 export interface PluginPanelProps {
@@ -59,7 +68,25 @@ export interface HermesPluginAPI {
 		list(): Promise<SessionInfo[]>;
 		focus(sessionId: string): Promise<void>;
 	};
-	agents: AgentsAPI;
+	/** The plugin API this plugin runs against: 1, or 2 when its manifest says `"apiVersion": 2`. */
+	apiVersion: 1 | 2;
+	/** v1: watchTranscript only (Claude-shaped, deprecated). v2 adds the normalised events of every agent. */
+	agents: AgentsAPI & Partial<AgentsAPIv2>;
+	/** v2 only: the attention inbox. */
+	inbox?: InboxAPI;
+	/** v2 only: the repository's feature tracks, read-only. */
+	features?: FeaturesAPI;
+	/** v2 only: checks the Review Desk runs over a diff. */
+	review?: ReviewAPI;
+	// NOTE: setLanguage is intentionally not permission-gated for now — the
+	// built-in language pack is the intended consumer of this API.
+	i18n: {
+		/** A pack with `load()` instead of `messages` fetches its messages
+		 *  only when the language is picked. */
+		registerLanguagePack(pack: LanguagePack | LazyLanguagePack): Disposable;
+		getCurrentLanguage(): string;
+		setLanguage(locale: string): Promise<void>;
+	};
 	subscriptions: Disposable[];
 	/** @internal Used by PluginRuntime to forward UI settings changes to plugin listeners. */
 	_notifySettingChanged(key: string, value: string | number | boolean): void;
@@ -90,22 +117,37 @@ export interface PluginAPICallbacks {
 	onSessionsList?: () => Promise<SessionInfo[]>;
 	onSessionFocus?: (sessionId: string) => void;
 	onFileHandlerRegistered?: () => void;
+	/** v2: the working directory of a session the app knows (features.list). */
+	onSessionWorkingDirectory?: (sessionId: string) => string | null | undefined;
 }
 
+/**
+ * Build the API object handed to one plugin. `pluginToken` is the backend's
+ * proof of this plugin's identity: every token-bound command goes out with
+ * it, and only closures of this object hold it. Never store the returned
+ * object anywhere a plugin could reach (see PluginRuntime).
+ */
 export function createPluginAPI(
 	pluginId: string,
+	pluginToken: string,
 	permissions: Set<string>,
 	settingsSchema: PluginSettingsSchema | undefined,
 	callbacks: PluginAPICallbacks,
 	commandHandlers: Map<string, () => void | Promise<void>>,
 	panelComponents: Map<string, React.ComponentType<PluginPanelProps>>,
 	fileHandlers?: Map<string, { pluginId: string; component: React.ComponentType<FileHandlerProps> }>,
+	apiVersion: 1 | 2 = 1,
 ): HermesPluginAPI {
 	const subscriptions: Disposable[] = [];
 	const schema = settingsSchema ?? {};
+	// Token-bound IPC: the backend learns who calls from the token, never
+	// from a plugin id in the arguments.
+	const call = bindPluginInvoke(pluginToken);
 	const settingsChangeListeners = new Map<string, Set<(value: string | number | boolean) => void>>();
+	let warnedTranscript = false;
 
-	return {
+	const api: HermesPluginAPI = {
+		apiVersion,
 		_notifySettingChanged(key: string, value: string | number | boolean) {
 			const listeners = settingsChangeListeners.get(key);
 			if (listeners) {
@@ -196,7 +238,7 @@ export function createPluginAPI(
 				if (!permissions.has("storage")) {
 					throw new PermissionDeniedError(pluginId, "storage");
 				}
-				return invoke<string | null>("get_plugin_setting", { pluginId, key });
+				return call<string | null>("get_plugin_setting", { key });
 			},
 			async set(key: string, value: string) {
 				if (!permissions.has("storage")) {
@@ -205,13 +247,13 @@ export function createPluginAPI(
 				if (key.startsWith("__setting:")) {
 					throw new Error(`Plugin "${pluginId}": storage key "${key}" is reserved. Use api.settings.update() instead.`);
 				}
-				await invoke("set_plugin_setting", { pluginId, key, value });
+				await call("set_plugin_setting", { key, value });
 			},
 			async delete(key: string) {
 				if (!permissions.has("storage")) {
 					throw new PermissionDeniedError(pluginId, "storage");
 				}
-				await invoke("delete_plugin_setting", { pluginId, key });
+				await call("delete_plugin_setting", { key });
 			},
 		},
 		settings: {
@@ -222,8 +264,7 @@ export function createPluginAPI(
 				const def = schema[key];
 				if (!def) return undefined as unknown as T;
 
-				const stored = await invoke<string | null>("get_plugin_setting", {
-					pluginId,
+				const stored = await call<string | null>("get_plugin_setting", {
 					key: `__setting:${key}`,
 				});
 
@@ -269,8 +310,7 @@ export function createPluginAPI(
 					}
 				}
 
-				await invoke("set_plugin_setting", {
-					pluginId,
+				await call("set_plugin_setting", {
 					key: `__setting:${key}`,
 					value: String(value),
 				});
@@ -310,8 +350,7 @@ export function createPluginAPI(
 				}
 				const result: Record<string, string | number | boolean> = {};
 				for (const [key, def] of Object.entries(schema)) {
-					const stored = await invoke<string | null>("get_plugin_setting", {
-						pluginId,
+					const stored = await call<string | null>("get_plugin_setting", {
 						key: `__setting:${key}`,
 					});
 					if (stored === null || stored === undefined) {
@@ -350,13 +389,13 @@ export function createPluginAPI(
 				if (!permissions.has("network")) {
 					throw new PermissionDeniedError(pluginId, "network");
 				}
-				return invoke("plugin_fetch_url", { url, headers: headers ?? null, pluginId });
+				return call("plugin_fetch_url", { url, headers: headers ?? null });
 			},
 			postJson(url: string, body: string, headers?: Record<string, string>): Promise<string> {
 				if (!permissions.has("network")) {
 					throw new PermissionDeniedError(pluginId, "network");
 				}
-				return invoke("plugin_post_json", { url, body, headers: headers ?? null, pluginId });
+				return call("plugin_post_json", { url, body, headers: headers ?? null });
 			},
 		},
 		shell: {
@@ -370,7 +409,7 @@ export function createPluginAPI(
 				if (!permissions.has("shell.exec")) {
 					throw new PermissionDeniedError(pluginId, "shell.exec");
 				}
-				return invoke("plugin_exec_command", { command, args: args ?? [], pluginId });
+				return call("plugin_exec_command", { command, args: args ?? [] });
 			},
 		},
 		sessions: {
@@ -407,6 +446,12 @@ export function createPluginAPI(
 				if (!permissions.has("sessions.read")) {
 					throw new PermissionDeniedError(pluginId, "sessions.read");
 				}
+				if (apiVersion === 2 && !warnedTranscript) {
+					warnedTranscript = true;
+					console.warn(
+						`[Plugin:${pluginId}] agents.watchTranscript is deprecated in plugin API v2: its events only come from Claude transcripts. Use agents.onEvent, which reports every agent the same way.`,
+					);
+				}
 				try {
 					const watcherId: string = await invoke("start_transcript_watcher", { sessionId });
 					const eventName = `transcript-event:${watcherId}`;
@@ -425,6 +470,31 @@ export function createPluginAPI(
 				}
 			},
 		},
+		i18n: {
+			registerLanguagePack(pack: LanguagePack | LazyLanguagePack): Disposable {
+				const disposable = registerLanguagePack(pack);
+				subscriptions.push(disposable);
+				return disposable;
+			},
+			getCurrentLanguage,
+			setLanguage,
+		},
 		subscriptions,
 	};
+
+	if (apiVersion === 2) {
+		const v2 = createPluginApiV2({
+			pluginId,
+			permissions,
+			call,
+			subscriptions,
+			workingDirectory: (sessionId) => callbacks.onSessionWorkingDirectory?.(sessionId) ?? null,
+			deny: (permission) => new PermissionDeniedError(pluginId, permission),
+		});
+		Object.assign(api.agents, v2.agents);
+		api.inbox = v2.inbox;
+		api.features = v2.features;
+		api.review = v2.review;
+	}
+	return api;
 }

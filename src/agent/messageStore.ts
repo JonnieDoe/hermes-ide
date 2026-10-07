@@ -62,6 +62,18 @@ export interface RenderedMessage {
   timestamp?: number;
 }
 
+/**
+ * F14: the agent compacted its context (a `system`/`compact_boundary`
+ * event). The view draws a divider after the message that was last when it
+ * happened (`afterMessageId`, null when there was none yet).
+ */
+export interface CompactionMark {
+  afterMessageId: string | null;
+  trigger: string | null;
+  preTokens: number | null;
+  at: number;
+}
+
 export interface AgentSessionState {
   initialized: boolean;
   initEvent: InitEvent | null;
@@ -121,6 +133,8 @@ export interface AgentSessionState {
    *  *bridge process's* lifetime, which with the long-lived bridge equals
    *  the user's session.  Reset on workspace restore. */
   cumulativeCostUsd: number;
+  /** Same idea for input tokens. Used by the Usage panel after it opens late. */
+  cumulativeInputTokens: number;
   /** Same idea for output tokens — quick "how much have I gotten back?" */
   cumulativeOutputTokens: number;
   /** Account info from the SDK's `query.accountInfo()`.  Captured once
@@ -153,11 +167,15 @@ export interface AgentSessionState {
    *  the last message in `messages` is still the user's prompt.
    *  Null until the first `result` event arrives. */
   resultEventAt: number | null;
+  /** Context compactions, oldest first (F14). */
+  compactions: CompactionMark[];
 }
 
 export function emptyState(): AgentSessionState {
   return {
+    compactions: [],
     cumulativeCostUsd: 0,
+    cumulativeInputTokens: 0,
     cumulativeOutputTokens: 0,
     accountInfo: null,
     rateLimits: {},
@@ -713,6 +731,24 @@ function reduceStreamPartial(
   return state;
 }
 
+/** Where a compact_boundary lands: after the last top-level message. */
+function compactionMark(state: AgentSessionState, event: AgentEvent): CompactionMark {
+  const meta = (event as { compact_metadata?: { trigger?: unknown; pre_tokens?: unknown } }).compact_metadata;
+  let afterMessageId: string | null = null;
+  for (let i = state.messages.length - 1; i >= 0; i--) {
+    if (!state.messages[i].parentToolUseId) {
+      afterMessageId = state.messages[i].id;
+      break;
+    }
+  }
+  return {
+    afterMessageId,
+    trigger: typeof meta?.trigger === "string" ? meta.trigger : null,
+    preTokens: typeof meta?.pre_tokens === "number" && Number.isFinite(meta.pre_tokens) ? meta.pre_tokens : null,
+    at: Date.now(),
+  };
+}
+
 /**
  * Pure reducer — given the previous state and an incoming event,
  * return the next state. Never mutates the input.
@@ -771,6 +807,9 @@ export function reduceEvent(
             ? state.streamingThinkingText
             : new Map(),
       };
+    }
+    if ((event as { subtype?: unknown }).subtype === "compact_boundary") {
+      return { ...state, compactions: [...state.compactions, compactionMark(state, event)] };
     }
     // Other system events (status, etc.) are flow markers — ignore quietly.
     return state;
@@ -907,6 +946,13 @@ export function reduceEvent(
           const v = u?.output_tokens;
           return typeof v === "number" ? v : 0;
         })();
+    const turnIn = alreadyAccumulated
+      ? 0
+      : (() => {
+          const u = (event as { usage?: { input_tokens?: unknown } }).usage;
+          const v = u?.input_tokens;
+          return typeof v === "number" ? v : 0;
+        })();
     const seenResultEventIds =
       eventId !== null && !alreadyAccumulated
         ? appendCappedResultId(state.seenResultEventIds, eventId)
@@ -921,6 +967,7 @@ export function reduceEvent(
       resultEventAt: now,
       seenResultEventIds,
       cumulativeCostUsd: state.cumulativeCostUsd + turnCost,
+      cumulativeInputTokens: state.cumulativeInputTokens + turnIn,
       cumulativeOutputTokens: state.cumulativeOutputTokens + turnOut,
       // A SUCCESSFUL result clears any prior error — once the user has
       // recovered (via /compact, /branch, a fork, etc.) the banner
@@ -1038,6 +1085,66 @@ function appendCappedResultId(
 /** Convenience: fold an array of events into a final state. */
 export function reduceAll(events: AgentEvent[]): AgentSessionState {
   return events.reduce(reduceEvent, emptyState());
+}
+
+/** The time a history event was said (epoch ms), when the transcript has it. */
+function historyTimestamp(event: AgentEvent): number | null {
+  const ts = (event as { _hermes_history_ts?: unknown })._hermes_history_ts;
+  return typeof ts === "number" && Number.isFinite(ts) ? ts : null;
+}
+
+/**
+ * Puts a restored session's earlier conversation (read back from the
+ * agent's own transcript) in front of what this store already shows.
+ *
+ * The history is finished: nothing in it is running, streaming or thinking
+ * any more, and a turn it ends on did not get an answer because the app
+ * quit, so it does not read as waiting. Messages the store already has
+ * (by id) are not added twice. Each message keeps the time it was said.
+ */
+export function withHistory(state: AgentSessionState, history: AgentEvent[]): AgentSessionState {
+  if (history.length === 0) return state;
+  const past = reduceAll(history);
+  if (past.messages.length === 0) return state;
+
+  const said = new Map<string, number>();
+  for (const event of history) {
+    const ts = historyTimestamp(event);
+    if (ts === null) continue;
+    if (isAssistantEvent(event)) {
+      if (!said.has(event.message.id)) said.set(event.message.id, ts);
+    } else if (isUserEvent(event) && event.uuid) {
+      said.set(`user-${event.uuid}`, ts);
+    }
+  }
+  const have = new Set(state.messages.map((m) => m.id));
+  const earlier = past.messages
+    .filter((m) => !have.has(m.id))
+    .map((m) => {
+      const ts = said.get(m.id);
+      return ts === undefined ? m : { ...m, timestamp: ts };
+    });
+  if (earlier.length === 0) return state;
+
+  const toolResults = new Map(past.toolResults);
+  for (const [id, result] of state.toolResults) toolResults.set(id, result);
+
+  // Thinking blocks of the past keep no timer: how long they took is not in
+  // the transcript, and a time measured now would be wrong.
+
+  const lastEarlier = earlier[earlier.length - 1];
+  const endedOnPrompt = state.messages.length === 0 && lastEarlier.role === "user";
+  const resultEventAt = endedOnPrompt
+    ? Math.max(state.resultEventAt ?? 0, lastEarlier.timestamp ?? 0)
+    : state.resultEventAt;
+
+  return {
+    ...state,
+    messages: [...earlier, ...state.messages],
+    toolResults,
+    compactions: [...past.compactions, ...state.compactions],
+    resultEventAt,
+  };
 }
 
 /**

@@ -1,6 +1,8 @@
 import type { PluginManifest, PluginCommandContribution, PluginPanelContribution, PluginStatusBarItem, PluginSessionActionContribution, HermesEvent, FileHandlerProps } from "./types";
 import { createPluginAPI, type HermesPluginAPI, type PluginPanelProps, type PluginAPICallbacks } from "./PluginAPI";
-import { invoke } from "@tauri-apps/api/core";
+import type { Disposable } from "./types";
+import { hostInvoke, issuePluginToken, revokePluginToken } from "./identity";
+import { PLUGIN_API_V1_REMOVED_IN, resolvePluginApi } from "./apiV2";
 
 export type PluginActivateFn = (api: HermesPluginAPI) => void | Promise<void>;
 export type PluginDeactivateFn = () => void | Promise<void>;
@@ -13,11 +15,31 @@ export interface PluginModule {
 
 export type PluginStatus = "registered" | "activating" | "active" | "error" | "inactive";
 
+/**
+ * What the runtime keeps of an active plugin's API. Deliberately NOT the API
+ * object itself: that object's closures hold the plugin's identity token,
+ * and this runtime is reachable from React props, so holding the API here
+ * would let one plugin act as another.
+ */
+interface PluginApiHandle {
+	subscriptions: Disposable[];
+	notifySettingChanged: (key: string, value: string | number | boolean) => void;
+}
+
 interface PluginEntry {
 	module: PluginModule;
 	status: PluginStatus;
-	api: HermesPluginAPI | null;
+	api: PluginApiHandle | null;
 	error?: Error;
+	/** Ships with the app: never reported as using a deprecated API. */
+	builtin: boolean;
+	/** The API it runs against, once activation resolved it. */
+	apiVersion: 1 | 2 | null;
+}
+
+export interface PluginRuntimeOptions {
+	/** The pluginApiV2 feature flag, read once at startup. */
+	pluginApiV2?: boolean;
 }
 
 export interface RuntimeStatusBarItem extends PluginStatusBarItem {
@@ -35,24 +57,44 @@ export class PluginRuntime {
 	private changeListeners = new Set<() => void>();
 	private eventListeners = new Map<HermesEvent, Set<(...args: unknown[]) => void>>();
 	private callbacks: PluginAPICallbacks;
+	private options: PluginRuntimeOptions;
 
-	constructor(callbacks: PluginAPICallbacks) {
+	constructor(callbacks: PluginAPICallbacks, options: PluginRuntimeOptions = {}) {
 		this.callbacks = callbacks;
+		this.options = options;
 	}
 
-	register(module: PluginModule): void {
+	register(module: PluginModule, options: { builtin?: boolean } = {}): void {
 		const { id } = module.manifest;
 		if (this.plugins.has(id)) {
 			console.warn(`[PluginRuntime] Plugin "${id}" already registered`);
 			return;
 		}
-		this.plugins.set(id, { module, status: "registered", api: null });
+		this.plugins.set(id, { module, status: "registered", api: null, builtin: options.builtin === true, apiVersion: null });
 		this.notify();
 	}
 
 	async activate(pluginId: string): Promise<void> {
 		const entry = this.plugins.get(pluginId);
 		if (!entry || entry.status === "active" || entry.status === "activating") return;
+
+		// Which plugin API it gets, before anything runs: a plugin built for
+		// an API this Hermes does not offer is refused, not half-started.
+		const apiChoice = resolvePluginApi(entry.module.manifest.apiVersion, this.options.pluginApiV2 === true, entry.builtin);
+		if (!apiChoice.ok) {
+			entry.status = "error";
+			entry.apiVersion = null;
+			entry.error = new Error(`Plugin "${pluginId}" ${apiChoice.message}.`);
+			console.error(`[PluginRuntime] Not activating "${pluginId}": ${apiChoice.message}.`);
+			this.notify();
+			return;
+		}
+		entry.apiVersion = apiChoice.version;
+		if (apiChoice.deprecated) {
+			console.warn(
+				`[PluginRuntime] Plugin "${pluginId}" uses plugin API v1, which is deprecated and stops loading in Hermes ${PLUGIN_API_V1_REMOVED_IN}. Declare "apiVersion": 2 in its hermes-plugin.json (see docs/plugin-api-v2.md).`,
+			);
+		}
 
 		entry.status = "activating";
 		this.notify();
@@ -72,9 +114,13 @@ export class PluginRuntime {
 				permissions.add("storage");
 			}
 
+			// The backend's proof of this plugin's identity. Without it the
+			// plugin cannot run: fail closed rather than activate unbound.
+			const pluginToken = await issuePluginToken(pluginId);
+
 			// Persist plugin metadata + permissions to DB for backend enforcement
 			try {
-				await invoke("save_plugin_metadata", {
+				await hostInvoke("save_plugin_metadata", {
 					pluginId,
 					version: entry.module.manifest.version,
 					name: entry.module.manifest.name,
@@ -96,16 +142,21 @@ export class PluginRuntime {
 					this.notify();
 				},
 			};
-			const api = createPluginAPI(
+			const api: HermesPluginAPI = createPluginAPI(
 				pluginId,
+				pluginToken,
 				permissions,
 				settingsSchema,
 				fullCallbacks,
 				this.commandHandlers,
 				this.panelComponents,
 				this.fileHandlers,
+				apiChoice.version,
 			);
-			entry.api = api;
+			entry.api = {
+				subscriptions: api.subscriptions,
+				notifySettingChanged: (key, value) => api._notifySettingChanged(key, value),
+			};
 			await entry.module.activate(api);
 			entry.status = "active";
 		} catch (err) {
@@ -123,13 +174,23 @@ export class PluginRuntime {
 
 			// Dispose subscriptions added during partial activation
 			if (entry.api) {
-				for (const sub of entry.api.subscriptions) {
+				for (const sub of [...entry.api.subscriptions]) {
 					try { sub.dispose(); } catch {}
 				}
 				entry.api = null;
 			}
+			await this.revokeToken(pluginId);
 		}
 		this.notify();
+	}
+
+	/** Best effort: a token that cannot be revoked dies with the page anyway. */
+	private async revokeToken(pluginId: string): Promise<void> {
+		try {
+			await revokePluginToken(pluginId);
+		} catch (err) {
+			console.warn(`[PluginRuntime] Failed to revoke token for "${pluginId}":`, err);
+		}
 	}
 
 	async deactivate(pluginId: string): Promise<void> {
@@ -144,13 +205,15 @@ export class PluginRuntime {
 
 		// Dispose all subscriptions
 		if (entry.api) {
-			for (const sub of entry.api.subscriptions) {
+			for (const sub of [...entry.api.subscriptions]) {
 				try { sub.dispose(); } catch {}
 			}
 		}
 
 		entry.api = null;
 		entry.status = "inactive";
+		// The API object the plugin still holds must stop working now.
+		await this.revokeToken(pluginId);
 		this.notify();
 	}
 
@@ -194,7 +257,7 @@ export class PluginRuntime {
 	notifySettingChanged(pluginId: string, key: string, value: string | number | boolean): void {
 		const entry = this.plugins.get(pluginId);
 		if (!entry?.api) return;
-		entry.api._notifySettingChanged(key, value);
+		entry.api.notifySettingChanged(key, value);
 	}
 
 	private subscribeEvent(event: HermesEvent, callback: (...args: unknown[]) => void): { dispose(): void } {
@@ -320,6 +383,15 @@ export class PluginRuntime {
 
 	getPluginCount(): number {
 		return this.plugins.size;
+	}
+
+	getAllPlugins(): { manifest: PluginManifest; status: PluginStatus; apiVersion: 1 | 2 | null; error: string | null }[] {
+		return Array.from(this.plugins.values()).map((entry) => ({
+			manifest: entry.module.manifest,
+			status: entry.status,
+			apiVersion: entry.apiVersion,
+			error: entry.status === "error" ? (entry.error?.message ?? null) : null,
+		}));
 	}
 
 	subscribe(listener: () => void): () => void {

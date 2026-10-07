@@ -7,9 +7,14 @@ interface MenuSyncState {
   sidebarVisible: boolean;
   processPanelOpen: boolean;
   gitPanelOpen: boolean;
+  /** F21: the ⌘G item's label while the Review Desk replaces the git panel; unset keeps "Git Panel". */
+  gitPanelLabel?: string;
   contextPanelOpen: boolean;
   searchPanelOpen: boolean;
   flowMode: boolean;
+  /** False greys out View > Cost Dashboard (and its shortcut): with the
+   *  fleetControls flag on, Hermes shows no estimated costs. Default true. */
+  costDashboardAvailable?: boolean;
 }
 
 export function useMenuStateSync(uiState: MenuSyncState): void {
@@ -17,10 +22,11 @@ export function useMenuStateSync(uiState: MenuSyncState): void {
     const updates: MenuItemUpdate[] = [
       { id: "view.toggle-sidebar", checked: uiState.sidebarVisible },
       { id: "view.process-panel", checked: uiState.processPanelOpen },
-      { id: "view.git-panel", checked: uiState.gitPanelOpen },
+      { id: "view.git-panel", checked: uiState.gitPanelOpen, ...(uiState.gitPanelLabel ? { text: uiState.gitPanelLabel } : {}) },
       { id: "view.context-panel", checked: uiState.contextPanelOpen },
       { id: "view.search-panel", checked: uiState.searchPanelOpen },
       { id: "view.flow-mode", checked: uiState.flowMode },
+      { id: "view.cost-dashboard", enabled: uiState.costDashboardAvailable ?? true },
     ];
 
     updateMenuState(updates).catch(console.error);
@@ -28,8 +34,10 @@ export function useMenuStateSync(uiState: MenuSyncState): void {
     uiState.sidebarVisible,
     uiState.processPanelOpen,
     uiState.gitPanelOpen,
+    uiState.gitPanelLabel,
     uiState.contextPanelOpen,
     uiState.searchPanelOpen,
     uiState.flowMode,
+    uiState.costDashboardAvailable,
   ]);
 }

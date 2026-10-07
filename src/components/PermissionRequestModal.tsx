@@ -6,8 +6,13 @@
  * to the bridge's stdin.
  *
  * Visual: docs/internal/v1-tui-parity-plan.md §8.4.
+ *
+ * The prompt never takes keyboard focus: it can appear while the user is
+ * typing in the composer, and an Enter meant for their message must not
+ * land on a focused approve button.
  */
 import "../styles/components/PermissionRequestModal.css";
+import { Button, Textarea } from "./ui";
 import { useEffect, useMemo, useState } from "react";
 import {
   buildApproveAllAllowRule,
@@ -19,9 +24,15 @@ interface Props {
   request: PermRequest;
   permissionMode: string;
   onDecision: (decision: PermissionDecision) => void;
+  /**
+   * Whether an "Always allow" rule can be saved.  False when the session
+   * has no project folder: the rule would have nowhere to go, so the
+   * button is not offered rather than silently saving nothing.
+   */
+  canPersist?: boolean;
 }
 
-export function PermissionRequestModal({ request, permissionMode, onDecision }: Props) {
+export function PermissionRequestModal({ request, permissionMode, onDecision, canPersist = true }: Props) {
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState(() =>
     JSON.stringify(request.input, null, 2),
@@ -82,12 +93,15 @@ export function PermissionRequestModal({ request, permissionMode, onDecision }: 
 
       {editing && (
         <div className="perm-modal-edit">
-          <textarea
+          <Textarea
+            code
             className="perm-edit-textarea"
+            aria-label="Tool input (JSON)"
             value={editText}
             onChange={(e) => setEditText(e.target.value)}
             rows={8}
             spellCheck={false}
+            invalid={parsedEdit === null}
           />
           {parsedEdit === null && (
             <div className="perm-edit-error">invalid JSON — fix to enable confirm</div>
@@ -98,30 +112,29 @@ export function PermissionRequestModal({ request, permissionMode, onDecision }: 
       <div className="perm-modal-actions">
         {editing ? (
           <>
-            <button
-              type="button"
-              className="perm-link"
+            <Button
+              variant="quiet"
+              className="perm-link-cancel"
               onClick={() => {
                 setEditing(false);
                 setEditText(JSON.stringify(request.input, null, 2));
               }}
             >
               Cancel
-            </button>
+            </Button>
             <span className="perm-modal-actions-spacer" />
-            <button
-              type="button"
-              className="perm-link perm-link-primary"
+            <Button
+              variant="primary"
+              className="perm-link-primary"
               disabled={parsedEdit === null}
               onClick={() => {
                 if (parsedEdit) {
                   onDecision({ kind: "allow", updatedInput: parsedEdit });
                 }
               }}
-              autoFocus
             >
               Confirm edit
-            </button>
+            </Button>
           </>
         ) : (
           <>
@@ -129,37 +142,37 @@ export function PermissionRequestModal({ request, permissionMode, onDecision }: 
              * Layout follows the standard dialog pattern: destructive
              * + secondary options sit at the leading edge, the
              * confirm action gets the trailing spotlight. */}
-            <button
-              type="button"
-              className="perm-link perm-link-deny"
+            <Button
+              variant="danger"
+              className="perm-link-deny"
               onClick={() => onDecision({ kind: "deny" })}
             >
               Deny
-            </button>
-            <button
-              type="button"
-              className="perm-link"
+            </Button>
+            <Button
+              variant="quiet"
+              className="perm-link-edit"
               onClick={() => setEditing(true)}
             >
               Edit input
-            </button>
+            </Button>
             <span className="perm-modal-actions-spacer" />
-            <button
-              type="button"
-              className="perm-link"
-              title={`Adds permissions.allow: ['${allowRule}'] to ~/.claude/settings.json`}
-              onClick={() => onDecision({ kind: "allow", persist: allowRule })}
-            >
-              Always allow ({request.toolName})
-            </button>
-            <button
-              type="button"
-              className="perm-link perm-link-primary"
+            {canPersist && (
+              <Button
+                className="perm-link-always"
+                title={`Adds permissions.allow: ['${allowRule}'] to this project's .claude/settings.local.json`}
+                onClick={() => onDecision({ kind: "allow", persist: allowRule })}
+              >
+                Always allow ({request.toolName})
+              </Button>
+            )}
+            <Button
+              variant="primary"
+              className="perm-link-primary"
               onClick={() => onDecision({ kind: "allow" })}
-              autoFocus
             >
               Approve once
-            </button>
+            </Button>
           </>
         )}
       </div>

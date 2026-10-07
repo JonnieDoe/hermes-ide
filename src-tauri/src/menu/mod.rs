@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::menu::{
-    AboutMetadataBuilder, CheckMenuItemBuilder, Menu, MenuBuilder, MenuEvent, MenuItemBuilder,
-    PredefinedMenuItem, SubmenuBuilder,
+    AboutMetadata, AboutMetadataBuilder, CheckMenuItemBuilder, Menu, MenuBuilder, MenuEvent,
+    MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder,
 };
 use tauri::{AppHandle, Emitter, Manager, Wry};
 
@@ -34,6 +34,9 @@ pub struct MenuItemUpdate {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub checked: Option<bool>,
+    /// A new label for the item (F21: "Git Panel" reads "Review Desk" with the flag on).
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,24 +44,113 @@ pub struct MenuActionPayload {
     pub action: String,
 }
 
+// ─── About dialog ───────────────────────────────────────────────────
+
+/// Shown in the About dialog so nobody mistakes this app for a different
+/// project that shares the Hermes name.
+pub const NON_AFFILIATION_NOTE: &str = "Not affiliated with Nous Research or its Hermes Agent.";
+
+/// Metadata for the native About dialog.  The non-affiliation note goes in
+/// both `comments` (shown on Windows and Linux) and `credits` (shown on
+/// macOS), because each platform shows only one of them.
+fn about_metadata() -> AboutMetadata<'static> {
+    AboutMetadataBuilder::new()
+        .name(Some("HERMES-IDE"))
+        .version(Some(env!("CARGO_PKG_VERSION")))
+        .comments(Some(NON_AFFILIATION_NOTE))
+        .credits(Some(NON_AFFILIATION_NOTE))
+        .build()
+}
+
+// ─── Keymap ─────────────────────────────────────────────────────────
+//
+// App chords live in one table shared with the frontend (which shows them in
+// the Shortcuts panel and handles them inside the webview). On Windows/Linux
+// a native accelerator can take a key before the webview sees it, so no app
+// chord there is a bare Ctrl+letter: those belong to the terminal.
+
+const KEYMAP_JSON: &str = include_str!("../../../src/utils/keymap.json");
+
+#[derive(Debug, Deserialize)]
+struct KeymapFile {
+    chords: Vec<KeymapChord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeymapChord {
+    action: String,
+    mac: String,
+    pc: String,
+}
+
+fn keymap() -> &'static KeymapFile {
+    static KEYMAP: std::sync::OnceLock<KeymapFile> = std::sync::OnceLock::new();
+    KEYMAP
+        .get_or_init(|| serde_json::from_str(KEYMAP_JSON).expect("src/utils/keymap.json is valid"))
+}
+
+/// Canonical chord ("{mod}{shift}D") → accelerator string ("CmdOrCtrl+Shift+D").
+fn to_accelerator(canonical: &str) -> String {
+    canonical
+        .replace("{mod}", "CmdOrCtrl+")
+        .replace("{ctrl}", "Ctrl+")
+        .replace("{shift}", "Shift+")
+        .replace("{alt}", "Alt+")
+}
+
+/// Accelerator for a menu action on the given platform.
+fn accelerator_for(action: &str, mac: bool) -> Option<String> {
+    keymap()
+        .chords
+        .iter()
+        .find(|c| c.action == action)
+        .map(|c| to_accelerator(if mac { &c.mac } else { &c.pc }))
+}
+
+fn app_accel(action: &str) -> Result<String, Box<dyn std::error::Error>> {
+    accelerator_for(action, cfg!(target_os = "macos"))
+        .ok_or_else(|| format!("no keyboard chord for menu action {action}").into())
+}
+
+// ─── Quit ───────────────────────────────────────────────────────────
+
+/// The app menu's Quit item.
+pub const QUIT_ID: &str = "hermes.quit";
+
+/// Label and accelerator the predefined Quit item has on each platform:
+/// Cmd+Q on macOS only; on Windows and Linux no chord (Ctrl+Q belongs to the
+/// terminal).
+fn quit_label_and_accelerator(mac: bool, windows: bool) -> (&'static str, Option<&'static str>) {
+    if mac {
+        ("Quit HERMES-IDE", Some("CmdOrCtrl+Q"))
+    } else if windows {
+        ("Exit", None)
+    } else {
+        ("Quit", None)
+    }
+}
+
+fn quit_item(app: &AppHandle) -> tauri::Result<tauri::menu::MenuItem<Wry>> {
+    let (label, accel) =
+        quit_label_and_accelerator(cfg!(target_os = "macos"), cfg!(target_os = "windows"));
+    let builder = MenuItemBuilder::with_id(QUIT_ID, label);
+    match accel {
+        Some(a) => builder.accelerator(a).build(app),
+        None => builder.build(app),
+    }
+}
+
 // ─── Build Application Menu Bar ─────────────────────────────────────
 
 pub fn build_app_menu(app: &AppHandle) -> Result<Menu<Wry>, Box<dyn std::error::Error>> {
     // ── Hermes menu (app menu) ──
-    let about = PredefinedMenuItem::about(
-        app,
-        Some("About HERMES-IDE"),
-        Some(
-            AboutMetadataBuilder::new()
-                .name(Some("HERMES-IDE"))
-                .version(Some(env!("CARGO_PKG_VERSION")))
-                .build(),
-        ),
-    )?;
+    let about = PredefinedMenuItem::about(app, Some("About HERMES-IDE"), Some(about_metadata()))?;
     let settings = MenuItemBuilder::with_id("hermes.settings", "Settings...")
-        .accelerator("CmdOrCtrl+,")
+        .accelerator(app_accel("hermes.settings")?)
         .build(app)?;
-    let quit = PredefinedMenuItem::quit(app, None)?;
+    // Not the predefined Quit: that one exits without asking the frontend
+    // to save its workspace first (see quit_flush).
+    let quit = quit_item(app)?;
 
     #[cfg(target_os = "macos")]
     let hermes_menu = {
@@ -93,20 +185,27 @@ pub fn build_app_menu(app: &AppHandle) -> Result<Menu<Wry>, Box<dyn std::error::
 
     // ── File menu ──
     let new_session = MenuItemBuilder::with_id("file.new-session", "New Session")
-        .accelerator("CmdOrCtrl+N")
+        .accelerator(app_accel("file.new-session")?)
         .build(app)?;
+    // The full creator (SSH, tmux, an existing branch, a plain shell); with
+    // the task launcher on, New Session opens the launcher instead (F15).
+    let new_session_advanced =
+        MenuItemBuilder::with_id("file.new-session-advanced", "New Session (Advanced)")
+            .accelerator(app_accel("file.new-session-advanced")?)
+            .build(app)?;
     let new_tab = MenuItemBuilder::with_id("file.new-session-tab", "New Tab")
-        .accelerator("CmdOrCtrl+T")
+        .accelerator(app_accel("file.new-session-tab")?)
         .build(app)?;
     let close_pane = MenuItemBuilder::with_id("file.close-pane", "Close Pane")
-        .accelerator("CmdOrCtrl+W")
+        .accelerator(app_accel("file.close-pane")?)
         .build(app)?;
     let open_file_explorer = MenuItemBuilder::with_id("file.file-explorer", "File Explorer")
-        .accelerator("CmdOrCtrl+F")
+        .accelerator(app_accel("file.file-explorer")?)
         .build(app)?;
 
     let file_menu = SubmenuBuilder::new(app, "File")
         .item(&new_session)
+        .item(&new_session_advanced)
         .item(&new_tab)
         .item(&close_pane)
         .separator()
@@ -153,37 +252,37 @@ pub fn build_app_menu(app: &AppHandle) -> Result<Menu<Wry>, Box<dyn std::error::
 
     // ── View menu ──
     let toggle_sidebar = CheckMenuItemBuilder::with_id("view.toggle-sidebar", "Sidebar")
-        .accelerator("CmdOrCtrl+B")
+        .accelerator(app_accel("view.toggle-sidebar")?)
         .checked(true)
         .build(app)?;
     let command_palette = MenuItemBuilder::with_id("view.command-palette", "Command Palette")
-        .accelerator("CmdOrCtrl+K")
+        .accelerator(app_accel("view.command-palette")?)
         .build(app)?;
-    let prompt_composer = MenuItemBuilder::with_id("view.prompt-composer", "Prompt Composer")
-        .accelerator("CmdOrCtrl+J")
+    let prompt_composer = MenuItemBuilder::with_id("view.prompt-composer", "Prompts")
+        .accelerator(app_accel("view.prompt-composer")?)
         .build(app)?;
     let process_panel = CheckMenuItemBuilder::with_id("view.process-panel", "Process Panel")
-        .accelerator("CmdOrCtrl+P")
+        .accelerator(app_accel("view.process-panel")?)
         .build(app)?;
     let git_panel = CheckMenuItemBuilder::with_id("view.git-panel", "Git Panel")
-        .accelerator("CmdOrCtrl+G")
+        .accelerator(app_accel("view.git-panel")?)
         .build(app)?;
     let context_panel = CheckMenuItemBuilder::with_id("view.context-panel", "Context Panel")
-        .accelerator("CmdOrCtrl+E")
+        .accelerator(app_accel("view.context-panel")?)
         .build(app)?;
     let cost_dashboard = MenuItemBuilder::with_id("view.cost-dashboard", "Cost Dashboard")
-        .accelerator("CmdOrCtrl+$")
+        .accelerator(app_accel("view.cost-dashboard")?)
         .build(app)?;
     let shortcuts = MenuItemBuilder::with_id("view.shortcuts", "Keyboard Shortcuts")
-        .accelerator("CmdOrCtrl+/")
+        .accelerator(app_accel("view.shortcuts")?)
         .build(app)?;
 
     // Split submenu
     let split_horizontal = MenuItemBuilder::with_id("view.split-horizontal", "Split Right")
-        .accelerator("CmdOrCtrl+D")
+        .accelerator(app_accel("view.split-horizontal")?)
         .build(app)?;
     let split_vertical = MenuItemBuilder::with_id("view.split-vertical", "Split Down")
-        .accelerator("CmdOrCtrl+Shift+D")
+        .accelerator(app_accel("view.split-vertical")?)
         .build(app)?;
 
     let split_submenu = SubmenuBuilder::new(app, "Split")
@@ -192,10 +291,10 @@ pub fn build_app_menu(app: &AppHandle) -> Result<Menu<Wry>, Box<dyn std::error::
         .build()?;
 
     let toggle_flow_mode = CheckMenuItemBuilder::with_id("view.flow-mode", "Flow Mode")
-        .accelerator("CmdOrCtrl+Shift+Z")
+        .accelerator(app_accel("view.flow-mode")?)
         .build(app)?;
     let search_panel = CheckMenuItemBuilder::with_id("view.search-panel", "Search Panel")
-        .accelerator("CmdOrCtrl+Shift+F")
+        .accelerator(app_accel("view.search-panel")?)
         .build(app)?;
 
     let mut view_builder = SubmenuBuilder::new(app, "View")
@@ -233,11 +332,19 @@ pub fn build_app_menu(app: &AppHandle) -> Result<Menu<Wry>, Box<dyn std::error::
 
     // ── Session menu ──
     let copy_context = MenuItemBuilder::with_id("session.copy-context", "Copy Context")
-        .accelerator("CmdOrCtrl+Shift+C")
+        .accelerator(app_accel("session.copy-context")?)
+        .build(app)?;
+
+    // Ends the session in view (the pane's ⌘W only closes the pane), through
+    // the same checks as the sidebar's close button.
+    let close_session = MenuItemBuilder::with_id("session.close-session", "Close Session")
+        .accelerator(app_accel("session.close-session")?)
         .build(app)?;
 
     let session_menu = SubmenuBuilder::new(app, "Session")
         .item(&copy_context)
+        .separator()
+        .item(&close_session)
         .build()?;
 
     // ── Window menu ──
@@ -288,10 +395,18 @@ pub fn build_app_menu(app: &AppHandle) -> Result<Menu<Wry>, Box<dyn std::error::
 // ─── Handle Menu Bar Events ─────────────────────────────────────────
 
 pub fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
-    let id = event.id().0.clone();
+    dispatch_menu_action(app, event.id().0.clone());
+}
 
+/// What choosing the menu item `id` does.
+pub fn dispatch_menu_action(app: &AppHandle, id: String) {
     // Skip predefined items (handled by the OS)
     if id.starts_with("__") {
+        return;
+    }
+
+    if id == QUIT_ID {
+        crate::quit_flush::quit(app);
         return;
     }
 
@@ -447,12 +562,19 @@ pub async fn update_menu_state(app: AppHandle, updates: Vec<MenuItemUpdate>) -> 
                     let _ = ci.set_enabled(enabled);
                 }
             }
+            if let Some(ref text) = update.text {
+                if let Some(mi) = item.as_menuitem() {
+                    let _ = mi.set_text(text);
+                } else if let Some(ci) = item.as_check_menuitem() {
+                    let _ = ci.set_text(text);
+                }
+            }
         }
     }
     Ok(())
 }
 
-fn find_menu_item_recursive(
+pub(crate) fn find_menu_item_recursive(
     menu: &Menu<Wry>,
     target_id: &str,
 ) -> Option<tauri::menu::MenuItemKind<Wry>> {
@@ -471,6 +593,27 @@ fn find_menu_item_recursive(
         }
     }
     None
+}
+
+/// Test builds only (cargo feature `e2e`): whether a native menu item is
+/// enabled, so a real-app scenario can see what the menu bar offers.
+/// `None` when the app has no menu or no item with that id.
+#[cfg(feature = "e2e")]
+#[tauri::command]
+pub fn menu_item_enabled_for_test(app: AppHandle, id: String) -> Option<bool> {
+    let menu = app.menu()?;
+    match find_menu_item_recursive(&menu, &id)? {
+        tauri::menu::MenuItemKind::MenuItem(mi) => mi.is_enabled().ok(),
+        tauri::menu::MenuItemKind::Check(ci) => ci.is_enabled().ok(),
+        _ => None,
+    }
+}
+
+/// The same command in a normal build: refuses.
+#[cfg(not(feature = "e2e"))]
+#[tauri::command]
+pub fn menu_item_enabled_for_test(_id: String) -> Result<bool, String> {
+    Err("only available in a test build".to_string())
 }
 
 fn find_in_submenu(
@@ -492,4 +635,140 @@ fn find_in_submenu(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn about_dialog_says_not_affiliated_on_every_platform() {
+        let meta = about_metadata();
+        assert_eq!(meta.name.as_deref(), Some("HERMES-IDE"));
+        assert_eq!(meta.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        // Windows and Linux show `comments`; macOS shows `credits`.
+        assert_eq!(meta.comments.as_deref(), Some(NON_AFFILIATION_NOTE));
+        assert_eq!(meta.credits.as_deref(), Some(NON_AFFILIATION_NOTE));
+        assert!(NON_AFFILIATION_NOTE.contains("Not affiliated with Nous Research"));
+    }
+
+    /// Every menu item that carries an app chord.
+    const MENU_ACTIONS_WITH_CHORDS: &[&str] = &[
+        "hermes.settings",
+        "file.new-session",
+        "file.new-session-advanced",
+        "file.new-session-tab",
+        "file.close-pane",
+        "file.file-explorer",
+        "view.toggle-sidebar",
+        "view.command-palette",
+        "view.prompt-composer",
+        "view.process-panel",
+        "view.git-panel",
+        "view.context-panel",
+        "view.cost-dashboard",
+        "view.shortcuts",
+        "view.split-horizontal",
+        "view.split-vertical",
+        "view.flow-mode",
+        "view.search-panel",
+        "session.copy-context",
+        "session.close-session",
+    ];
+
+    fn is_bare_ctrl_letter(accel: &str) -> bool {
+        let parts: Vec<&str> = accel.split('+').collect();
+        parts.len() == 2
+            && matches!(parts[0], "Ctrl" | "CmdOrCtrl" | "Control")
+            && parts[1].len() == 1
+            && parts[1].chars().all(|c| c.is_ascii_alphabetic())
+    }
+
+    #[test]
+    fn every_menu_action_has_a_chord_on_both_platforms() {
+        for action in MENU_ACTIONS_WITH_CHORDS {
+            assert!(accelerator_for(action, true).is_some(), "{action} (mac)");
+            assert!(accelerator_for(action, false).is_some(), "{action} (pc)");
+        }
+    }
+
+    #[test]
+    fn no_windows_linux_chord_takes_a_bare_ctrl_letter() {
+        for action in MENU_ACTIONS_WITH_CHORDS {
+            let accel = accelerator_for(action, false).unwrap();
+            assert!(
+                !is_bare_ctrl_letter(&accel),
+                "{action} uses {accel}, which a terminal needs"
+            );
+        }
+    }
+
+    #[test]
+    fn chords_are_unique_per_platform() {
+        for mac in [true, false] {
+            let mut seen = std::collections::HashMap::new();
+            for action in MENU_ACTIONS_WITH_CHORDS {
+                let accel = accelerator_for(action, mac).unwrap();
+                if let Some(other) = seen.insert(accel.clone(), *action) {
+                    panic!("{accel} is used by both {other} and {action} (mac={mac})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mac_chords_keep_their_cmd_accelerators() {
+        assert_eq!(
+            accelerator_for("view.split-horizontal", true).unwrap(),
+            "CmdOrCtrl+D"
+        );
+        assert_eq!(
+            accelerator_for("view.split-vertical", true).unwrap(),
+            "CmdOrCtrl+Shift+D"
+        );
+        assert_eq!(
+            accelerator_for("file.close-pane", true).unwrap(),
+            "CmdOrCtrl+W"
+        );
+        assert_eq!(
+            accelerator_for("hermes.settings", true).unwrap(),
+            "CmdOrCtrl+,"
+        );
+    }
+
+    #[test]
+    fn windows_linux_split_is_ctrl_shift_d() {
+        assert_eq!(
+            accelerator_for("view.split-horizontal", false).unwrap(),
+            "Ctrl+Shift+D"
+        );
+        assert_eq!(
+            accelerator_for("file.close-pane", false).unwrap(),
+            "Ctrl+Shift+W"
+        );
+    }
+
+    #[test]
+    fn quit_keeps_cmd_q_on_mac_and_leaves_ctrl_q_to_the_terminal() {
+        assert_eq!(
+            quit_label_and_accelerator(true, false),
+            ("Quit HERMES-IDE", Some("CmdOrCtrl+Q"))
+        );
+        assert_eq!(quit_label_and_accelerator(false, true), ("Exit", None));
+        assert_eq!(quit_label_and_accelerator(false, false), ("Quit", None));
+    }
+
+    #[test]
+    fn unknown_action_has_no_chord() {
+        assert!(accelerator_for("view.nope", false).is_none());
+        assert!(app_accel("view.nope").is_err());
+    }
+
+    #[test]
+    fn detects_bare_ctrl_letter() {
+        assert!(is_bare_ctrl_letter("Ctrl+D"));
+        assert!(is_bare_ctrl_letter("CmdOrCtrl+W"));
+        assert!(!is_bare_ctrl_letter("Ctrl+Shift+D"));
+        assert!(!is_bare_ctrl_letter("Ctrl+,"));
+    }
 }

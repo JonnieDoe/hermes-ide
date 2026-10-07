@@ -1,10 +1,14 @@
-import { useState, useCallback, useEffect } from "react";
+import { Fragment, useState, useCallback, useEffect } from "react";
 import { useGitStatus } from "../hooks/useGitStatus";
 import { getSessionWorktreeInfo } from "../api/git";
 import { getSettings } from "../api/settings";
 import { GitProjectSection } from "./GitProjectSection";
 import { GitDiffView } from "./GitDiffView";
 import { WorktreeIndicator } from "./WorktreeIndicator";
+import { WorktreeOverviewPanel } from "./WorktreeOverviewPanel";
+import { SessionWorktreeSetup } from "./WorktreeSetupSummary";
+import { isFeatureFlagEnabled } from "../featureFlags";
+import { openLandSheet } from "../land/LandSheetHost";
 import type { GitFile, SessionWorktree } from "../types/git";
 import type { GitToast } from "./GitPanel";
 import "../styles/components/SessionGitPanel.css";
@@ -28,6 +32,16 @@ export function SessionGitPanel({ sessionId, projectId }: SessionGitPanelProps) 
   const [diffTarget, setDiffTarget] = useState<{ sessionId: string; projectId: string; file: GitFile } | null>(null);
   const [toast, setToast] = useState<GitToast | null>(null);
   const [worktreeInfo, setWorktreeInfo] = useState<SessionWorktree | null>(null);
+  // Disk guard (feature flag): a Worktrees view with disk use and cleanup.
+  const diskGuard = isFeatureFlagEnabled("diskGuard");
+  const [view, setView] = useState<"changes" | "worktrees">("changes");
+  // Land sheet (feature flag): ship this task's worktree, with undo.
+  const landSheet = isFeatureFlagEnabled("landSheet");
+  // Projects this session works on in a worktree of its own (the backend
+  // re-checks: never the project folder, never a shared checkout).
+  const landable = landSheet
+    ? (status?.projects ?? []).filter((p) => p.is_git_repo && /hermes-worktrees[\\/]/.test(p.project_path))
+    : [];
 
   // Load poll interval setting on mount
   useEffect(() => {
@@ -80,6 +94,17 @@ export function SessionGitPanel({ sessionId, projectId }: SessionGitPanelProps) 
             isActive
           />
         )}
+        {landable.map((project) => (
+          <button
+            key={project.project_id}
+            className="session-git-land-btn"
+            data-project-id={project.project_id}
+            onClick={() => openLandSheet(sessionId, project.project_id)}
+            title="Commit, open a pull request or merge this task, with undo"
+          >
+            {landable.length === 1 ? "Land…" : `Land ${project.project_name}…`}
+          </button>
+        ))}
         <button
           className="git-panel-refresh"
           onClick={refresh}
@@ -89,7 +114,30 @@ export function SessionGitPanel({ sessionId, projectId }: SessionGitPanelProps) 
         </button>
       </div>
 
-      <div className="session-git-panel-scroll">
+      {diskGuard && (
+        <div className="git-view-toggle">
+          <button
+            className={`git-view-toggle-btn ${view === "changes" ? "git-view-toggle-btn-active" : ""}`}
+            onClick={() => setView("changes")}
+          >
+            Changes
+          </button>
+          <button
+            className={`git-view-toggle-btn ${view === "worktrees" ? "git-view-toggle-btn-active" : ""}`}
+            onClick={() => setView("worktrees")}
+          >
+            Worktrees
+          </button>
+        </div>
+      )}
+
+      {view === "worktrees" && (
+        <div className="session-git-panel-scroll">
+          <WorktreeOverviewPanel />
+        </div>
+      )}
+
+      <div className="session-git-panel-scroll" hidden={view !== "changes"}>
         {error && (
           <div className="git-error">{error}</div>
         )}
@@ -103,15 +151,18 @@ export function SessionGitPanel({ sessionId, projectId }: SessionGitPanelProps) 
         )}
 
         {status && status.projects.map((project) => (
-          <GitProjectSection
-            key={project.project_id}
-            sessionId={sessionId}
-            projectId={project.project_id}
-            project={project}
-            onRefresh={refresh}
-            onDiffFile={handleDiffFile}
-            onToast={showToast}
-          />
+          <Fragment key={project.project_id}>
+            {/* Fast worktrees (behind the same flag): ports and cloned dependencies. */}
+            {diskGuard && <SessionWorktreeSetup sessionId={sessionId} projectId={project.project_id} />}
+            <GitProjectSection
+              sessionId={sessionId}
+              projectId={project.project_id}
+              project={project}
+              onRefresh={refresh}
+              onDiffFile={handleDiffFile}
+              onToast={showToast}
+            />
+          </Fragment>
         ))}
       </div>
 

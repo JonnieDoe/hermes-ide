@@ -1,0 +1,580 @@
+{
+  "$schema": "./agents.schema.json",
+  "version": 1,
+  "agents": [
+    {
+      "id": "claude",
+      "name": "Claude Code",
+      "vendor": "Anthropic",
+      "description": "Anthropic's coding agent",
+      "homepage": "https://code.claude.com/docs/en/setup",
+      "status": "current",
+      "channel": "stable",
+      "terminal": {
+        "argv": ["claude"],
+        "resume": {
+          "by_id": ["--resume", "{session_id}"],
+          "latest": ["--continue"],
+          "not_found": { "exit_codes": [1], "output": ["No conversation found with session ID"] }
+        },
+        "new_session_id": ["--session-id", "{session_id}"],
+        "initial_prompt": ["{prompt}"],
+        "system_prompt": ["--append-system-prompt", "{prompt}"],
+        "paste_fold": { "chars": 800, "lines": 3 },
+        "signals": {
+          "method": "settings_file",
+          "args": ["--settings", "{signals_file}"],
+          "events": {
+            "session_start": ["SessionStart"],
+            "working": ["UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "PermissionDenied"],
+            "needs_approval": ["PermissionRequest"],
+            "needs_answer": ["PreToolUse:AskUserQuestion", "Notification:elicitation_dialog"],
+            "plan_ready": ["PreToolUse:ExitPlanMode"],
+            "turn_end": ["Stop"],
+            "error": ["StopFailure"],
+            "exited": ["SessionEnd"],
+            "subagents": ["SubagentStart", "SubagentStop"],
+            "limited": [
+              "StopFailure:rate_limit",
+              "Notification:quota_auto_resume_stale",
+              "Notification:quota_auto_resume_disabled",
+              "Notification:quota_auto_resume_fired",
+              "UserPromptSubmit",
+              "statusLine:rate_limits"
+            ]
+          },
+          "check_hook": "Stop",
+          "confidence": "exact",
+          "note": "Hook entries merge with the user's own hooks; nothing is written to the user's settings. 'limited' lists the events that start, update or end a usage limit; the status line (which carries rate_limits) is set only when the user has none of their own."
+        },
+        "permission_flags": {
+          "default": [],
+          "acceptEdits": ["--permission-mode", "acceptEdits"],
+          "plan": ["--permission-mode", "plan"],
+          "auto": ["--permission-mode", "auto"],
+          "dontAsk": ["--permission-mode", "dontAsk"],
+          "bypassPermissions": ["--permission-mode", "bypassPermissions"]
+        },
+        "min_version": "2.1.0",
+        "safety": {
+          "default_mode": "acceptEdits",
+          "fit": "exact",
+          "looser_args": [["--dangerously-skip-permissions"], ["--permission-mode", "bypassPermissions"], ["--permission-mode", "auto"]],
+          "note": "Edits inside the working folder are accepted; commands, web access and other folders ask."
+        }
+      },
+      "structured": { "protocol": "claude-agent-sdk" },
+      "capabilities": {"verified_on_real_install": true, "model": {"flag": ["--model", "{model}"], "id_style": "alias", "aliases": [{"id": "opus", "label": "Opus", "note": "latest Opus"}, {"id": "sonnet", "label": "Sonnet", "note": "latest Sonnet"}, {"id": "haiku", "label": "Haiku", "note": "fast, no effort levels"}, {"id": "opusplan", "label": "Opus plan", "note": "Opus plans, Sonnet codes"}], "list": {"source": "claude_model_cache"}, "typed": true}, "effort": {"flag": ["--effort", "{effort}"], "values": ["low", "medium", "high", "xhigh", "max"], "per_model": [{"match": "haiku", "values": []}, {"match": "^claude-3|^claude-(opus|sonnet)-4-[0-5]|^claude-(opus|sonnet)-4$", "values": []}, {"match": "4-6", "values": ["low", "medium", "high", "max"]}], "validated_by": "none"}, "accounts": {"probe": {"command": ["claude", "auth", "status", "--json"], "parser": "claude_auth_json"}, "profile_env": "CLAUDE_CONFIG_DIR", "profile_dir": ".claude-{slug}", "login": ["claude", "auth", "login"], "logout": ["claude", "auth", "logout"]}, "error_signatures": [{"pattern": "^(?:API Error: )?There's an issue with the selected model \\((.+?)\\)", "reason": "model", "suggestion": "retry-default"}, {"pattern": "^Not logged in \u00b7 Please run /login", "reason": "signed_out", "suggestion": "sign-in"}, {"pattern": "^Warning: Unknown --effort value '(.+?)'", "reason": "effort", "suggestion": "retry-default"}], "model_report": "hooks:model"},
+      "install": {
+        "command": "curl -fsSL https://claude.ai/install.sh | bash",
+        "windows": "irm https://claude.ai/install.ps1 | iex",
+        "url": "https://code.claude.com/docs/en/setup"
+      },
+      "detect": { "command": ["claude", "--version"] },
+      "auth": { "check": ["claude", "auth", "status"], "hint": "Run 'claude' and sign in on first use" },
+      "evidence": { "level": "help", "version": "2.1.283" },
+      "setup": {
+        "instructions": { "project": ["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"], "global": ["~/.claude/CLAUDE.md"], "imports": true },
+        "settings": { "project": [".claude/settings.json", ".claude/settings.local.json"], "global": ["~/.claude/settings.json"] },
+        "skills": { "project": [".claude/skills"], "global": ["~/.claude/skills"] },
+        "mcp": [{ "path": ".mcp.json", "scope": "project", "format": "json", "key": "mcpServers" }, { "path": "~/.claude.json", "scope": "global", "format": "json", "key": "mcpServers" }, { "path": "~/.claude.json", "scope": "global", "format": "claude_local", "key": "mcpServers" }]
+      }
+    },
+    {
+      "id": "codex",
+      "name": "Codex",
+      "vendor": "OpenAI",
+      "description": "OpenAI's coding agent",
+      "homepage": "https://github.com/openai/codex",
+      "status": "current",
+      "channel": "stable",
+      "terminal": {
+        "argv": ["codex"],
+        "resume": {
+          "by_id": ["resume", "{session_id}"],
+          "latest": ["resume", "--last"],
+          "not_found": { "output": ["No saved session found with ID"] }
+        },
+        "new_session_id": null,
+        "initial_prompt": ["{prompt}"],
+        "signals": {
+          "method": "config_flags",
+          "args": [
+            "-c", "tui.notifications=true",
+            "-c", "tui.notification_method=\"osc9\"",
+            "-c", "tui.notification_condition=\"always\"",
+            "-c", "notify=[\"{hi}\",\"signal\",\"--agent\",\"codex\",\"--argv-json\"]"
+          ],
+          "hook_flags": "toml_config",
+          "hook_trust": "app_server_hooks_list",
+          "events": {
+            "session_start": ["SessionStart"],
+            "working": ["UserPromptSubmit", "PostToolUse"],
+            "needs_approval": ["PermissionRequest", "osc9:Approval requested"],
+            "needs_answer": ["PreToolUse:request_user_input", "osc9:Question requested"],
+            "turn_end": ["notify:agent-turn-complete", "Stop"],
+            "exited": ["SessionEnd"],
+            "subagents": ["SubagentStart", "SubagentStop"]
+          },
+          "confidence": "exact",
+          "note": "The hooks go on the command line (-c hooks.<Event>=...) and only Hermes's own are trusted for the launch, with the hashes Codex's app server reports; the user's config is never written. SessionStart fires with the first prompt, not at startup. request_user_input exists only in plan mode. No flag assigns a session id up front; it is read from the hook session_id or the notify thread-id."
+        },
+        "permission_flags": {
+          "default": [],
+          "auto": ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"],
+          "bypassPermissions": ["--dangerously-bypass-approvals-and-sandbox"]
+        },
+        "min_version": "0.145.0",
+        "safety": {
+          "default_mode": "auto",
+          "fit": "exact",
+          "looser_args": [["--dangerously-bypass-approvals-and-sandbox"], ["--yolo"], ["--sandbox", "danger-full-access"], ["-s", "danger-full-access"], ["--ask-for-approval", "never"], ["-a", "never"]],
+          "note": "Writes inside the workspace; the network is off and anything outside it asks."
+        }
+      },
+      "structured": { "protocol": "codex-app-server", "args": ["app-server"] },
+      "capabilities": {"verified_on_real_install": true, "model": {"flag": ["-m", "{model}"], "id_style": "slug", "aliases": [], "list": {"command": ["codex", "debug", "models", "--bundled"], "parser": "codex_debug_models"}, "typed": false}, "effort": {"flag": ["-c", "model_reasoning_effort=\"{effort}\""], "values": ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"], "per_model": null, "validated_by": "server"}, "accounts": {"probe": {"command": ["codex", "login", "status"], "parser": "codex_login_status"}, "profile_env": "CODEX_HOME", "profile_dir": ".codex-{slug}", "login": ["codex", "login"], "logout": ["codex", "logout"]}, "error_signatures": [{"pattern": "^(?:ERROR: )?\\{\"type\":\"error\".*model is not supported when using Codex with a ChatGPT account", "reason": "model", "suggestion": "retry-default"}, {"pattern": "^(?:(?:ERROR: )?\\{\"type\":\"error\".*: )?The model `(.+?)` does not exist or you do not have access to it", "reason": "model", "suggestion": "retry-default"}, {"pattern": "^(?:ERROR: )?(?:\\{\"type\":\"error\".*)?\"?\\[ReasoningEffortParam\\] \\[reasoning\\.effort\\] \\[invalid_enum_value\\]", "reason": "effort", "suggestion": "retry-default"}, {"pattern": "^Not logged in$", "reason": "signed_out", "suggestion": "sign-in"}, {"pattern": "^(?:ERROR: |(?:ERROR: )?\\{\"type\":\"error\".*stream error: )?unexpected status 401 Unauthorized", "reason": "signed_out", "suggestion": "sign-in"}], "model_report": "rollout"},
+      "install": {
+        "command": "npm install -g @openai/codex",
+        "url": "https://github.com/openai/codex"
+      },
+      "detect": { "command": ["codex", "--version"] },
+      "auth": { "check": ["codex", "login", "status"], "hint": "Run 'codex' and sign in on first use" },
+      "evidence": { "level": "help", "version": "0.145.0" },
+      "setup": {
+        "instructions": { "project": ["AGENTS.override.md|AGENTS.md"], "global": ["~/.codex/AGENTS.override.md|~/.codex/AGENTS.md"], "imports": false },
+        "settings": { "project": [".codex/config.toml"], "global": ["~/.codex/config.toml"] },
+        "skills": { "project": [".agents/skills"], "global": ["~/.agents/skills", "~/.codex/skills"] },
+        "mcp": [{ "path": ".codex/config.toml", "scope": "project", "format": "toml", "key": "mcp_servers" }, { "path": "~/.codex/config.toml", "scope": "global", "format": "toml", "key": "mcp_servers" }]
+      }
+    },
+    {
+      "id": "antigravity",
+      "name": "Antigravity CLI",
+      "vendor": "Google",
+      "description": "Google's coding agent (agy)",
+      "homepage": "https://antigravity.google/docs/cli/install/",
+      "status": "current",
+      "channel": "beta",
+      "terminal": {
+        "argv": ["agy"],
+        "resume": { "by_id": ["--conversation", "{session_id}"], "latest": ["--continue"] },
+        "new_session_id": null,
+        "initial_prompt": ["--prompt-interactive", "{prompt}"],
+        "signals": {
+          "method": "worktree_file",
+          "files": [".agents/hooks.json"],
+          "events": {
+            "working": ["PreInvocation", "PostInvocation", "PostToolUse"],
+            "tool_pending": ["PreToolUse"],
+            "needs_answer": ["PreToolUse:ask_question"],
+            "turn_end": ["Stop:fullyIdle"],
+            "error": ["Stop:error"]
+          },
+          "confidence": "exact",
+          "note": "No per-launch flag exists; the hook file goes into the Hermes-owned worktree and is excluded from git. The tool events take a matcher, the others a flat list of handlers. There is no approval event: a tool call that neither starts a command nor finishes within a moment, while the agent is quiet, shows as a guessed approval."
+        },
+        "permission_flags": {
+          "default": [],
+          "bypassPermissions": ["--dangerously-skip-permissions"]
+        },
+        "min_version": "1.2.13",
+        "safety": {
+          "default_mode": "default",
+          "fit": "stricter",
+          "looser_args": [["--dangerously-skip-permissions"]],
+          "note": "No launch flag accepts edits only, so the agent asks before every change."
+        }
+      },
+      "capabilities": {"verified_on_real_install": true, "model": {"flag": ["--model", "{model}"], "id_style": "slug", "aliases": [], "list": {"command": ["agy", "models"], "parser": "agy_models"}, "typed": false, "silent_fallback": true}, "effort": {"flag": ["--effort", "{effort}"], "values": ["low", "medium", "high", "max"], "per_model": null, "validated_by": "cli"}, "accounts": {"probe": {"command": ["agy", "models"], "parser": "agy_models"}, "profile_env": null, "profile_dir": null, "login": null, "note": "One account per computer user (Antigravity has no profiles)"}, "error_signatures": [{"pattern": "^error: invalid model selection .*model (\\S+) is not recognized", "reason": "model", "suggestion": "retry-default"}, {"pattern": "^error: invalid model selection .*invalid --effort \"(.+?)\" \\(valid: (.+?)\\)", "reason": "effort", "suggestion": "retry-default"}, {"pattern": "^Authentication required\\. Please visit the URL to log in", "reason": "signed_out", "suggestion": "sign-in"}], "model_report": "hooks:modelName"},
+      "install": {
+        "command": "curl -fsSL https://antigravity.google/cli/install.sh | bash",
+        "windows": "irm https://antigravity.google/cli/install.ps1 | iex",
+        "url": "https://antigravity.google/docs/cli/install/"
+      },
+      "detect": { "command": ["agy", "--version"] },
+      "auth": { "check": null, "hint": "Run 'agy' and sign in with Google in the browser, or set GEMINI_API_KEY" },
+      "evidence": { "level": "help", "version": "1.2.13" },
+      "setup": {
+        "instructions": { "project": ["AGENTS.md", "GEMINI.md"], "global": ["~/.gemini/GEMINI.md"], "imports": false },
+        "settings": { "project": [".agents/hooks.json"], "global": [] },
+        "skills": { "project": [".agents/skills"], "global": [] },
+        "mcp": null
+      }
+    },
+    {
+      "id": "gemini",
+      "name": "Gemini CLI (legacy)",
+      "vendor": "Google",
+      "description": "Google's previous coding agent",
+      "homepage": "https://github.com/google-gemini/gemini-cli",
+      "status": "legacy",
+      "status_note": "Retired for personal Google accounts on 2026-06-18; still works with a paid API key or Gemini Code Assist Standard or Enterprise. Antigravity CLI is Google's current agent.",
+      "channel": "stable",
+      "terminal": {
+        "argv": ["gemini"],
+        "resume": {
+          "by_id": ["--resume", "{session_id}"],
+          "latest": ["--resume", "latest"],
+          "not_found": { "exit_codes": [42], "output": ["Error resuming session"] }
+        },
+        "new_session_id": ["--session-id", "{session_id}"],
+        "initial_prompt": ["{prompt}"],
+        "signals": {
+          "method": "env_file",
+          "env": { "GEMINI_CLI_SYSTEM_DEFAULTS_PATH": "{signals_file}" },
+          "events": {
+            "working": ["BeforeAgent"],
+            "needs_approval": ["Notification:ToolPermission"],
+            "turn_end": ["AfterAgent"],
+            "exited": ["SessionEnd"]
+          },
+          "confidence": "exact",
+          "hook_shell": "powershell",
+          "note": "The lowest-precedence settings layer; hook arrays merge with the user's own. On Windows Gemini runs hook commands with PowerShell -Command."
+        },
+        "permission_flags": {
+          "default": [],
+          "acceptEdits": ["--approval-mode", "auto_edit"],
+          "plan": ["--approval-mode", "plan"],
+          "bypassPermissions": ["--yolo"]
+        },
+        "min_version": "0.45.0",
+        "safety": {
+          "default_mode": "acceptEdits",
+          "fit": "exact",
+          "looser_args": [["--yolo"], ["-y"], ["--approval-mode", "yolo"]],
+          "note": "Edits are accepted; commands and web access ask."
+        }
+      },
+      "structured": { "protocol": "acp", "args": ["--acp"] },
+      "capabilities": {"verified_on_real_install": false, "model": {"flag": ["-m", "{model}"], "id_style": "slug", "aliases": [], "list": null, "typed": true}, "effort": null, "accounts": {"probe": null, "profile_env": "GEMINI_CLI_HOME", "profile_dir": ".gemini-cli-{slug}", "login": ["gemini"]}, "error_signatures": [{"pattern": "^Error authenticating: .*IneligibleTierError", "reason": "other", "suggestion": "switch-account"}, {"pattern": "^Please set an Auth method", "reason": "signed_out", "suggestion": "sign-in"}], "model_report": "none"},
+      "install": {
+        "command": "npm install -g @google/gemini-cli",
+        "url": "https://github.com/google-gemini/gemini-cli"
+      },
+      "detect": { "command": ["gemini", "--version"] },
+      "auth": { "check": null, "hint": "Needs GEMINI_API_KEY or a Gemini Code Assist Standard or Enterprise login" },
+      "evidence": { "level": "help", "version": "0.45.2" },
+      "setup": {
+        "instructions": { "project": ["GEMINI.md"], "global": ["~/.gemini/GEMINI.md"], "imports": true },
+        "settings": { "project": [".gemini/settings.json"], "global": ["~/.gemini/settings.json"] },
+        "skills": { "project": [".gemini/skills"], "global": ["~/.gemini/skills"] },
+        "mcp": [{ "path": ".gemini/settings.json", "scope": "project", "format": "json", "key": "mcpServers" }, { "path": "~/.gemini/settings.json", "scope": "global", "format": "json", "key": "mcpServers" }]
+      }
+    },
+    {
+      "id": "copilot",
+      "name": "GitHub Copilot CLI",
+      "vendor": "GitHub",
+      "description": "GitHub's coding agent",
+      "homepage": "https://github.com/github/copilot-cli",
+      "status": "current",
+      "channel": "stable",
+      "terminal": {
+        "argv": ["copilot"],
+        "resume": { "by_id": ["--resume", "{session_id}"], "latest": ["--continue"] },
+        "new_session_id": ["--session-id", "{session_id}"],
+        "initial_prompt": ["--interactive", "{prompt}"],
+        "signals": {
+          "method": "plugin_dir",
+          "args": ["--plugin-dir", "{signals_dir}"],
+          "events": {
+            "session_start": ["sessionStart"],
+            "exited": ["sessionEnd"],
+            "needs_approval": ["notification:permission_prompt"],
+            "needs_answer": ["notification:elicitation_dialog"],
+            "turn_end": ["agentStop"],
+            "error": ["errorOccurred"]
+          },
+          "confidence": "signal",
+          "note": "notification can fire for tools that are already approved (github/copilot-cli#2586), so approval is not exact."
+        },
+        "permission_flags": {
+          "default": [],
+          "acceptEdits": ["--allow-tool", "write"],
+          "plan": ["--plan"],
+          "auto": ["--allow-all-tools"],
+          "bypassPermissions": ["--allow-all"]
+        },
+        "beta_permission_modes": ["acceptEdits"],
+        "min_version": "1.0.0",
+        "safety": {
+          "default_mode": "acceptEdits",
+          "fit": "exact",
+          "looser_args": [["--allow-all"], ["--allow-all-tools"], ["--allow-all-paths"], ["--allow-all-urls"], ["--yolo"]],
+          "note": "File edits are allowed; commands, URLs and paths outside the folder ask."
+        }
+      },
+      "structured": { "protocol": "acp", "args": ["--acp"] },
+      "capabilities": {"verified_on_real_install": false, "model": {"flag": ["--model", "{model}"], "id_style": "slug", "aliases": [], "list": null, "typed": true}, "effort": {"flag": ["--effort", "{effort}"], "values": ["low", "medium", "high", "xhigh", "max"], "per_model": null, "validated_by": "none"}, "accounts": {"probe": null, "profile_env": "COPILOT_HOME", "profile_dir": ".copilot-{slug}", "login": ["copilot"]}, "error_signatures": [{"pattern": "^(?:Error: )?No authentication information found", "reason": "signed_out", "suggestion": "sign-in"}, {"pattern": "^Error: Authentication failed", "reason": "signed_out", "suggestion": "sign-in"}], "model_report": "none"},
+      "install": {
+        "command": "npm install -g @github/copilot",
+        "url": "https://github.com/github/copilot-cli"
+      },
+      "detect": { "command": ["copilot", "--version"] },
+      "auth": { "check": null, "hint": "Run 'copilot' and use /login, or set GH_TOKEN" },
+      "evidence": { "level": "help", "version": "1.0.88" },
+      "setup": {
+        "instructions": { "project": [".github/copilot-instructions.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md", ".github/instructions/*.instructions.md"], "global": ["~/.copilot/copilot-instructions.md"], "imports": false },
+        "settings": { "project": [], "global": ["~/.copilot/config.json"] },
+        "skills": { "project": [".github/skills", ".claude/skills"], "global": ["~/.copilot/skills"] },
+        "mcp": [{ "path": "~/.copilot/mcp-config.json", "scope": "global", "format": "json", "key": "mcpServers" }]
+      }
+    },
+    {
+      "id": "opencode",
+      "name": "OpenCode",
+      "vendor": "SST",
+      "description": "Open-source coding agent for any model",
+      "homepage": "https://opencode.ai/docs/cli/",
+      "status": "current",
+      "channel": "beta",
+      "terminal": {
+        "argv": ["opencode"],
+        "resume": { "by_id": ["--session", "{session_id}"], "latest": ["--continue"] },
+        "new_session_id": null,
+        "initial_prompt": ["--prompt", "{prompt}"],
+        "signals": {
+          "method": "event_stream",
+          "args": ["--port", "{port}", "--hostname", "127.0.0.1"],
+          "env": { "OPENCODE_SERVER_PASSWORD": "{secret}" },
+          "events": {
+            "working": ["session.status"],
+            "needs_approval": ["permission.asked"],
+            "turn_end": ["session.idle"],
+            "error": ["session.error"]
+          },
+          "confidence": "exact",
+          "note": "Hermes reads the local event stream (GET /event)."
+        },
+        "permission_flags": {
+          "default": [],
+          "auto": ["--auto"]
+        },
+        "min_version": "1.18.0",
+        "safety": {
+          "default_mode": "default",
+          "fit": "looser",
+          "looser_args": [["--auto"]],
+          "note": "OpenCode runs tools without asking by default and has no launch flag that narrows it."
+        }
+      },
+      "structured": { "protocol": "acp", "args": ["acp"] },
+      "capabilities": {"verified_on_real_install": false, "model": {"flag": ["-m", "{model}"], "id_style": "provider/model", "aliases": [], "list": {"command": ["opencode", "models"], "parser": "lines"}, "typed": true}, "effort": null, "accounts": {"probe": {"command": ["opencode", "providers", "list"], "parser": "exit_code"}, "profile_env": "XDG_DATA_HOME", "profile_dir": ".opencode-{slug}", "login": ["opencode", "auth", "login"]}, "error_signatures": [{"pattern": "^(?:Error: )?Model not found: (\\S+)", "reason": "model", "suggestion": "retry-default"}], "model_report": "none"},
+      "install": {
+        "command": "npm install -g opencode-ai",
+        "url": "https://opencode.ai/docs/"
+      },
+      "detect": { "command": ["opencode", "--version"] },
+      "auth": { "check": ["opencode", "providers", "list"], "hint": "Run 'opencode providers login' to add a model provider" },
+      "evidence": { "level": "help", "version": "1.18.32" },
+      "setup": {
+        "instructions": { "project": ["AGENTS.md|CLAUDE.md"], "global": ["~/.config/opencode/AGENTS.md|~/.claude/CLAUDE.md"], "imports": false },
+        "settings": { "project": ["opencode.json", "opencode.jsonc"], "global": ["~/.config/opencode/opencode.json"] },
+        "skills": { "project": [".opencode/skills", ".claude/skills", ".agents/skills"], "global": ["~/.config/opencode/skills"] },
+        "mcp": [{ "path": "opencode.json", "scope": "project", "format": "json", "key": "mcp" }, { "path": "~/.config/opencode/opencode.json", "scope": "global", "format": "json", "key": "mcp" }]
+      }
+    },
+    {
+      "id": "goose",
+      "name": "goose",
+      "vendor": "AAIF",
+      "description": "Open-source agent for any model",
+      "homepage": "https://goose-docs.ai/docs/getting-started/installation",
+      "status": "current",
+      "channel": "beta",
+      "terminal": {
+        "argv": ["goose", "session"],
+        "resume": { "by_id": ["--resume", "--session-id", "{session_id}"], "latest": ["--resume"] },
+        "new_session_id": null,
+        "initial_prompt": null,
+        "signals": {
+          "method": "worktree_file",
+          "files": [".agents/plugins/hermes-signal/hooks/hooks.json"],
+          "events": { "turn_end": ["Stop"] },
+          "confidence": "guessed",
+          "note": "Hooks only through plugin folders; no approval or notification event."
+        },
+        "permission_flags": { "default": [] },
+        "min_version": null,
+        "safety": {
+          "default_mode": "default",
+          "fit": "looser",
+          "looser_args": [],
+          "note": "goose's own mode setting decides, and its default approves every tool."
+        }
+      },
+      "capabilities": {"verified_on_real_install": false, "model": {"flag": ["--model", "{model}"], "id_style": "slug", "aliases": [], "list": null, "typed": true}, "effort": {"flag": null, "env": "GOOSE_THINKING_EFFORT", "values": ["off", "low", "medium", "high", "max"], "per_model": null, "validated_by": "none"}, "accounts": {"probe": null, "profile_env": "GOOSE_PATH_ROOT", "profile_dir": ".goose-{slug}", "login": ["goose", "configure"]}, "error_signatures": [{"pattern": "^(?:Error: )?No provider configured", "reason": "signed_out", "suggestion": "sign-in"}], "model_report": "none"},
+      "install": {
+        "command": "curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash",
+        "url": "https://goose-docs.ai/docs/getting-started/installation"
+      },
+      "detect": { "command": ["goose", "--version"] },
+      "auth": { "check": null, "hint": "Run 'goose configure' to choose a model provider" },
+      "evidence": { "level": "help", "version": "1.52.0" },
+      "setup": {
+        "instructions": { "project": [".goosehints", "AGENTS.md"], "global": ["~/.config/goose/.goosehints"], "imports": false },
+        "settings": { "project": [], "global": ["~/.config/goose/config.yaml"] },
+        "skills": { "project": [".agents/skills"], "global": [] },
+        "mcp": null
+      }
+    },
+    {
+      "id": "hermes-agent",
+      "name": "Hermes Agent",
+      "vendor": "Nous Research",
+      "description": "Nous Research's agent (not related to Hermes IDE)",
+      "homepage": "https://github.com/NousResearch/hermes-agent",
+      "status": "current",
+      "channel": "beta",
+      "terminal": {
+        "argv": ["hermes"],
+        "resume": { "by_id": ["--resume", "{session_id}"], "latest": ["--continue"] },
+        "new_session_id": null,
+        "initial_prompt": null,
+        "signals": { "method": "none", "confidence": "guessed" },
+        "permission_flags": {
+          "default": [],
+          "bypassPermissions": ["--yolo"]
+        },
+        "min_version": null,
+        "safety": {
+          "default_mode": "default",
+          "fit": "unknown",
+          "looser_args": [["--yolo"]],
+          "note": "No documented approval policy to map yet."
+        }
+      },
+      "capabilities": {"verified_on_real_install": false, "model": {"flag": ["-m", "{model}"], "id_style": "slug", "aliases": [], "list": null, "typed": true}, "effort": null, "accounts": {"probe": {"command": ["hermes", "status"], "parser": "exit_code"}, "profile_env": "HERMES_HOME", "profile_dir": ".hermes-agent-{slug}", "login": ["hermes", "setup"]}, "error_signatures": [], "model_report": "none"},
+      "install": {
+        "command": "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
+        "windows": "iex (irm https://hermes-agent.nousresearch.com/install.ps1)",
+        "ci": "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --non-interactive --skip-browser",
+        "url": "https://github.com/NousResearch/hermes-agent"
+      },
+      "detect": { "command": ["hermes", "--version"] },
+      "auth": { "check": ["hermes", "status"], "hint": "Run 'hermes setup' to choose a model provider" },
+      "evidence": { "level": "help", "version": "0.21.5" },
+      "setup": {
+        "instructions": { "project": ["AGENTS.md"], "global": [], "imports": false },
+        "settings": { "project": [], "global": [] },
+        "skills": { "project": [], "global": [] },
+        "mcp": null
+      }
+    },
+    {
+      "id": "aider",
+      "name": "Aider",
+      "vendor": "Aider",
+      "description": "AI pair programming in your terminal",
+      "homepage": "https://aider.chat/docs/install.html",
+      "status": "current",
+      "channel": "stable",
+      "terminal": {
+        "argv": ["aider"],
+        "resume": { "by_id": null, "latest": ["--restore-chat-history"] },
+        "new_session_id": null,
+        "initial_prompt": null,
+        "signals": { "method": "none", "confidence": "guessed" },
+        "permission_flags": {
+          "default": [],
+          "auto": ["--yes-always"],
+          "bypassPermissions": ["--yes-always"]
+        },
+        "min_version": null,
+        "safety": {
+          "default_mode": "default",
+          "fit": "closest",
+          "looser_args": [["--yes-always"], ["--yes"]],
+          "note": "Aider edits the files added to the chat and asks before running commands or opening URLs."
+        }
+      },
+      "capabilities": {"verified_on_real_install": false, "model": {"flag": ["--model", "{model}"], "id_style": "alias", "aliases": [{"id": "sonnet", "label": "Sonnet"}, {"id": "opus", "label": "Opus"}, {"id": "haiku", "label": "Haiku"}], "list": null, "typed": true}, "effort": {"flag": ["--reasoning-effort", "{effort}"], "values": ["low", "medium", "high"], "per_model": null, "validated_by": "none"}, "accounts": {"probe": null, "profile_env": null, "profile_dir": null, "login": null, "note": "Aider uses the API keys in your environment; it has no sign-in"}, "error_signatures": [], "model_report": "none"},
+      "install": {
+        "command": "python -m pip install aider-install && aider-install",
+        "ci": "python3 -m pip install aider-install && aider-install",
+        "url": "https://aider.chat/docs/install.html"
+      },
+      "detect": { "command": ["aider", "--version"] },
+      "auth": { "check": null, "hint": "Set OPENAI_API_KEY or ANTHROPIC_API_KEY" },
+      "evidence": { "level": "help", "version": "0.86.2" },
+      "setup": {
+        "instructions": { "project": [], "global": [], "imports": false },
+        "settings": { "project": [".aider.conf.yml"], "global": ["~/.aider.conf.yml"] },
+        "skills": { "project": [], "global": [] },
+        "mcp": null
+      }
+    },
+    {
+      "id": "kiro",
+      "name": "Kiro CLI",
+      "vendor": "AWS",
+      "description": "Kiro's coding agent",
+      "homepage": "https://kiro.dev/docs/cli/",
+      "status": "current",
+      "channel": "stable",
+      "terminal": {
+        "argv": ["kiro-cli", "chat"],
+        "resume": { "by_id": ["--resume-id", "{session_id}"], "latest": ["--resume"] },
+        "new_session_id": null,
+        "initial_prompt": ["{prompt}"],
+        "signals": { "method": "none", "confidence": "guessed" },
+        "permission_flags": {
+          "default": [],
+          "auto": ["--trust-all-tools"]
+        },
+        "min_version": null,
+        "safety": {
+          "default_mode": "default",
+          "fit": "stricter",
+          "looser_args": [["--trust-all-tools"], ["--trust-tools"]],
+          "note": "Kiro asks before writing files and running commands."
+        }
+      },
+      "capabilities": {"verified_on_real_install": false, "model": {"flag": ["--model", "{model}"], "id_style": "slug", "aliases": [], "list": null, "typed": true}, "effort": {"flag": ["--effort", "{effort}"], "values": ["low", "medium", "high", "xhigh", "max"], "per_model": [{"match": "4[.-]6", "values": ["low", "medium", "high", "max"]}], "validated_by": "none"}, "accounts": {"probe": {"command": ["kiro-cli", "whoami", "--format", "json"], "parser": "exit_code"}, "profile_env": null, "profile_dir": null, "login": ["kiro-cli", "login"], "note": "Kiro CLI has one account per computer user"}, "error_signatures": [], "model_report": "none"},
+      "install": {
+        "command": "curl -fsSL https://cli.kiro.dev/install | bash",
+        "url": "https://kiro.dev/docs/cli/"
+      },
+      "detect": { "command": ["kiro-cli", "--version"] },
+      "auth": { "check": null, "hint": "Run 'kiro-cli login' to sign in" },
+      "evidence": { "level": "help", "version": "2.24.1" },
+      "setup": {
+        "instructions": { "project": ["AGENTS.md", ".kiro/steering/*.md"], "global": ["~/.kiro/steering/*.md"], "imports": false },
+        "settings": { "project": [".kiro/settings/mcp.json"], "global": ["~/.kiro/settings/mcp.json"] },
+        "skills": { "project": [], "global": [] },
+        "mcp": [{ "path": ".kiro/settings/mcp.json", "scope": "project", "format": "json", "key": "mcpServers" }, { "path": "~/.kiro/settings/mcp.json", "scope": "global", "format": "json", "key": "mcpServers" }]
+      }
+    },
+    {
+      "id": "custom",
+      "name": "Custom agent",
+      "vendor": null,
+      "description": "Any command you type",
+      "homepage": null,
+      "status": "current",
+      "channel": "beta",
+      "custom": true,
+      "terminal": {
+        "argv": [],
+        "resume": { "by_id": null, "latest": null },
+        "new_session_id": null,
+        "initial_prompt": null,
+        "signals": { "method": "none", "confidence": "guessed" },
+        "permission_flags": { "default": [] },
+        "min_version": null,
+        "safety": {
+          "default_mode": "default",
+          "fit": "unknown",
+          "looser_args": [],
+          "note": "Hermes does not know this command's approval model."
+        }
+      },
+      "install": null,
+      "detect": null,
+      "auth": null,
+      "evidence": { "level": "none" }
+    }
+  ]
+}

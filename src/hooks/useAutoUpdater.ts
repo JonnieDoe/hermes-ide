@@ -1,6 +1,52 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { check, type Update } from "@tauri-apps/plugin-updater";
+import type { DownloadEvent, Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { checkForUpdate } from "../api/updater";
+
+/**
+ * Test-only escape hatch for e2e runs. Only read when the frontend is built
+ * with VITE_HERMES_E2E=1 (the same flag that loads `src/e2e/hooks.ts`), so
+ * it is compiled out of normal builds. Lets a scenario force the "update
+ * ready" state without reaching a real update server, and records
+ * install/relaunch attempts instead of tearing the test app down — see
+ * N10's real-app scenario.
+ */
+declare global {
+  interface Window {
+    __HERMES_TEST_UPDATE__?: {
+      forcedUpdate: { version: string; body?: string } | null;
+      installCalls: number;
+      relaunchCalls: number;
+    };
+  }
+}
+
+function testUpdateOverride() {
+  // Dead code outside the e2e build: Vite inlines the flag, so normal
+  // builds never read the global.
+  if (import.meta.env.VITE_HERMES_E2E !== "1") return undefined;
+  return typeof window !== "undefined" ? window.__HERMES_TEST_UPDATE__ : undefined;
+}
+
+/** Builds a fake `Update` from a forced test override — real enough for the
+ *  hook's state machine, but its `download`/`install` never touch the
+ *  network or the real installer. */
+function fakeUpdateFromOverride(
+  forced: { version: string; body?: string },
+  override: NonNullable<Window["__HERMES_TEST_UPDATE__"]>,
+): Update {
+  return {
+    version: forced.version,
+    body: forced.body ?? "",
+    download: async (onEvent?: (event: DownloadEvent) => void) => {
+      onEvent?.({ event: "Started", data: { contentLength: 0 } });
+      onEvent?.({ event: "Finished" });
+    },
+    install: async () => {
+      override.installCalls += 1;
+    },
+  } as unknown as Update;
+}
 
 export interface UpdateState {
   /** An update is available */
@@ -29,7 +75,16 @@ export interface UpdateState {
   stalled: boolean;
   /** Install-and-relaunch in progress (after the user clicks "Install & Relaunch") */
   installing: boolean;
+  /** Count of sessions currently working (agent busy, or a terminal command
+   *  running) — mirrors the `busySessionCount` argument. While this is
+   *  greater than zero the update waits instead of relaunching (N10). */
+  busySessionCount: number;
+  /** A check the person asked for (menu, version chip) is running. */
+  checking: boolean;
 }
+
+/** How a check ended: an update was found, none exists, or it could not be done. */
+export type UpdateCheckResult = "available" | "none" | "error";
 
 const INITIAL: UpdateState = {
   available: false,
@@ -45,13 +100,46 @@ const INITIAL: UpdateState = {
   error: false,
   stalled: false,
   installing: false,
+  busySessionCount: 0,
+  checking: false,
 };
 
 const CHECK_DELAY_MS = 5_000;
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const STALL_TIMEOUT_MS = 15_000;
+/** A check that has not answered by then counts as failed (no endless "Checking…"). */
+export const CHECK_TIMEOUT_MS = 15_000;
 
-export function useAutoUpdater() {
+/** `promise`, or a rejection once `ms` have passed without an answer. */
+export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`no answer after ${ms} ms`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err: unknown) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+// e2e/CI builds (`VITE_HERMES_E2E=1`, set by e2e/app/build.mjs) never poll
+// for updates — a proof-rig run or CI job should never talk to the update
+// endpoint on a timer. `manualCheck()` (behind an explicit user action)
+// still works, matching how analytics still works if triggered directly.
+const isE2eBuild = import.meta.env.VITE_HERMES_E2E === "1";
+
+/**
+ * @param busySessionCount Number of sessions currently working (agent busy,
+ *   or a terminal command running). While greater than zero, installing is
+ *   deferred so an update can never kill a working agent (N10) — the
+ *   dialog shows a waiting message instead, with a "Relaunch now" override.
+ */
+export function useAutoUpdater(busySessionCount = 0) {
   const [state, setState] = useState<UpdateState>(INITIAL);
   const updateRef = useRef<Update | null>(null);
   const downloadingRef = useRef(false);
@@ -59,13 +147,27 @@ export function useAutoUpdater() {
   const cancelledRef = useRef(false);
   const lastProgressRef = useRef(0);
   const stallTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const busySessionCountRef = useRef(busySessionCount);
 
-  const doCheck = useCallback(async () => {
-    // Skip periodic checks while download or install is in progress
-    if (downloadingRef.current || installingRef.current) return;
+  useEffect(() => {
+    busySessionCountRef.current = busySessionCount;
+    setState((s) => (s.busySessionCount === busySessionCount ? s : { ...s, busySessionCount }));
+  }, [busySessionCount]);
+
+  const checkingRef = useRef<Promise<UpdateCheckResult> | null>(null);
+
+  const doCheck = useCallback(async (): Promise<UpdateCheckResult> => {
+    // Skip checks while download or install is in progress (an update is
+    // already in hand).
+    if (downloadingRef.current || installingRef.current) return "available";
 
     try {
-      const update = await check();
+      // A test build may force an update; otherwise the check runs in the
+      // backend so the stable/beta channel setting applies.
+      const override = testUpdateOverride();
+      const update = override?.forcedUpdate
+        ? fakeUpdateFromOverride(override.forcedUpdate, override)
+        : await withTimeout(checkForUpdate(), CHECK_TIMEOUT_MS);
       if (update) {
         setState((s) => {
           // Don't clobber state during an active download or install
@@ -92,6 +194,7 @@ export function useAutoUpdater() {
             dismissed: s.dismissed && s.dismissedVersion === update.version,
           };
         });
+        return "available";
       } else {
         // No update available — clear the ref only if not mid-download/ready
         setState((s) => {
@@ -100,14 +203,18 @@ export function useAutoUpdater() {
           }
           return s;
         });
+        return "none";
       }
     } catch {
-      // Fail silently — no internet, endpoint down, dev mode, etc.
+      // No internet, endpoint down, no answer in time: a periodic check
+      // stays silent; a check the person asked for says so (manualCheck).
+      return "error";
     }
   }, []);
 
-  // Check on launch (after delay) + periodically
+  // Check on launch (after delay) + periodically. Never in an e2e/CI build.
   useEffect(() => {
+    if (isE2eBuild) return;
     const timeout = setTimeout(doCheck, CHECK_DELAY_MS);
     const interval = setInterval(doCheck, CHECK_INTERVAL_MS);
     return () => {
@@ -206,11 +313,17 @@ export function useAutoUpdater() {
     downloadingRef.current = false;
   }, [clearStallTimer]);
 
-  const installAndRelaunch = useCallback(async (beforeInstall?: () => Promise<void>) => {
+  const installAndRelaunch = useCallback(async (
+    beforeInstall?: () => Promise<void>,
+    options?: { force?: boolean },
+  ) => {
     const update = updateRef.current;
     if (!update) return;
     // Re-entrancy guard — multiple rapid clicks fire only one install pipeline
     if (installingRef.current) return;
+    // Never kill a working agent (N10): wait for every session to go idle
+    // unless the user explicitly overrides with "Relaunch now".
+    if (busySessionCountRef.current > 0 && !options?.force) return;
     installingRef.current = true;
     // Flip UI to "Installing…" BEFORE any slow pre-step (e.g. saveWorkspace)
     setState((s) => ({ ...s, installing: true, error: false }));
@@ -218,7 +331,13 @@ export function useAutoUpdater() {
     try {
       if (beforeInstall) await beforeInstall();
       await update.install();
-      await relaunch();
+      const override = testUpdateOverride();
+      if (override) {
+        // e2e run: record the attempt instead of tearing the test app down.
+        override.relaunchCalls += 1;
+      } else {
+        await relaunch();
+      }
       // Process is being torn down for relaunch — we don't normally reach here.
     } catch {
       installingRef.current = false;
@@ -228,11 +347,20 @@ export function useAutoUpdater() {
     }
   }, []);
 
-  const manualCheck = useCallback(async () => {
-    setState((s) => ({ ...s, dismissed: false, error: false }));
-    await doCheck();
-    // Return whether an update was found
-    return updateRef.current !== null;
+  /**
+   * A check the person asked for: `checking` while it runs (at most
+   * CHECK_TIMEOUT_MS), and how it ended, so the caller can say so. A second
+   * request while one runs joins it.
+   */
+  const manualCheck = useCallback((): Promise<UpdateCheckResult> => {
+    if (checkingRef.current) return checkingRef.current;
+    setState((s) => ({ ...s, dismissed: false, error: false, checking: true }));
+    const run = doCheck().finally(() => {
+      checkingRef.current = null;
+      setState((s) => ({ ...s, checking: false }));
+    });
+    checkingRef.current = run;
+    return run;
   }, [doCheck]);
 
   return { state, dismiss, download, cancelDownload, installAndRelaunch, manualCheck };

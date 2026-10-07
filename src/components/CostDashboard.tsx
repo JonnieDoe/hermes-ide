@@ -3,6 +3,10 @@ import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import type { CostDailyEntry, ProjectCostEntry } from "../types";
 import { getCostHistory, getCostByProject } from "../api/costs";
 import { useContextMenu, menuItem } from "../hooks/useContextMenu";
+import { CloseButton, Segmented } from "./ui";
+import { translate } from "../i18n/registry";
+import { useFocusTrap } from "../hooks/useFocusTrap";
+import { basename } from "../utils/paths";
 
 interface CostDashboardProps {
   onClose: () => void;
@@ -30,16 +34,9 @@ export function CostDashboard({ onClose }: CostDashboardProps) {
   }, []);
   const { showMenu: showCostMenu } = useContextMenu(handleCostAction);
 
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopImmediatePropagation();
-        onClose();
-      }
-    };
-    document.addEventListener("keydown", handler);
-    return () => document.removeEventListener("keydown", handler);
-  }, [onClose]);
+  // The keyboard is the dashboard's while it is open; Esc closes it.
+  const panelRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(panelRef, { onEscape: onClose });
 
   useEffect(() => {
     setLoading(true);
@@ -72,7 +69,7 @@ export function CostDashboard({ onClose }: CostDashboardProps) {
   const projectBreakdown = useMemo(() => {
     const byProject: Record<string, number> = {};
     for (const entry of projectCosts) {
-      const name = entry.working_directory.split("/").pop() || entry.working_directory;
+      const name = basename(entry.working_directory);
       byProject[name] = (byProject[name] || 0) + entry.total_cost_usd;
     }
     return Object.entries(byProject).sort(([, a], [, b]) => b - a);
@@ -83,22 +80,19 @@ export function CostDashboard({ onClose }: CostDashboardProps) {
   const isEmpty = dailyCosts.length === 0 && projectCosts.length === 0;
 
   return (
-    <div className="command-palette-overlay" onClick={onClose} role="dialog" aria-modal="true">
-      <div className="cost-dashboard" onClick={(e) => e.stopPropagation()}>
+    <div className="command-palette-overlay" onClick={onClose} role="dialog" aria-modal="true" aria-labelledby="cost-dashboard-title">
+      <div ref={panelRef} className="cost-dashboard" onClick={(e) => e.stopPropagation()}>
         <div className="cost-dashboard-header">
-          <h2 className="cost-dashboard-title">Cost Dashboard</h2>
-          <div className="cost-dashboard-tabs">
-            {[7, 14, 30].map((d) => (
-              <button
-                key={d}
-                className={`cost-tab ${days === d ? "cost-tab-active" : ""}`}
-                onClick={() => setDays(d)}
-              >
-                {d}d
-              </button>
-            ))}
-          </div>
-          <button className="close-btn cost-dashboard-close" onClick={onClose} aria-label="Close">&times;</button>
+          <h2 className="cost-dashboard-title" id="cost-dashboard-title">Cost Dashboard</h2>
+          <Segmented
+            size="sm"
+            className="cost-dashboard-tabs"
+            label="Period"
+            value={String(days)}
+            onChange={(v) => setDays(Number(v))}
+            options={[7, 14, 30].map((d) => ({ value: String(d), label: `${d}d` }))}
+          />
+          <CloseButton className="cost-dashboard-close" onClick={onClose} label={translate("common.close")} />
         </div>
 
         {loading ? (

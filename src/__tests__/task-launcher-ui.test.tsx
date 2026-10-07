@@ -1,0 +1,1127 @@
+// @vitest-environment jsdom
+/**
+ * The task launcher (⌘N), driven through the DOM with the agent catalog,
+ * the doctor and the settings table behind it:
+ *   - it opens pre-set to the usual full combination of the repository, so
+ *     a task and Enter launch it (with the approval mode, model, effort,
+ *     extra args, prefix and channels on the launch);
+ *   - every chip: agent · account (Custom agent listed), project (most used
+ *     first), where (new worktree + base, existing branch, current checkout),
+ *     approval (the agent's real modes, Skip all in red with its note),
+ *     model, effort (disabled when the model has none);
+ *   - + options: extra args, the Settings prefix, channels, editable checks,
+ *     Track as a feature (instead of a size), Also on with its own choices;
+ *   - "Hermes will run", Recent, Launch & next (⌘⏎) keeps the sheet, Enter
+ *     from any field, Esc, the draft that survives a click outside;
+ *   - presets: Save as preset…, ⌘1–⌘4 apply one and keep the task, a stale
+ *     preset falls back with a warning, "Save as preset?" after 3 identical
+ *     launches, once;
+ *   - the rows that stop Launch (signed out, not a repository, branch taken,
+ *     low disk) and a launch that could only be queued;
+ *   - capabilities that cannot be read stop Launch with a way to try again
+ *     (never a list of Hermes's own).
+ * The capability commands are answered by a typed in-memory fake with the
+ * backend's rules (src/__tests__/fakes/capabilityCommands.ts).
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Suspense } from "react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import "@testing-library/jest-dom/vitest";
+import type { DoctorRow } from "../api/doctor";
+import type { RepoProbe } from "../api/launcher";
+import type { FakeCapabilityCommands } from "./fakes/capabilityCommands";
+
+const h = vi.hoisted(() => ({
+  doctor: [] as DoctorRow[],
+  probe: new Map<string, RepoProbe>(),
+  /** While set, the repository probe answers only once it resolves. */
+  probeGate: null as Promise<void> | null,
+  disk: { free_bytes: 100 * 1024 ** 3, required_bytes: 10 * 1024 ** 3, below_threshold: false },
+  settings: new Map<string, string>(),
+  projects: [] as { id: string; name: string; path: string; path_exists: boolean; session_count: number }[],
+  cap: null as unknown as FakeCapabilityCommands,
+}));
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(async (cmd: string, args: Record<string, unknown>) => {
+    if (cmd === "agent_doctor") return h.doctor;
+    if (cmd === "task_repo_probe") {
+      if (h.probeGate) await h.probeGate;
+      return h.probe.get(String(args.path)) ?? { git_root: null, branch_exists: false, local_branches: [], worktree_toml: null, current_branch: null };
+    }
+    if (cmd === "git_disk_status") return h.disk;
+    if (cmd === "get_projects_ordered") return h.projects;
+    const answer = h.cap.handle(cmd, args ?? {});
+    if (answer) return answer.value;
+    throw new Error(`command ${cmd} not found`);
+  }),
+}));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(async () => null) }));
+vi.mock("../api/settings", () => ({
+  getSetting: vi.fn(async (k: string) => h.settings.get(k) ?? ""),
+  setSetting: vi.fn(async (k: string, v: string) => {
+    h.settings.set(k, v);
+  }),
+  getSettings: vi.fn(async () => Object.fromEntries(h.settings)),
+}));
+
+import { TaskLauncher, type TaskLaunchRequest, type TaskLaunchResult } from "../components/TaskLauncher";
+import { I18nProvider } from "../i18n/I18nProvider";
+import { __resetDoctorForTest } from "../launcher/doctorStore";
+import { fakeCapabilityCommands } from "./fakes/capabilityCommands";
+import { peekLauncherSeed, setLauncherSeed } from "../library/launcherSeed";
+import { __resetOffersForTest, clearLauncherDraft, setPendingSuggestion } from "../launcher/draft";
+import { isMac } from "../utils/platform";
+import type { AgentCapabilities } from "../agent/capabilities/types";
+
+function doctorRow(id: string, name: string, over: Partial<DoctorRow> = {}): DoctorRow {
+  return { id, name, installed: true, version: "1.2.3", min_version: null, version_ok: null, signed_in: "yes", signals: "exact", resume: true, retired: false, retired_note: null, beta: false, ...over };
+}
+
+// Each test opens the sheet (and some reopen it), waiting for the doctor,
+// the settings and the debounced repository probe every time.
+vi.setConfig({ testTimeout: 20_000 });
+
+const REPO = "/fixture-home/repo";
+const OTHER = "/fixture-home/other";
+
+beforeEach(() => {
+  h.doctor = [doctorRow("claude", "Claude Code"), doctorRow("codex", "Codex CLI")];
+  h.probe = new Map([
+    [REPO, { git_root: REPO, branch_exists: false, local_branches: ["main", "develop", "feature/inbox"], worktree_toml: 'done_when = ["npm test"]\n', current_branch: "main" }],
+    [OTHER, { git_root: OTHER, branch_exists: false, local_branches: ["main"], worktree_toml: null, current_branch: "main" }],
+  ]);
+  h.probeGate = null;
+  h.disk = { free_bytes: 100 * 1024 ** 3, required_bytes: 10 * 1024 ** 3, below_threshold: false };
+  h.settings = new Map();
+  h.projects = [
+    { id: "p2", name: "other", path: OTHER, path_exists: true, session_count: 9 },
+    { id: "p1", name: "repo", path: REPO, path_exists: true, session_count: 1 },
+  ];
+  __resetDoctorForTest();
+  h.cap = fakeCapabilityCommands(() => h.doctor);
+  clearLauncherDraft();
+  setPendingSuggestion(null);
+  __resetOffersForTest();
+  vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+    cb(0);
+    return 0;
+  });
+});
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+const settle = () =>
+  act(async () => {
+    await new Promise((r) => setTimeout(r, 300));
+  });
+
+async function open(props: Partial<Parameters<typeof TaskLauncher>[0]> = {}, result: TaskLaunchResult = true) {
+  const onLaunch = vi.fn(async (_req: TaskLaunchRequest) => result);
+  const onSignIn = vi.fn();
+  const onOpenAdvanced = vi.fn();
+  const onClose = vi.fn();
+  const ui = render(
+    <I18nProvider>
+      <TaskLauncher defaultRepo={REPO} onLaunch={onLaunch} onSignIn={onSignIn} onOpenAdvanced={onOpenAdvanced} onClose={onClose} {...props} />
+    </I18nProvider>,
+  );
+  await settle();
+  await settle();
+  return { onLaunch, onSignIn, onOpenAdvanced, onClose, ui };
+}
+
+const task = () => screen.getByPlaceholderText(/Describe the task/) as HTMLTextAreaElement;
+const launchButton = () => document.querySelector(".task-launcher-launch") as HTMLButtonElement;
+const chip = (name: string) => document.querySelector(`[data-chip="${name}"]`) as HTMLButtonElement;
+const blocks = () => [...document.querySelectorAll(".task-launcher-block")].map((b) => b.getAttribute("data-kind"));
+const preview = () => document.querySelector(".task-launcher-command")?.textContent ?? "";
+const modKey = isMac ? { metaKey: true } : { ctrlKey: true };
+
+async function typeTask(text: string) {
+  fireEvent.change(task(), { target: { value: text } });
+  await settle();
+}
+async function pick(chipName: string, selector: string) {
+  fireEvent.click(chip(chipName));
+  fireEvent.click(document.querySelector(`.task-launcher-menu ${selector}`) as HTMLElement);
+  await settle();
+}
+/** Picks a value of a Select the way the mouse does: open its list, click the option. */
+function choose(selector: string, value: string) {
+  const trigger = document.querySelector(selector) as HTMLElement;
+  expect(trigger?.getAttribute("role")).toBe("combobox");
+  fireEvent.click(trigger);
+  const list = document.getElementById(trigger.getAttribute("aria-controls") ?? "") as HTMLElement;
+  fireEvent.click(list.querySelector(`[data-value="${value}"]`) as HTMLElement);
+}
+async function expand() {
+  fireEvent.click(document.querySelector(".task-launcher-expand") as HTMLElement);
+  await settle();
+}
+/** Types a branch name of the person's own (the where menu's field). */
+async function typeBranch(name: string) {
+  if (!document.querySelector(".task-launcher-branch")) fireEvent.click(chip("where"));
+  fireEvent.change(document.querySelector(".task-launcher-branch") as HTMLInputElement, { target: { value: name } });
+  await settle();
+}
+/** Closes an open chip menu (Esc on it), leaving the sheet open. */
+function closeMenus() {
+  const m = document.querySelector(".task-launcher-menu");
+  if (m) fireEvent.keyDown(m, { key: "Escape" });
+}
+async function launchWithEnter() {
+  fireEvent.keyDown(task(), { key: "Enter" });
+  await settle();
+}
+
+describe("TaskLauncher: the defaults and Enter", () => {
+  it("with nothing remembered: Claude in its safety default, a new worktree named from the task, the repo's checks; Enter launches", async () => {
+    const { onLaunch, onClose } = await open();
+    expect(chip("agent")).toHaveTextContent("Claude Code · default profile");
+    expect(chip("approval")).toHaveTextContent("Accept edits");
+    expect(chip("model")).toHaveTextContent("model: default");
+    expect(launchButton()).toBeDisabled();
+    await typeTask("Fix the login bug");
+    expect(chip("where")).toHaveTextContent("new worktree · hermes/fix-the-login-bug");
+    expect(preview()).toBe('claude --permission-mode acceptEdits "Fix the login bug"  ·  in worktree hermes/fix-the-login-bug from main');
+    await launchWithEnter();
+    expect(onLaunch).toHaveBeenCalledTimes(1);
+    const req = onLaunch.mock.calls[0][0];
+    expect(req).toMatchObject({ task: "Fix the login bug", repoRoot: REPO, track: "Quick", doneWhen: ["npm test"] });
+    expect(req.agents).toHaveLength(1);
+    expect(req.agents[0]).toMatchObject({
+      id: "claude",
+      mode: "terminal",
+      branch: "hermes/fix-the-login-bug",
+      createBranch: true,
+      worktree: true,
+      launch: { permissionMode: "acceptEdits", customPrefix: "", customSuffix: "", channels: [] },
+    });
+    expect(onClose).toHaveBeenCalledWith({ keepDraft: false });
+    expect(h.settings.get("last_ai_provider")).toBe("claude");
+    expect(h.cap.history).toHaveLength(1);
+  });
+
+  it("Settings apply: the default approval mode, the extra args and the agent's prefix", async () => {
+    h.settings.set("default_permission_mode", "plan");
+    h.settings.set("custom_command_suffix", "--verbose");
+    h.settings.set("ai_agent_prefixes", JSON.stringify({ claude: "caffeinate -i" }));
+    const { onLaunch } = await open();
+    expect(chip("approval")).toHaveTextContent("Plan first");
+    await typeTask("Fix it");
+    expect(preview()).toBe('caffeinate -i claude --permission-mode plan "Fix it" --verbose  ·  in worktree hermes/fix-it from main');
+    await expand();
+    expect(screen.getByText("per agent · prefix from Settings: caffeinate -i")).toBeInTheDocument();
+    await launchWithEnter();
+    expect(onLaunch.mock.calls[0][0].agents[0].launch).toMatchObject({ permissionMode: "plan", customPrefix: "caffeinate -i", customSuffix: "--verbose" });
+  });
+
+  it("opens pre-set to the usual combination of the repository (Skip all excepted), so task + Enter launches it", async () => {
+    const usual = { agentId: "codex", accountId: "default", approvalModeId: "bypassPermissions", modelId: "gpt-fake-luna", effort: "high", extraArgs: "", prefix: "", channels: [], where: { kind: "new-worktree", baseBranch: "develop", branch: "" }, trackAsFeature: false };
+    const other = { ...usual, agentId: "claude", approvalModeId: "plan", modelId: "opus", effort: null };
+    h.cap.history = [
+        { repo: REPO, choice: other, at: 1 },
+        { repo: REPO, choice: usual, at: 2 },
+        { repo: REPO, choice: usual, at: 3 },
+        { repo: OTHER, choice: other, at: 4 },
+        { repo: OTHER, choice: other, at: 5 },
+        { repo: OTHER, choice: other, at: 6 },
+      ];
+    const { onLaunch } = await open();
+    expect(chip("agent")).toHaveTextContent("Codex CLI");
+    // Skip all is never picked for the person, not even as their usual:
+    // Codex's safety default instead, and the sheet says so.
+    expect(chip("approval")).not.toHaveTextContent("Skip all");
+    expect(chip("approval")).not.toHaveClass("danger");
+    expect(document.querySelector(".task-launcher-danger-dropped")?.textContent).toBe("Skip all ⚠ is never picked for you: choose it in Approval if this task needs it.");
+    expect(chip("model")).toHaveTextContent("model: gpt-fake-luna");
+    expect(chip("effort")).toHaveTextContent("effort: high");
+    await typeTask("Bump tauri");
+    await launchWithEnter();
+    const agent = onLaunch.mock.calls[0][0].agents[0];
+    expect(agent).toMatchObject({ id: "codex", baseBranch: "develop", branch: "hermes/bump-tauri" });
+    expect(agent.launch).toMatchObject({ permissionMode: "auto", customSuffix: "", agentLaunch: { modelId: "gpt-fake-luna", effort: "high", accountId: null } });
+  });
+
+  it("Skip all needs the person's own choice: never from Settings' default, and once chosen it is said in the chip row", async () => {
+    h.settings.set("default_permission_mode", "bypassPermissions");
+    await open();
+    expect(chip("approval")).toHaveTextContent("Accept edits");
+    expect(document.querySelector(".task-launcher-danger-warning")).toBeNull();
+    await pick("approval", '[data-mode="bypassPermissions"]');
+    closeMenus();
+    await settle();
+    expect(document.querySelector(".task-launcher-menu")).toBeNull();
+    // The warning stands in the chip row itself, with no menu or options open.
+    const warning = document.querySelector(".task-launcher-danger-warning");
+    expect(warning?.textContent).toBe("⚠ Skip all ⚠: Claude Code will run every command and edit without asking you.");
+    expect(warning?.previousElementSibling).toHaveClass("task-launcher-chips");
+    await expand();
+    fireEvent.click(screen.getByRole("checkbox", { name: /Track as a feature/ }));
+    await settle();
+    expect(document.querySelector(".task-launcher-danger-warning")?.textContent).toContain("The feature track's gates then rely on the agent stopping by itself.");
+  });
+
+  it("plan mode is findable: the approval chip says its mode, Plan first says it is Claude's plan mode, the Track option says it is not", async () => {
+    await open();
+    expect(chip("approval").getAttribute("title")).toBe("Approval: Accept edits. Edits inside the worktree run. Commands, network and other folders ask.");
+    fireEvent.click(chip("approval"));
+    await settle();
+    expect(document.querySelector(".task-launcher-plan-hint")?.textContent).toBe("Plan first is Claude Code's own plan mode: it plans and changes nothing until you approve. For Hermes's phased workflow, use Track as a feature in + options.");
+    closeMenus();
+    await expand();
+    const labels = [...document.querySelectorAll(".task-launcher-opt-label")].map((l) => l.textContent);
+    expect(labels).toContain("Feature track");
+    expect(labels).not.toContain("Planning");
+    expect(screen.getByText(/Not the same as Claude Code's own plan mode \(Approval › Plan first\)\./)).toBeInTheDocument();
+  });
+
+  it("without an active session, starts on the most used project (every launch is a session of its project)", async () => {
+    h.projects = [
+      { id: "p1", name: "repo", path: REPO, path_exists: true, session_count: 1 },
+      { id: "p2", name: "other", path: OTHER, path_exists: true, session_count: 9 },
+    ];
+    await open({ defaultRepo: null });
+    expect(chip("project")).toHaveTextContent("other");
+    fireEvent.click(chip("project"));
+    const items = [...document.querySelectorAll(".task-launcher-menu [data-project-path]")].map((b) => b.getAttribute("data-project-path"));
+    expect(items).toEqual([OTHER, REPO]);
+    expect(screen.getByRole("button", { name: "Browse…" })).toBeInTheDocument();
+  });
+
+  it("Shift+Enter is a new line, not a launch; Enter in any field launches", async () => {
+    const { onLaunch } = await open();
+    await typeTask("x");
+    fireEvent.keyDown(task(), { key: "Enter", shiftKey: true });
+    await settle();
+    expect(onLaunch).not.toHaveBeenCalled();
+    await expand();
+    fireEvent.keyDown(document.querySelector(".task-launcher-extra-args") as HTMLElement, { key: "Enter" });
+    await settle();
+    expect(onLaunch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("TaskLauncher: the chips", () => {
+  it("agent · account lists every agent, the Custom agent too; switching agent brings its own approval modes", async () => {
+    const { onLaunch } = await open();
+    fireEvent.click(chip("agent"));
+    const ids = [...document.querySelectorAll(".task-launcher-menu [data-agent-id]")].map((b) => b.getAttribute("data-agent-id"));
+    expect(ids).toContain("claude");
+    expect(ids).toContain("codex");
+    expect(ids).toContain("custom");
+    expect(screen.getByText("Account for Claude Code")).toBeInTheDocument();
+    fireEvent.click(document.querySelector('.task-launcher-menu [data-agent-id="codex"]') as HTMLElement);
+    await settle();
+    expect(chip("approval")).toHaveTextContent("Auto");
+    fireEvent.click(chip("approval"));
+    const modes = [...document.querySelectorAll(".task-launcher-approval-modes [data-mode]")].map((b) => b.getAttribute("data-mode"));
+    expect(modes).toEqual(["default", "auto", "bypassPermissions"]);
+    await typeTask("Do it");
+    await launchWithEnter();
+    expect(onLaunch.mock.calls[0][0].agents[0]).toMatchObject({ id: "codex", launch: { permissionMode: "auto" } });
+  });
+
+  it("switching agent brings back what was last launched with it (per agent and account)", async () => {
+    const choice = (over: Record<string, unknown>) => ({ agentId: "claude", accountId: "default", approvalModeId: "acceptEdits", modelId: "default", effort: null, extraArgs: "", prefix: "", channels: [], where: { kind: "new-worktree", baseBranch: "", branch: "" }, trackAsFeature: false, ...over });
+    h.cap.history = [
+        { repo: OTHER, choice: choice({ agentId: "codex", approvalModeId: "bypassPermissions", modelId: "gpt-fake-luna", effort: "max" }), at: 1 },
+        { repo: REPO, choice: choice({ modelId: "opus" }), at: 2 },
+      ];
+    await open();
+    expect(chip("model")).toHaveTextContent("model: opus");
+    await pick("agent", '[data-agent-id="codex"]');
+    await settle();
+    expect(chip("model")).toHaveTextContent("model: gpt-fake-luna");
+    expect(chip("effort")).toHaveTextContent("effort: max");
+    // Its last approval was Skip all: never brought back by itself.
+    expect(chip("approval")).not.toHaveTextContent("Skip all");
+    expect(document.querySelector(".task-launcher-danger-dropped")).not.toBeNull();
+    // A pick closes the menu and gives the task field the keyboard (SOLO-10).
+    expect(document.querySelector(".task-launcher-menu")).toBeNull();
+    expect(document.activeElement).toBe(task());
+    await pick("agent", '[data-agent-id="gemini"]');
+    expect(chip("model")).toHaveTextContent("model: default");
+  });
+
+  it("approval: Skip all is red, with its note and flag", async () => {
+    await open();
+    fireEvent.click(chip("approval"));
+    const skip = document.querySelector('.task-launcher-approval-modes [data-mode="bypassPermissions"]') as HTMLElement;
+    expect(skip).toHaveClass("danger");
+    fireEvent.click(skip);
+    await settle();
+    expect(chip("approval")).toHaveClass("danger");
+    // The pick closed the menu; open again to read the note.
+    expect(document.querySelector(".task-launcher-menu")).toBeNull();
+    fireEvent.click(chip("approval"));
+    expect(document.querySelector(".task-launcher-approval-note")).toHaveClass("danger");
+    expect(document.querySelector(".task-launcher-approval-note")?.textContent).toMatch(/Never asks, for anything\. Only in a throwaway worktree/);
+    expect(document.querySelector(".task-launcher-approval code")?.textContent).toBe("--permission-mode bypassPermissions");
+  });
+
+  it("model and effort: the model's efforts are offered; a model without any disables the effort chip", async () => {
+    const { onLaunch } = await open();
+    await pick("model", '[data-model-id="opus"]');
+    expect(chip("model")).toHaveTextContent("model: opus");
+    expect(chip("effort")).toBeEnabled();
+    fireEvent.click(chip("effort"));
+    const efforts = [...document.querySelectorAll(".task-launcher-menu [data-effort]")].map((b) => b.getAttribute("data-effort"));
+    expect(efforts).toEqual(["", "low", "medium", "high", "xhigh", "max"]);
+    fireEvent.click(document.querySelector('.task-launcher-menu [data-effort="max"]') as HTMLElement);
+    await settle();
+    await typeTask("Plan the refactor");
+    expect(preview()).toContain('claude --permission-mode acceptEdits "Plan the refactor" --model opus --effort max');
+    await pick("model", '[data-model-id="haiku"]');
+    expect(chip("effort")).toBeDisabled();
+    expect(chip("effort")).toHaveTextContent("effort: n/a for haiku");
+    await launchWithEnter();
+    expect(onLaunch.mock.calls[0][0].agents[0].launch).toMatchObject({ customSuffix: "", agentLaunch: { modelId: "haiku", effort: null } });
+  });
+
+  it("where: an existing branch, the current checkout, or a new worktree cut from another branch", async () => {
+    const { onLaunch } = await open();
+    await typeTask("Fix the badge");
+    fireEvent.click(chip("where"));
+    fireEvent.click(document.querySelector('.task-launcher-menu [data-where="existing-branch"]') as HTMLElement);
+    await settle();
+    choose(".task-launcher-menu .task-launcher-existing", "feature/inbox");
+    await settle();
+    expect(chip("where")).toHaveTextContent("existing branch · feature/inbox");
+    await launchWithEnter();
+    expect(onLaunch.mock.calls[0][0].agents[0]).toMatchObject({ branch: "feature/inbox", createBranch: false, worktree: true });
+
+    cleanup();
+    const second = await open();
+    await typeTask("Fix the badge");
+    await pick("where", '[data-where="current-checkout"]');
+    expect(chip("where")).toHaveTextContent("current checkout · main");
+    expect(preview()).toContain("in repo (main)");
+    await launchWithEnter();
+    expect(second.onLaunch.mock.calls[0][0].agents[0]).toMatchObject({ worktree: false, createBranch: false });
+
+    cleanup();
+    const third = await open();
+    // The usual is the current checkout (the latest of two tied launches),
+    // but a new task is never put on it without asking: a new worktree (QAGIT-16).
+    expect(chip("where")).toHaveTextContent("new worktree");
+    expect(chip("where")).not.toHaveClass("danger");
+    await typeTask("Fix the badge");
+    fireEvent.click(chip("where"));
+    choose(".task-launcher-menu .task-launcher-base", "develop");
+    await settle();
+    expect(preview()).toContain("in worktree hermes/fix-the-badge from develop");
+    await launchWithEnter();
+    expect(third.onLaunch.mock.calls[0][0].agents[0]).toMatchObject({ baseBranch: "develop", createBranch: true });
+  });
+
+  it("a Custom agent needs its command, then launches it", async () => {
+    const { onLaunch } = await open();
+    await pick("agent", '[data-agent-id="custom"]');
+    await typeTask("Summarise the logs");
+    expect(blocks()).toContain("custom-command");
+    expect(launchButton()).toBeDisabled();
+    fireEvent.change(document.querySelector(".task-launcher-custom-command") as HTMLInputElement, { target: { value: "my-agent --fast" } });
+    await settle();
+    await launchWithEnter();
+    expect(onLaunch.mock.calls[0][0].agents[0]).toMatchObject({ id: "custom", launch: { agentCommand: "my-agent --fast" } });
+  });
+
+  it("the keyboard alone: arrows move between chips, Enter opens one, arrows + Enter pick, Esc closes the menu first", async () => {
+    const { onClose } = await open();
+    chip("agent").focus();
+    fireEvent.keyDown(chip("agent"), { key: "ArrowRight" });
+    expect(document.activeElement).toBe(chip("project"));
+    fireEvent.keyDown(chip("project"), { key: "ArrowRight" });
+    fireEvent.keyDown(chip("where"), { key: "ArrowRight" });
+    expect(document.activeElement).toBe(chip("approval"));
+    fireEvent.keyDown(chip("approval"), { key: "Enter" });
+    await settle();
+    expect(document.querySelector('.task-launcher-menu[data-menu="approval"]')).not.toBeNull();
+    expect(document.activeElement?.getAttribute("data-mode")).toBe("acceptEdits");
+    fireEvent.keyDown(document.activeElement as HTMLElement, { key: "ArrowRight" });
+    expect(document.activeElement?.getAttribute("data-mode")).toBe("plan");
+    fireEvent.keyDown(document.activeElement as HTMLElement, { key: "Enter" });
+    await settle();
+    expect(chip("approval")).toHaveTextContent("Plan first");
+    // A pick closes the menu; the task field has the keyboard, so the next Enter launches (SOLO-10).
+    expect(document.querySelector(".task-launcher-menu")).toBeNull();
+    expect(document.activeElement).toBe(task());
+    // Esc without a pick closes the menu and goes back to its chip.
+    chip("model").focus();
+    fireEvent.keyDown(chip("model"), { key: "Enter" });
+    await settle();
+    expect(document.querySelector('.task-launcher-menu[data-menu="model"]')).not.toBeNull();
+    fireEvent.keyDown(document.activeElement as HTMLElement, { key: "Escape" });
+    await settle();
+    expect(document.querySelector(".task-launcher-menu")).toBeNull();
+    expect(document.activeElement).toBe(chip("model"));
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.keyDown(task(), { key: "Escape" });
+    expect(onClose).toHaveBeenCalledWith({ keepDraft: true });
+  });
+});
+
+describe("TaskLauncher: + options", () => {
+  it("extra args, channels, checks, Track as a feature and Also on all reach the launch", async () => {
+    const { onLaunch } = await open();
+    await typeTask("Add ru locale");
+    fireEvent.keyDown(task(), { key: ".", ...modKey });
+    await settle();
+    expect(document.querySelector(".task-launcher-options")).not.toBeNull();
+    fireEvent.change(document.querySelector(".task-launcher-extra-args") as HTMLInputElement, { target: { value: "--debug" } });
+    fireEvent.change(document.querySelector(".task-launcher-channels") as HTMLInputElement, { target: { value: "plugin:telegram" } });
+    fireEvent.change(document.querySelector(".task-launcher-check-input") as HTMLInputElement, { target: { value: "npm run test:ci" } });
+    fireEvent.click(screen.getByRole("button", { name: "+ add check" }));
+    await settle();
+    const inputs = document.querySelectorAll(".task-launcher-check-input");
+    fireEvent.change(inputs[1], { target: { value: "npx tsc --noEmit" } });
+    expect(screen.queryByText("Size")).toBeNull();
+    const feature = screen.getByRole("checkbox", { name: /Track as a feature/ });
+    expect(screen.getByText(/Questions → research → design → structure → plan → implement, before any code\. The agent stops after each phase/)).toBeInTheDocument();
+    fireEvent.click(feature);
+    fireEvent.click(document.querySelector(".task-launcher-also-toggle") as HTMLElement);
+    await settle();
+    choose(".task-launcher-also-approval", "bypassPermissions");
+    choose(".task-launcher-also-model", "gpt-fake-terra");
+    await settle();
+    choose(".task-launcher-also-effort", "ultra");
+    await settle();
+    expect(preview()).toContain('--channels plugin:telegram --debug  +  codex --dangerously-bypass-approvals-and-sandbox "Add ru locale" -m gpt-fake-terra -c model_reasoning_effort=ultra');
+    await launchWithEnter();
+    const req = onLaunch.mock.calls[0][0];
+    expect(req.track).toBe("Full");
+    expect(req.doneWhen).toEqual(["npm run test:ci", "npx tsc --noEmit"]);
+    expect(req.agents.map((a) => [a.id, a.branch, a.launch.permissionMode, a.launch.customSuffix, a.launch.agentLaunch?.modelId, a.launch.agentLaunch?.effort, a.launch.channels])).toEqual([
+      ["claude", "hermes/add-ru-locale", "acceptEdits", "--debug", null, null, ["plugin:telegram"]],
+      ["codex", "hermes/add-ru-locale-codex", "bypassPermissions", "", "gpt-fake-terra", "ultra", []],
+    ]);
+    expect(req.choice.alsoOn?.agentId).toBe("codex");
+  });
+
+  it("offers the Agent view only for Claude, and launches in it when chosen", async () => {
+    const { onLaunch } = await open();
+    await expand();
+    fireEvent.click(document.querySelector('.task-launcher-view [data-mode="agent"]') as HTMLElement);
+    await typeTask("Explain the code");
+    await launchWithEnter();
+    expect(onLaunch.mock.calls[0][0].agents[0].mode).toBe("agent");
+    expect(JSON.parse(h.settings.get("session_mode_by_provider") ?? "{}")).toEqual({ claude: "agent" });
+    cleanup();
+    await open();
+    await pick("agent", '[data-agent-id="codex"]');
+    await expand();
+    expect(document.querySelector(".task-launcher-view")).toBeNull();
+  });
+
+  it("keeps a check added the moment the repository's probe lands", async () => {
+    const THIRD = "/fixture-home/third";
+    h.probe.set(THIRD, { git_root: THIRD, branch_exists: false, local_branches: ["main"], worktree_toml: "[[[ not toml", current_branch: "main" });
+    await open();
+    await expand();
+    let release = () => {};
+    h.probeGate = new Promise<void>((r) => {
+      release = r;
+    });
+    fireEvent.click(chip("project"));
+    fireEvent.change(document.querySelector(".task-launcher-repo") as HTMLInputElement, { target: { value: THIRD } });
+    await settle();
+    expect(document.querySelectorAll(".task-launcher-check-input")).toHaveLength(0);
+    // Real scheduling: the probe's render commits, and "+ add check" is
+    // clicked before that render's effects run (as a click can on a busy machine).
+    const actEnv = globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean };
+    actEnv.IS_REACT_ACT_ENVIRONMENT = false;
+    try {
+      const mo = new MutationObserver(() => {
+        mo.disconnect();
+        (document.querySelector(".task-launcher-check-add") as HTMLButtonElement).click();
+      });
+      mo.observe(document.querySelector(".task-launcher-checks") as HTMLElement, { childList: true, subtree: true, characterData: true });
+      release();
+      await waitFor(() => expect(document.querySelector(".task-launcher-checks")).toHaveTextContent(/line 1/));
+      await new Promise((r) => setTimeout(r, 100));
+    } finally {
+      actEnv.IS_REACT_ACT_ENVIRONMENT = true;
+    }
+    expect(document.querySelectorAll(".task-launcher-check-input")).toHaveLength(1);
+  });
+});
+
+describe("TaskLauncher: flow", () => {
+  it("Launch & next (⌘⏎) keeps the sheet open with the same choice and an empty task", async () => {
+    const { onLaunch, onClose } = await open();
+    await pick("model", '[data-model-id="sonnet"]');
+    for (const t of ["Task one", "Task two"]) {
+      await typeTask(t);
+      fireEvent.keyDown(task(), { key: "Enter", ...modKey });
+      await settle();
+      expect(task().value).toBe("");
+    }
+    expect(onLaunch.mock.calls.map((c) => [c[0].task, c[0].agents[0].launch.agentLaunch?.modelId])).toEqual([
+      ["Task one", "sonnet"],
+      ["Task two", "sonnet"],
+    ]);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(document.querySelector(".task-launcher-launched")?.textContent).toContain("Launched 2");
+  });
+
+  it("the draft survives a click outside, Esc, Cancel and Close; only Start over or a launch forgets it", async () => {
+    const first = await open();
+    await typeTask("Half-written task");
+    await pick("model", '[data-model-id="opus"]');
+    fireEvent.mouseDown(document.querySelector(".task-launcher-overlay") as HTMLElement);
+    expect(first.onClose).toHaveBeenCalledWith({ keepDraft: true });
+    cleanup();
+    const second = await open();
+    expect(task().value).toBe("Half-written task");
+    expect(chip("model")).toHaveTextContent("model: opus");
+    expect(document.querySelector(".task-launcher-restored")?.textContent).toContain("Your unsent task is back, as you left it.");
+    fireEvent.keyDown(task(), { key: "Escape" });
+    expect(second.onClose).toHaveBeenCalledWith({ keepDraft: true });
+    cleanup();
+    await open();
+    expect(task().value).toBe("Half-written task");
+    fireEvent.click(document.querySelector(".task-launcher-cancel") as HTMLElement);
+    cleanup();
+    await open();
+    expect(task().value).toBe("Half-written task");
+    fireEvent.click(document.querySelector(".task-launcher-close") as HTMLElement);
+    cleanup();
+    const onStartOver = vi.fn();
+    await open({ onStartOver });
+    expect(task().value).toBe("Half-written task");
+    fireEvent.click(document.querySelector(".task-launcher-start-over") as HTMLElement);
+    expect(onStartOver).toHaveBeenCalledTimes(1);
+    cleanup();
+    await open();
+    expect(task().value).toBe("");
+    expect(chip("model")).toHaveTextContent("model: default");
+    expect(document.querySelector(".task-launcher-restored")).toBeNull();
+    // A launch forgets it too.
+    await typeTask("Launched one");
+    await launchWithEnter();
+    cleanup();
+    await open();
+    expect(task().value).toBe("");
+  });
+
+  it("taken away by the app (Settings, a sign-in) it keeps every chip, the options and the task, and comes back as it was", async () => {
+    await open();
+    await typeTask("Fix the flaky login test");
+    await pick("approval", '[data-mode="plan"]');
+    await pick("model", '[data-model-id="opus"]');
+    await pick("effort", '[data-effort="high"]');
+    closeMenus();
+    await expand();
+    fireEvent.change(document.querySelector(".task-launcher-extra-args") as HTMLInputElement, { target: { value: "--verbose" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: /Track as a feature/ }));
+    fireEvent.change(document.querySelector(".task-launcher-branch") as HTMLInputElement, { target: { value: "hermes/my-branch" } });
+    await settle();
+    const before = { approval: chip("approval").textContent, model: chip("model").textContent, effort: chip("effort").textContent, preview: preview() };
+    // The app unmounts the sheet (Manage accounts opened Settings): no onClose, no Esc.
+    cleanup();
+    const back = await open();
+    expect(task().value).toBe("Fix the flaky login test");
+    expect({ approval: chip("approval").textContent, model: chip("model").textContent, effort: chip("effort").textContent, preview: preview() }).toEqual(before);
+    expect(document.querySelector(".task-launcher-options")).not.toBeNull();
+    expect((document.querySelector(".task-launcher-extra-args") as HTMLInputElement).value).toBe("--verbose");
+    expect((screen.getByRole("checkbox", { name: /Track as a feature/ }) as HTMLInputElement).checked).toBe(true);
+    expect((document.querySelector(".task-launcher-branch") as HTMLInputElement).value).toBe("hermes/my-branch");
+    await launchWithEnter();
+    expect(back.onLaunch.mock.calls[0][0]).toMatchObject({ task: "Fix the flaky login test", track: "Full", agents: [{ branch: "hermes/my-branch", launch: { permissionMode: "plan", customSuffix: "--verbose" } }] });
+  });
+
+  it("an untouched sheet closed again is not a draft: the next one opens on the usual combination", async () => {
+    await open();
+    fireEvent.keyDown(task(), { key: "Escape" });
+    cleanup();
+    await open();
+    expect(document.querySelector(".task-launcher-restored")).toBeNull();
+  });
+
+  it("Recent lists the last tasks; one click puts it back in the task field", async () => {
+    h.settings.set(
+      "task_launches",
+      JSON.stringify([
+        { sessionId: "a", task: "Bump tauri to 2.9", agentId: "claude", mode: "terminal", repo: REPO, branch: "hermes/a", track: "Quick", doneWhen: [], pairedWith: null, createdAt: 1 },
+        { sessionId: "b", task: "Add ru locale", agentId: "claude", mode: "terminal", repo: REPO, branch: "hermes/b", track: "Quick", doneWhen: [], pairedWith: null, createdAt: 2 },
+      ]),
+    );
+    await open();
+    const recents = [...document.querySelectorAll(".task-launcher-recent")].map((b) => b.textContent);
+    expect(recents).toEqual(["Add ru locale", "Bump tauri to 2.9"]);
+    fireEvent.click(screen.getByRole("button", { name: "Bump tauri to 2.9" }));
+    expect(task().value).toBe("Bump tauri to 2.9");
+  });
+
+  it("a launch that only got queued (running-agents cap) says so and still counts", async () => {
+    await open({}, "queued");
+    await typeTask("Queued task");
+    fireEvent.keyDown(task(), { key: "Enter", ...modKey });
+    await settle();
+    expect(document.querySelector(".task-launcher-queued")?.textContent).toContain("waits for a free slot");
+  });
+
+  it("keeps Launch off and says so when the launch fails", async () => {
+    await open({}, false);
+    await typeTask("Fix it");
+    await launchWithEnter();
+    expect(blocks()).toContain("failed");
+  });
+});
+
+describe("TaskLauncher: presets", () => {
+  it("Save as preset… then ⌘1 applies it and keeps the task text", async () => {
+    await open();
+    await pick("model", '[data-model-id="opus"]');
+    fireEvent.click(screen.getByRole("button", { name: "Save as preset…" }));
+    const name = screen.getByRole("textbox", { name: "Preset name" });
+    fireEvent.change(name, { target: { value: "Deep work" } });
+    fireEvent.keyDown(name, { key: "Enter" });
+    await settle();
+    expect(h.cap.presets.map((p: { name: string }) => p.name)).toEqual(["Deep work"]);
+    await pick("model", '[data-model-id="haiku"]');
+    await typeTask("Keep this text");
+    fireEvent.keyDown(task(), { key: "1", ...modKey });
+    await settle();
+    expect(chip("model")).toHaveTextContent("model: opus");
+    expect(task().value).toBe("Keep this text");
+    expect(document.querySelector(".task-launcher-preset.selected")?.textContent).toContain("Deep work");
+  });
+
+  it("⌘2 applies the second preset; a stale one shows the warning and the fallback, and launches the fallback", async () => {
+    const base = { accountId: "default", extraArgs: "", prefix: "", channels: [], where: { kind: "new-worktree", baseBranch: "", branch: "" }, trackAsFeature: false };
+    h.cap.presets = [
+        { id: "p1", name: "Quick", choice: { ...base, agentId: "claude", approvalModeId: "acceptEdits", modelId: "haiku", effort: null } },
+        { id: "p2", name: "Old", choice: { ...base, agentId: "codex", approvalModeId: "auto", modelId: "gpt-4-retired", effort: "ultra" } },
+      ];
+    const { onLaunch } = await open();
+    const presets = [...document.querySelectorAll(".task-launcher-preset")].map((b) => b.textContent);
+    expect(presets).toEqual([`${isMac ? "⌘1" : "Ctrl+1"}Quick`, `${isMac ? "⌘2" : "Ctrl+2"}Old`]);
+    fireEvent.keyDown(task(), { key: "2", ...modKey });
+    await settle();
+    const warning = document.querySelector(".task-launcher-fallback") as HTMLElement;
+    expect(warning).not.toBeNull();
+    expect(within(warning).getByText(/Parts of the preset "Old" are not available now/)).toBeInTheDocument();
+    expect([...warning.querySelectorAll("li")].map((l) => l.getAttribute("data-field"))).toEqual(["model", "effort"]);
+    expect(chip("model")).toHaveTextContent("model: default");
+    expect(chip("effort")).toHaveTextContent("effort: high");
+    await typeTask("Run it");
+    await launchWithEnter();
+    expect(onLaunch.mock.calls[0][0].agents[0]).toMatchObject({ id: "codex", launch: { permissionMode: "auto", agentLaunch: { modelId: null, effort: "high" } } });
+  });
+
+  it("a preset whose second agent lost a model says the fallback is about the second agent", async () => {
+    const base = { accountId: "default", extraArgs: "", prefix: "", channels: [], where: { kind: "new-worktree", baseBranch: "", branch: "" }, trackAsFeature: false };
+    h.cap.presets = [
+      { id: "p1", name: "Pair", choice: { ...base, agentId: "claude", approvalModeId: "acceptEdits", modelId: "haiku", effort: null, alsoOn: { ...base, agentId: "codex", approvalModeId: "auto", modelId: "gpt-4-retired", effort: null } } },
+    ];
+    await open();
+    fireEvent.keyDown(task(), { key: "1", ...modKey });
+    await settle();
+    const warning = document.querySelector(".task-launcher-fallback") as HTMLElement;
+    expect(warning).not.toBeNull();
+    expect([...warning.querySelectorAll("li")].map((l) => [l.getAttribute("data-field"), l.textContent])).toEqual([
+      ["model", "Also on: Model gpt-4-retired is not available: using default"],
+    ]);
+  });
+
+  it("after 3 identical launches: 'Save as preset?' once; saving it makes a preset chip, and ⌘N opens on it as the usual", async () => {
+    const { onLaunch } = await open();
+    await pick("model", '[data-model-id="sonnet"]');
+    for (const t of ["One", "Two"]) {
+      await typeTask(t);
+      fireEvent.keyDown(task(), { key: "Enter", ...modKey });
+      await settle();
+      expect(document.querySelector(".task-launcher-suggest")).toBeNull();
+    }
+    await typeTask("Three");
+    fireEvent.keyDown(task(), { key: "Enter", ...modKey });
+    await settle();
+    expect(onLaunch).toHaveBeenCalledTimes(3);
+    const suggest = document.querySelector(".task-launcher-suggest") as HTMLElement;
+    expect(suggest).not.toBeNull();
+    expect(suggest.textContent).toContain("You launched this combination 3 times");
+    fireEvent.change(within(suggest).getByRole("textbox"), { target: { value: "Sonnet usual" } });
+    fireEvent.click(within(suggest).getByRole("button", { name: "Save" }));
+    await settle();
+    expect(document.querySelector(".task-launcher-suggest")).toBeNull();
+    cleanup();
+
+    await open();
+    expect(document.querySelector(".task-launcher-preset")?.textContent).toContain("Sonnet usual");
+    expect(document.querySelector(".task-launcher-preset")).toHaveClass("selected");
+    expect(chip("model")).toHaveTextContent("model: sonnet");
+    // Offered once: a fourth launch does not ask again.
+    await typeTask("Four");
+    fireEvent.keyDown(task(), { key: "Enter", ...modKey });
+    await settle();
+    expect(document.querySelector(".task-launcher-suggest")).toBeNull();
+  });
+
+  it("'Save as preset?' left unanswered is not asked again: closing the sheet, reopening, a 4th identical launch", async () => {
+    const first = await open();
+    await pick("model", '[data-model-id="sonnet"]');
+    for (const t of ["One", "Two", "Three"]) {
+      await typeTask(t);
+      fireEvent.keyDown(task(), { key: "Enter", ...modKey });
+      await settle();
+    }
+    expect(document.querySelector(".task-launcher-suggest")?.textContent).toContain("You launched this combination 3 times");
+    // Not asked again in this session; only "No, don't ask again" stops it for good (SOLO-18).
+    expect(h.cap.dismissed).toHaveLength(0);
+    fireEvent.keyDown(task(), { key: "Escape" });
+    expect(first.onClose).toHaveBeenCalledWith({ keepDraft: true });
+    cleanup();
+    const second = await open();
+    expect(chip("model")).toHaveTextContent("model: sonnet");
+    expect(document.querySelector(".task-launcher-suggest")).toBeNull();
+    await typeTask("Four");
+    fireEvent.keyDown(task(), { key: "Enter", ...modKey });
+    await settle();
+    expect(second.onLaunch).toHaveBeenCalledTimes(1);
+    expect(h.cap.history).toHaveLength(4);
+    expect(document.querySelector(".task-launcher-suggest")).toBeNull();
+  });
+
+  it("a launch that closes the sheet asks when ⌘N opens next, with the real count, and only then", async () => {
+    h.cap.history = ["a", "b", "c", "d"].map((_, i) => ({ repo: REPO, choice: { agentId: "claude", accountId: "default", approvalModeId: "acceptEdits", modelId: "default", effort: null, extraArgs: "", prefix: "", channels: [], where: { kind: "new-worktree", baseBranch: "", branch: "" }, trackAsFeature: false }, at: i + 1 }) as never);
+    await open();
+    await typeTask("Fifth");
+    await launchWithEnter();
+    cleanup();
+    await open();
+    const suggest = document.querySelector(".task-launcher-suggest") as HTMLElement;
+    expect(suggest?.textContent).toContain("You launched this combination 5 times");
+    expect((within(suggest).getByRole("textbox") as HTMLInputElement).value).toBe("Claude Code · default");
+    cleanup();
+    await open();
+    await typeTask("Sixth");
+    await launchWithEnter();
+    cleanup();
+    await open();
+    expect(document.querySelector(".task-launcher-suggest")).toBeNull();
+  });
+
+  it("dismissing 'Save as preset?' means never again for that combination", async () => {
+    await open();
+    for (const t of ["a", "b", "c"]) {
+      await typeTask(t);
+      fireEvent.keyDown(task(), { key: "Enter", ...modKey });
+      await settle();
+    }
+    fireEvent.click(screen.getByRole("button", { name: "No, don't ask again" }));
+    await settle();
+    for (const t of ["d", "e", "f"]) {
+      await typeTask(t);
+      fireEvent.keyDown(task(), { key: "Enter", ...modKey });
+      await settle();
+    }
+    expect(document.querySelector(".task-launcher-suggest")).toBeNull();
+    expect(h.cap.dismissed).toHaveLength(1);
+  });
+});
+
+describe("TaskLauncher: rows that stop Launch", () => {
+  it("a signed-out agent disables Launch and offers Sign in", async () => {
+    h.doctor = [doctorRow("claude", "Claude Code", { signed_in: "no" })];
+    const { onSignIn, onLaunch } = await open();
+    await typeTask("Fix it");
+    expect(screen.getByText("Claude Code is signed out.")).toBeInTheDocument();
+    expect(launchButton()).toBeDisabled();
+    fireEvent.keyDown(task(), { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    // The CLI's own default profile (no added account).
+    expect(onSignIn).toHaveBeenCalledWith("claude", null);
+    expect(onLaunch).not.toHaveBeenCalled();
+  });
+
+  it("a sign-in done while the sheet is open unblocks Launch (the usual combination is judged again)", async () => {
+    h.cap.history = [{ repo: REPO, choice: { agentId: "claude", accountId: "default", approvalModeId: "plan", modelId: "opus", effort: null, extraArgs: "", prefix: "", channels: [], where: { kind: "new-worktree", baseBranch: "", branch: "" }, trackAsFeature: false }, at: 1 }];
+    h.doctor = [doctorRow("claude", "Claude Code", { signed_in: "no" })];
+    await open();
+    await typeTask("Fix it");
+    expect(blocks()).toContain("signed-out");
+    expect(launchButton()).toBeDisabled();
+    h.doctor = [doctorRow("claude", "Claude Code")];
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    await settle();
+    await settle();
+    expect(blocks()).toEqual([]);
+    expect(launchButton()).toBeEnabled();
+    expect(chip("model")).toHaveTextContent("model: opus");
+  });
+
+  it("a folder that is not a git repository launches in that folder: no worktree, no branch, a plain hint", async () => {
+    const plain = "/fixture-home/plain";
+    h.probe.set(plain, { git_root: null, branch_exists: false, local_branches: [], worktree_toml: null, current_branch: null, exists: true, is_dir: true, has_commits: false, resolved: plain });
+    const { onLaunch } = await open({ defaultRepo: plain });
+    await typeTask("Fix it");
+    expect(blocks()).toEqual([]);
+    // Nothing to choose about worktrees or branches there.
+    expect(chip("where")).toBeNull();
+    expect(chip("project")).not.toHaveClass("danger");
+    expect(document.querySelector(".task-launcher-plain-folder")).toHaveTextContent("Not a git repository: the agent works directly in this folder.");
+    expect(preview()).toMatch(/ {2}·  in plain \(no worktree\)$/);
+    await expand();
+    expect(document.querySelector(".task-launcher-options [data-where]")).toBeNull();
+    expect(launchButton()).toBeEnabled();
+    await launchWithEnter();
+    expect(onLaunch).toHaveBeenCalledTimes(1);
+    const req = onLaunch.mock.calls[0][0];
+    expect(req.repoRoot).toBe(plain);
+    expect(req.agents[0]).toMatchObject({ branch: "", createBranch: false, baseBranch: "", worktree: false });
+  });
+
+  it("nothing at the path still stops Launch, with what is wrong", async () => {
+    const gone = "/fixture-home/gone";
+    h.probe.set(gone, { git_root: null, branch_exists: false, local_branches: [], worktree_toml: null, current_branch: null, exists: false, is_dir: false, has_commits: false, resolved: gone });
+    await open({ defaultRepo: gone });
+    await typeTask("Fix it");
+    expect(blocks()).toEqual(["not-git"]);
+    expect(document.querySelector('.task-launcher-block[data-kind="not-git"]')).toHaveTextContent("No folder at this path.");
+    expect(launchButton()).toBeDisabled();
+  });
+
+  it("the same task again gets the next free branch by itself (SOLO-09)", async () => {
+    h.probe.set(REPO, { ...(h.probe.get(REPO) as RepoProbe), local_branches: ["main", "hermes/fix-it", "hermes/fix-it-2"] });
+    const { onLaunch } = await open();
+    await typeTask("Fix it");
+    expect(blocks()).toEqual([]);
+    expect(chip("where")).toHaveTextContent("new worktree · hermes/fix-it-3");
+    await launchWithEnter();
+    expect(onLaunch.mock.calls[0][0].agents[0].branch).toBe("hermes/fix-it-3");
+  });
+
+  it("a typed branch that exists blocks until the suggested free one is used", async () => {
+    h.probe.set(REPO, { ...(h.probe.get(REPO) as RepoProbe), local_branches: ["main", "hermes/fix-it"] });
+    await open();
+    await typeTask("Fix it");
+    await typeBranch("hermes/fix-it");
+    expect(blocks()).toEqual(["branch-exists"]);
+    fireEvent.click(screen.getByRole("button", { name: "Use hermes/fix-it-2" }));
+    await settle();
+    expect(blocks()).toEqual([]);
+    expect(launchButton()).toBeEnabled();
+    // The row went away with the focused button: the keyboard is back in the task field (SOLO-02).
+    expect(document.activeElement).toBe(task());
+  });
+
+  it("a branch that differs from an existing one only in letter case blocks, names it, and can be used on purpose", async () => {
+    h.probe.set(REPO, { ...(h.probe.get(REPO) as RepoProbe), local_branches: ["main", "Hermes/Fix-It"] });
+    await open();
+    await typeTask("Fix it");
+    // Made up by the launcher, the name steps around it…
+    expect(blocks()).toEqual([]);
+    // …typed by the person, it is said.
+    await typeBranch("hermes/fix-it");
+    expect(blocks()).toEqual(["branch-exists"]);
+    expect(document.querySelector('.task-launcher-block[data-kind="branch-exists"]')).toHaveTextContent(
+      "Branch Hermes/Fix-It already exists; hermes/fix-it differs only in letter case",
+    );
+    expect(launchButton()).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Use the existing Hermes/Fix-It" }));
+    await settle();
+    expect(blocks()).toEqual([]);
+    expect(launchButton()).toBeEnabled();
+    expect(document.querySelector('[data-chip="where"]')).toHaveTextContent("Hermes/Fix-It");
+  });
+
+  it("low disk blocks a new worktree, not the current checkout", async () => {
+    h.disk = { free_bytes: 2e9, required_bytes: 10e9, below_threshold: true };
+    await open();
+    await typeTask("Fix it");
+    expect(blocks()).toEqual(["low-disk"]);
+    await pick("where", '[data-where="current-checkout"]');
+    expect(blocks()).toEqual([]);
+  });
+});
+
+describe("TaskLauncher: what the agents offer comes from the capability commands only", () => {
+  it("shows the agent's accounts and passes model, effort and account as the launch contract's options", async () => {
+    h.cap.override.set("claude", (caps) => ({
+      ...caps,
+      accounts: [
+        { id: "default", label: "Personal", detail: "Pro plan", signedIn: true },
+        { id: "work", label: "Work", detail: "Max plan", profileEnv: { name: "CLAUDE_CONFIG_DIR", value: "~/.claude-work" }, signedIn: true },
+      ],
+    }));
+    const { onLaunch } = await open();
+    fireEvent.click(chip("agent"));
+    fireEvent.click(document.querySelector('.task-launcher-menu [data-account-id="work"]') as HTMLElement);
+    await settle();
+    expect(chip("agent")).toHaveTextContent("Claude Code · Work");
+    await pick("model", '[data-model-id="opus"]');
+    await pick("effort", '[data-effort="high"]');
+    await typeTask("Real work");
+    expect(preview()).toContain('CLAUDE_CONFIG_DIR=~/.claude-work claude --permission-mode acceptEdits "Real work" --model opus --effort high');
+    await launchWithEnter();
+    expect(onLaunch.mock.calls[0][0].agents[0].launch.agentLaunch).toEqual({ modelId: "opus", effort: "high", accountId: "work", purpose: "agent" });
+    expect(h.cap.calls.filter((c) => c.cmd === "remember_launch_choice")).toHaveLength(1);
+  });
+
+  it("capabilities that cannot be read stop Launch with the reason and Try again; no list of Hermes's own is shown", async () => {
+    h.cap.failing.set("claude", "the model probe timed out");
+    const { onLaunch } = await open();
+    await typeTask("Fix it");
+    expect(blocks()).toEqual(["caps-error"]);
+    expect(screen.getByText(/Hermes could not read what Claude Code offers \(the model probe timed out\)/)).toBeInTheDocument();
+    expect(launchButton()).toBeDisabled();
+    fireEvent.click(chip("model"));
+    expect(document.querySelectorAll(".task-launcher-menu [data-model-id]")).toHaveLength(0);
+    fireEvent.click(chip("model"));
+    fireEvent.keyDown(task(), { key: "Enter" });
+    await settle();
+    expect(onLaunch).not.toHaveBeenCalled();
+    h.cap.failing.clear();
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await settle();
+    expect(blocks()).toEqual([]);
+    expect(launchButton()).toBeEnabled();
+    fireEvent.click(chip("model"));
+    expect([...document.querySelectorAll(".task-launcher-menu [data-model-id]")].map((b) => b.getAttribute("data-model-id"))).toEqual(["default", "opus", "sonnet", "haiku"]);
+  });
+
+  it("an agent whose capabilities fail does not stop another agent", async () => {
+    h.cap.failing.set("codex", "codex exited 1");
+    const { onLaunch } = await open();
+    await typeTask("Fix it");
+    expect(blocks()).toEqual([]);
+    await pick("agent", '[data-agent-id="codex"]');
+    expect(blocks()).toEqual(["caps-error"]);
+    await pick("agent", '[data-agent-id="claude"]');
+    expect(blocks()).toEqual([]);
+    await launchWithEnter();
+    expect(onLaunch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("TaskLauncher: a base branch the repository does not have", () => {
+  const stored = (baseBranch: string) => ({ agentId: "claude", accountId: "default", approvalModeId: "plan", modelId: "opus", effort: null, extraArgs: "", prefix: "", channels: [], where: { kind: "new-worktree", baseBranch, branch: "" }, trackAsFeature: false });
+
+  it("a preset cut from release/gone warns, falls back to the current branch, and launches from it", async () => {
+    h.cap.presets = [{ id: "p1", name: "Release fix", choice: stored("release/gone") } as never];
+    const { onLaunch } = await open();
+    await typeTask("Fix the release");
+    fireEvent.keyDown(task(), { key: "1", ...modKey });
+    await settle();
+    const warning = document.querySelector(".task-launcher-fallback") as HTMLElement;
+    expect(warning).not.toBeNull();
+    expect(within(warning).getByText(/Parts of the preset "Release fix" are not available now/)).toBeInTheDocument();
+    expect([...warning.querySelectorAll("li")].map((l) => [l.getAttribute("data-field"), l.textContent])).toEqual([
+      ["where", "Base branch release/gone is not in this repository: the new worktree starts from the current branch"],
+    ]);
+    expect(chip("model")).toHaveTextContent("model: opus");
+    expect(preview()).toContain("in worktree hermes/fix-the-release from main");
+    expect(preview()).not.toContain("release/gone");
+    fireEvent.click(chip("where"));
+    expect(document.querySelector(".task-launcher-menu .task-launcher-base")?.getAttribute("data-value")).toBe("");
+    await launchWithEnter();
+    expect(onLaunch.mock.calls[0][0].agents[0]).toMatchObject({ baseBranch: "", createBranch: true, branch: "hermes/fix-the-release" });
+  });
+
+  it("the applied preset stays the selected chip after its base falls back, even when that equals another preset; a change of the person ends it", async () => {
+    h.cap.presets = [
+      { id: "p1", name: "Opus plan", choice: stored("") } as never,
+      { id: "p2", name: "Release fix", choice: stored("release/gone") } as never,
+    ];
+    await open();
+    await typeTask("Fix the release");
+    fireEvent.keyDown(task(), { key: "2", ...modKey });
+    await settle();
+    expect(document.querySelector(".task-launcher-fallback")).not.toBeNull();
+    const selected = () => [...document.querySelectorAll(".task-launcher-preset.selected")].map((b) => b.textContent);
+    expect(selected()).toEqual([expect.stringContaining("Release fix")]);
+    // The person changes the choice and changes it back: the equal preset is the selected one again.
+    fireEvent.click(chip("where"));
+    choose(".task-launcher-menu .task-launcher-base", "develop");
+    await settle();
+    expect(selected()).toEqual([]);
+    fireEvent.click(chip("where"));
+    choose(".task-launcher-menu .task-launcher-base", "");
+    await settle();
+    expect(selected()).toEqual([expect.stringContaining("Opus plan")]);
+  });
+
+  it("the usual combination from another repository keeps its base only where that branch exists", async () => {
+    h.cap.history = [{ repo: REPO, choice: stored("develop"), at: 1 } as never];
+    const first = await open();
+    await typeTask("Here develop exists");
+    expect(document.querySelector(".task-launcher-fallback")).toBeNull();
+    expect(preview()).toContain("from develop");
+    await launchWithEnter();
+    expect(first.onLaunch.mock.calls[0][0].agents[0].baseBranch).toBe("develop");
+    cleanup();
+    const second = await open({ defaultRepo: OTHER });
+    await typeTask("Not here");
+    const warning = document.querySelector(".task-launcher-fallback") as HTMLElement;
+    expect(warning?.getAttribute("data-source")).toBe("usual");
+    expect([...warning.querySelectorAll("li")].map((l) => l.getAttribute("data-field"))).toEqual(["where"]);
+    expect(preview()).toContain("from main");
+    expect(launchButton()).toBeEnabled();
+    await launchWithEnter();
+    expect(second.onLaunch.mock.calls[0][0].agents[0].baseBranch).toBe("");
+  });
+
+  it("switching project after choosing a base branch falls back the same way", async () => {
+    await open();
+    await typeTask("Switch me");
+    fireEvent.click(chip("where"));
+    choose(".task-launcher-menu .task-launcher-base", "develop");
+    await settle();
+    expect(preview()).toContain("from develop");
+    await pick("project", `[data-project-path="${OTHER}"]`);
+    await settle();
+    const warning = document.querySelector(".task-launcher-fallback") as HTMLElement;
+    expect(warning?.getAttribute("data-source")).toBe("repo");
+    expect(within(warning).getByText("Parts of this choice are not available in this repository:")).toBeInTheDocument();
+    expect(preview()).toContain("from main");
+  });
+});
+
+describe("TaskLauncher: a start from the Library", () => {
+  const persona = { id: "code-reviewer", version: "1.0.0", title: "Code reviewer", text: "You review changes." };
+
+  it("keeps the Library's persona when React throws away the first render of the sheet", async () => {
+    // A sibling that suspends once on mount: React discards the sheet's first
+    // render and renders it again, as it does when a render is interrupted.
+    let ready = false;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = () => {
+        ready = true;
+        r();
+      };
+    });
+    function SuspendOnce() {
+      if (!ready) throw gate;
+      return null;
+    }
+    setLauncherSeed({ task: "", prompt: null, persona });
+    const onLaunch = vi.fn(async (_req: TaskLaunchRequest) => true as TaskLaunchResult);
+    render(
+      <I18nProvider>
+        <Suspense fallback={null}>
+          <TaskLauncher defaultRepo={REPO} onLaunch={onLaunch} onSignIn={vi.fn()} onOpenAdvanced={vi.fn()} onClose={vi.fn()} />
+          <SuspendOnce />
+        </Suspense>
+      </I18nProvider>,
+    );
+    await settle();
+    await act(async () => {
+      release();
+      await gate;
+    });
+    await settle();
+    await settle();
+    await waitFor(() => expect(document.querySelector(".task-launcher-library-persona")?.textContent).toContain("Code reviewer"));
+    await typeTask("Review the auth change");
+    await launchWithEnter();
+    expect(onLaunch.mock.calls[0][0].library?.persona?.text).toBe("You review changes.");
+    // Used up: the next sheet opens without it.
+    expect(peekLauncherSeed()).toBeNull();
+  });
+});

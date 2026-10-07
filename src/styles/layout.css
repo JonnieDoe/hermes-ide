@@ -12,7 +12,6 @@
   overflow: hidden;
 }
 
-
 .main-area {
   display: flex;
   flex: 1;
@@ -49,20 +48,6 @@
 
 .panel-error-boundary p {
   margin: 0;
-}
-
-.panel-error-boundary button {
-  background: var(--bg-2);
-  color: var(--text-1);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 4px 12px;
-  font-size: var(--text-sm);
-  cursor: pointer;
-}
-
-.panel-error-boundary button:hover {
-  background: var(--bg-3);
 }
 
 /* ─── CRT Scanline Overlay ──────────────────────────────── */
@@ -173,6 +158,16 @@
 }
 
 /* ─── Plugin Panel Container ───────────────────────────────── */
+
+/* Left sidebar slot for plugin panels — own resizable width (see
+   utils/pluginPanelLayout.ts), same zone rule so it reads as a sidebar. */
+.plugin-side-panel {
+  width: var(--side-panel-w, var(--sidebar-w));
+  flex-shrink: 0;
+  background: var(--bg-1);
+  border-right: 1px solid var(--rule-zone);
+  overflow: hidden;
+}
 
 .plugin-panel-container {
   display: flex;
